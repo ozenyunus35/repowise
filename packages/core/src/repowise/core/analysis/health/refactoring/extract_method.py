@@ -76,6 +76,12 @@ Plan shape (open dict, no migration):
   ``kind`` is; ``call_site`` also when an awaiting span sits in a host that
   is not async. A missing name reads ``<name>`` in them,
   and ``suggested_name`` is in the language's private form (Python ``_x``).
+- ``plan.anchors`` = ``{"first": str, "last": str}`` -- the exact text the
+  span starts and ends with, each unique in the function (``anchors``), so an
+  agent finds it by text once earlier edits have moved its lines; every stage
+  carries its own. A staged split that cannot be anchored falls back to the
+  function's best single span; when that cannot be either, the function is
+  refused (``span_unanchored``).
 - ``evidence`` = ``{"slice_nloc": int, "ccn_removed": int}`` -- the size and
   complexity (code lines, decision points) the residual method sheds.
 - ``plan.stages`` -- only on a staged plan (``dataflow.stages``): a function
@@ -115,6 +121,7 @@ from ..effort import effort_bucket
 from ..perf.dialects import PERF_DIALECTS
 from ..scoring import severity_deduction
 from . import render
+from .anchors import Scope, anchor_plan, file_source, function_scope
 from .declarative import declarative_flat
 from .helper_naming import ScopeNames, helper_names, out_value_name
 from .models import RefactoringContext, RefactoringSuggestion
@@ -180,6 +187,8 @@ class ExtractMethodDetector(RefactoringDetector):
         out: list[RefactoringSuggestion] = []
         names = ScopeNames(lmap)
         dialect = get_defuse_dialect(ctx.language or "")
+        # The file's text, read off the tree once, when the first plan needs it.
+        files: dict[str, Any] = {}
         # Source order, so the first of two colliding plans keeps the name.
         for analysis in sorted(analyses, key=lambda a: (a.start_line, a.end_line)):
             matched = self._findings_for(analysis, ctx.findings)
@@ -201,12 +210,16 @@ class ExtractMethodDetector(RefactoringDetector):
             candidates = find_extractions(analysis, lmap, receiver, prefixes)
             best = _choose(analysis, candidates, markers)
             staged = _staged(analysis, best, lmap, receiver, ctx.language, markers, prefixes)
+            scope = _scope(fn_node, files) if staged is not None or best is not None else None
             if staged is not None:
-                out.append(
-                    self._staged_suggestion(ctx, analysis, staged, matched, names, receiver)
-                )
-                continue
+                split = self._staged_suggestion(ctx, analysis, staged, matched, names, receiver)
+                if anchor_plan(split.plan, scope):
+                    out.append(split)
+                    continue
             if best is None:
+                # Nothing to fall back to from a split no text anchors.
+                if staged is not None:
+                    _mark_refused(matched, "span_unanchored")
                 continue
             impact, share, source = self._impact_for(analysis, best, matched)
             name = render.private_name(
@@ -226,7 +239,8 @@ class ExtractMethodDetector(RefactoringDetector):
                 _symbol_fields(best, receiver),
                 async_host=async_fields.get("async_host", True),
             )
-            out.append(
+            _serve_anchored(
+                out,
                 RefactoringSuggestion(
                     refactoring_type=self.name,
                     file_path=ctx.file_path,
@@ -250,7 +264,9 @@ class ExtractMethodDetector(RefactoringDetector):
                     blast_radius={"scope": "local"},
                     confidence=self._confidence(best, share),
                     source_biomarker=source,
-                )
+                ),
+                matched,
+                scope,
             )
 
         # Stable order: biggest recovery first, then symbol, then span start.
@@ -354,6 +370,27 @@ def _mark_refused(findings: list[Any], reason: str) -> None:
             details[REFUSED_DETAIL] = reason
 
 
+def _scope(fn_node: Any, files: dict[str, Any]) -> Scope | None:
+    """*fn_node*'s lines in its file, the file read once per detect call."""
+    if "source" not in files and fn_node is not None:
+        files["source"] = file_source(fn_node)
+    return function_scope(fn_node, files.get("source"))
+
+
+def _serve_anchored(
+    out: list[RefactoringSuggestion],
+    suggestion: RefactoringSuggestion,
+    findings: list[Any],
+    scope: Scope | None,
+) -> None:
+    """Serve *suggestion* only when every span in it is anchored by its text
+    (``anchors``); one that is not is refused, never served by line alone."""
+    if anchor_plan(suggestion.plan, scope):
+        out.append(suggestion)
+    else:
+        _mark_refused(findings, "span_unanchored")
+
+
 def recovered_share(
     biomarker: str, analysis: FunctionAnalysis, extraction: Extraction
 ) -> float:
@@ -414,8 +451,13 @@ def _staged_fields(
     # Without an object (no free variable name for it) the values stay plain.
     context = staged.context if obj else ()
     imports = names.imports(analysis.fn_node)
+    # The function's import goes with the last stage reading it, so the code
+    # still runs when the stages before it are applied and tested alone.
+    last = {
+        imported: i for i, stage_imports in enumerate(staged.imports) for imported in stage_imports
+    }
     stages = []
-    for x, reimports in zip(staged.stages, staged.imports, strict=True):
+    for i, (x, reimports) in enumerate(zip(staged.stages, staged.imports, strict=True)):
         name = render.private_name(
             language,
             names.claim_first(
@@ -436,7 +478,8 @@ def _staged_fields(
             async_host=async_fields.get("async_host", True),
             leading=lead,
         )
-        _add_stage_notes(symbol["new_symbol"], lead, carried, reimports, staged.moved_imports)
+        moved = frozenset(m for m in staged.moved_imports if last.get(m) == i)
+        _add_stage_notes(symbol["new_symbol"], lead, carried, reimports, moved)
         stages.append(
             {
                 "span": {"start": x.start_line, "end": x.end_line},

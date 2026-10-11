@@ -273,6 +273,16 @@ Most plans answer a health finding, so per-path marker rules in
   labelled sections is named after them. When a function moves
   between a single helper and a staged plan, or its stages change, the plan
   gets a new id.
+- Every Extract Method step, and every stage of a staged plan, shows the exact
+  first and last lines of its span, so an agent finds it by its text after
+  earlier stages have moved its lines; the line numbers are only a hint. The
+  plan asks for each stage as a direct edit to the file, one at a time, never a
+  script that rewrites it. A staged plan whose stages cannot all be pinned down
+  that way falls back to a single helper, and a function with neither gets no plan.
+- A staged plan with more than five stages comes in batches of at most five.
+  Each batch names the tests to run before the next one, and a batch whose
+  tests fail stops the plan there. The code runs after every batch, so a
+  failure points at the stages just applied.
 - Move Method never targets a class the method only instantiates, or an ancestor of
   its own class.
 - Split File works on any language with call resolution and suggests a split only

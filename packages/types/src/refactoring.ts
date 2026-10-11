@@ -211,6 +211,10 @@ export type RecipePreconditionKind =
   | "unchecked"
   | "kind_unaudited";
 
+/** Where an Extract Method anchor is unique: the whole file, or only inside
+ *  its function (a text match must then stay inside the host). */
+export type AnchorScope = "file" | "function";
+
 export interface RecipeStep {
   n: number;
   action: RecipeAction;
@@ -232,6 +236,9 @@ export interface RecipeStep {
     notes: string[];
   };
   call_site?: ExtractCallSite;
+  /** Extract Method: the exact text the span starts and ends with, so the
+   *  step is found by text, not line. */
+  anchors?: { first: string; last: string; unique_in: AnchorScope };
   symbols?: string[];
   to_file?: string | null;
   /** Extract Helper: the directory the shared helper belongs in. */
@@ -272,6 +279,21 @@ export interface RefactoringRecipe {
   >;
   /** `constraint` reads after "Do not"; `reason` says why, when it is not obvious. */
   does_not: Array<{ constraint: string; reason: string | null }>;
+  /** A staged plan over five stages only: its steps in ordered batches of at
+   *  most five, each with the tests to run before the next; a failing batch
+   *  stops the plan. */
+  batches?: RecipeBatch[];
+}
+
+/** One batch of a long staged plan. Mirrors `stage_batches`. */
+export interface RecipeBatch {
+  n: number;
+  /** Recipe step numbers, in order. */
+  steps: number[];
+  stages: { first: number; last: number };
+  tests: string[];
+  commands: string[];
+  text: string;
 }
 
 export interface RefactoringTypeCount {
