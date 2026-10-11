@@ -106,6 +106,10 @@ async def mark_tombstone_pages(
         )
         for page in res.scalars():
             path = (page.target_path or "").split("::", 1)[0]
+            # SQLite LIKE ignores ASCII case, so ``pkg/Foo.py::`` also matches
+            # a live ``pkg/foo.py``; keep only exact path matches.
+            if path not in successors_by_path:
+                continue
             page_ids[page.id] = (path, successors_by_path.get(path, []))
             pages.append(page)
     marked: list[str] = []

@@ -187,3 +187,19 @@ async def test_a_path_is_matched_literally_not_as_a_like_pattern(session, engine
 
     assert sorted(marked) == ["file_page:pkg/a_b.py", gone]
     assert (await _status(session, other))[0] == "fresh"
+
+
+async def test_a_case_only_sibling_keeps_its_spotlight_pages(session, engine):
+    """SQLite LIKE ignores ASCII case: deleting ``pkg/Foo.py`` must not
+    tombstone the spotlight pages of a live ``pkg/foo.py``."""
+    fts = FullTextSearch(engine)
+    await fts.ensure_index()
+    repo_id = await _seed(session, fts, "pkg/Foo.py", "pkg/foo.py")
+    gone = await _spotlight(session, repo_id, "pkg/Foo.py::f")
+    kept = await _spotlight(session, repo_id, "pkg/foo.py::f")
+    await session.commit()
+
+    marked = await mark_tombstone_pages(session, repo_id, [("pkg/Foo.py", [])])
+
+    assert sorted(marked) == ["file_page:pkg/Foo.py", gone]
+    assert (await _status(session, kept))[0] == "fresh"
