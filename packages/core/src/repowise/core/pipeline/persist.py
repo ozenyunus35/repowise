@@ -23,6 +23,10 @@ from repowise.core.generation.models import (
 
 logger = structlog.get_logger(__name__)
 
+#: Candidate paths per spotlight query: each path is one ``LIKE`` term, and
+#: SQLite caps how deep an expression tree may grow.
+_SPOTLIGHT_PATHS_PER_QUERY = 200
+
 # A second, stdlib logger for the one message here that has to survive
 # ``repowise init``. ``configure_cli_logging`` pins both ``repowise.core`` and
 # structlog to ERROR for the progress-bar commands, so anything below ERROR is
@@ -55,7 +59,8 @@ def tombstone_candidates(file_diffs: list[Any]) -> list[tuple[str, list[str]]]:
 async def mark_tombstone_pages(
     session: Any, repo_id: str, candidates: list[tuple[str, list[str]]]
 ) -> list[str]:
-    """Mark file pages for deleted/renamed files as tombstones.
+    """Mark the pages of deleted/renamed files as tombstones: each file's page
+    and the symbol spotlight pages of the symbols it defined.
 
     A ``freshness_status="fresh"`` page for a file that no longer exists is
     an active trap: retrieval serves it, agents cite it, and the index-age
@@ -73,16 +78,38 @@ async def mark_tombstone_pages(
     """
     if not candidates:
         return []
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
 
     from repowise.core.persistence.models import Page
 
     page_ids = {f"file_page:{path}": (path, successors) for path, successors in candidates}
-    res = await session.execute(
-        select(Page).where(Page.repository_id == repo_id, Page.id.in_(page_ids))
+    pages = list(
+        (
+            await session.execute(
+                select(Page).where(Page.repository_id == repo_id, Page.id.in_(page_ids))
+            )
+        ).scalars()
     )
+    # A symbol spotlight page targets ``<path>::<symbol>``, so its id is never
+    # ``file_page:<path>``; it goes with its file all the same. Matched on the
+    # ``<path>::`` prefix, so a file whose name merely starts with *path* stays.
+    successors_by_path = dict(candidates)
+    paths = list(successors_by_path)
+    for start in range(0, len(paths), _SPOTLIGHT_PATHS_PER_QUERY):
+        chunk = paths[start : start + _SPOTLIGHT_PATHS_PER_QUERY]
+        res = await session.execute(
+            select(Page).where(
+                Page.repository_id == repo_id,
+                Page.page_type == "symbol_spotlight",
+                or_(*(Page.target_path.startswith(f"{p}::", autoescape=True) for p in chunk)),
+            )
+        )
+        for page in res.scalars():
+            path = (page.target_path or "").split("::", 1)[0]
+            page_ids[page.id] = (path, successors_by_path.get(path, []))
+            pages.append(page)
     marked: list[str] = []
-    for page in res.scalars().all():
+    for page in pages:
         _, successors = page_ids[page.id]
         page.freshness_status = "tombstone"
         try:
