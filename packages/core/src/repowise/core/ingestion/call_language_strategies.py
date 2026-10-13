@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .call_receiver_typing import _TYPE_KINDS
 from .models import CallSite, ParsedFile
 from .resolved_call import ResolvedCall
 
@@ -22,11 +23,18 @@ class _LanguageCallStrategies:
     after all of them, so a strategy there only ever sees a call nothing else
     claimed and can only add an edge. All three stop at the first hit.
     Strategies are named rather than bound so a probe can substitute one.
+
+    ``member_bare_fallback`` lets a member or chained call nothing claimed fall
+    back to the bare-name tiers. ``inherited_typed_receiver`` lets a typed
+    receiver whose type lacks the method answer with the one ancestor that
+    declares it.
     """
 
     free: tuple[str, ...] = ()
     member: tuple[str, ...] = ()
     member_fallback: tuple[str, ...] = ()
+    member_bare_fallback: bool = True
+    inherited_typed_receiver: bool = False
 
 
 _NO_LANGUAGE_STRATEGIES = _LanguageCallStrategies()
@@ -61,18 +69,24 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
     # Kotlin shares the JVM tiers and the typed-receiver fallback. Java takes
     # the uniqueness-gated package tier, Kotlin the open one; see
     # ``_resolve_java_same_package_unique`` for why that is a language rule.
+    # A Java member call never reaches the bare-name tiers: measured on jsoup
+    # and gson, they bound such calls at 0.38 site precision. Kotlin is
+    # unmeasured, so it keeps both defaults.
     "java": replace(
         _JVM_STRATEGIES,
         free=("_resolve_java_same_package_unique",),
         member_fallback=_TYPED_RECEIVER,
+        member_bare_fallback=False,
+        inherited_typed_receiver=True,
     ),
     "kotlin": replace(_JVM_STRATEGIES, member_fallback=_TYPED_RECEIVER),
     "csharp": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     "python": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
-    # Swift registers the fallback and nothing else: it has no package
-    # tier of its own, so a typed receiver is looked for in the caller's
-    # file, in what the file imports, and then in the global pair index.
+    # Swift and Dart register the fallback and nothing else: neither has a
+    # package tier of its own, so a typed receiver is looked for in the
+    # caller's file, in what the file imports, and then in the global pair index.
     "swift": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
+    "dart": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     # TypeScript's typed fallback also walks a dotted receiver's fields.
     "typescript": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     # Rust types a local or parameter only; a `self.field` receiver is not
@@ -316,8 +330,8 @@ class LanguageStrategiesMixin:
             return None
         found: str | None = None
         for sibling in index.same_package_files(file_path):
-            sym_id = self._file_symbols.get(sibling, {}).get(call.target_name)
-            if sym_id is not None and sym_id != caller_id:
+            sym_id = self._package_symbol(sibling, call.target_name, caller_id)
+            if sym_id is not None:
                 if not unique_only:
                     return ResolvedCall(caller_id, sym_id, 0.90, call.line, "same_package")
                 if found is not None:
@@ -327,6 +341,24 @@ class LanguageStrategiesMixin:
         if found is None:
             return None
         return ResolvedCall(caller_id, found, 0.90, call.line, "same_package")
+
+    def _package_symbol(self, sibling: str, name: str, caller_id: str) -> str | None:
+        """What *name* means in *sibling* to a bare call from another package file.
+
+        The package shares top-level names, not members: a data class's
+        synthesized ``copy`` or a ViewModel's ``onClick`` is reached through a
+        receiver, an ancestor or a scope function, never by the package alone.
+        A nested type and a constructor (named for its class) are not members.
+        A member indexed last under the name hides no top-level symbol of it.
+        """
+        sym_id = self._file_symbols.get(sibling, {}).get(name)
+        if sym_id is None:
+            return None
+        symbol = self._symbols_by_id[sym_id]
+        parent = symbol.parent_name
+        if parent is not None and symbol.name != parent and symbol.kind not in _TYPE_KINDS:
+            sym_id = self._file_top_level.get(sibling, {}).get(name)
+        return None if sym_id == caller_id else sym_id
 
     def _resolve_jvm_receiver_same_package(
         self,
@@ -373,7 +405,8 @@ class LanguageStrategiesMixin:
         if pkg is None:
             return None
         for sibling in pkg.files:
-            syms = self._file_symbols.get(sibling, {})
+            # A package qualifier reaches package-level names, never a method.
+            syms = self._file_top_level.get(sibling, {})
             sym_id = syms.get(call.target_name)
             if sym_id is not None and sym_id != caller_id:
                 return ResolvedCall(caller_id, sym_id, 0.88, call.line, "package_alias")

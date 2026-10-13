@@ -99,7 +99,7 @@ def test_return_type_chain_retargets_to_declared_type(
     assert after[0].origin.startswith("return_type_")
 
 
-def test_java_unknown_member_preserves_legacy_fallback(tmp_path: Path) -> None:
+def test_java_unknown_member_gets_no_bare_name_edge(tmp_path: Path) -> None:
     source = (
         "class Product {} class Wrong { void run() {} } "
         "class Use { Product make() { return new Product(); } void go() { make().run(); } }"
@@ -118,11 +118,11 @@ def test_java_unknown_member_preserves_legacy_fallback(tmp_path: Path) -> None:
         "Example.java", [call]
     )
 
-    assert len(before) == 1
-    assert after == before
+    assert before == []
+    assert after == []
 
 
-def test_java_ambiguous_overload_return_preserves_legacy_fallback(tmp_path: Path) -> None:
+def test_java_ambiguous_overload_return_gets_no_edge(tmp_path: Path) -> None:
     source = (
         "class First { void run() {} }\nclass Second { void run() {} }\n"
         "class Factory {\n First make(int value) { return new First(); }\n"
@@ -143,7 +143,7 @@ def test_java_ambiguous_overload_return_preserves_legacy_fallback(tmp_path: Path
         "Example.java", [call]
     )
 
-    assert after == before
+    assert before == after == []
 
 
 def test_cpp_future_get_can_refuse_a_bare_name_fallback(tmp_path: Path) -> None:
@@ -215,7 +215,7 @@ def test_unbound_global_return_type_preserves_legacy_fallback(
 
 
 def test_only_audited_lanes_are_enabled_by_default() -> None:
-    assert frozenset({"cpp", "csharp", "go"}) == PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES
+    assert frozenset({"cpp", "csharp", "go", "java"}) == PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES
 
 
 def test_module_level_chain_keeps_structural_receiver(tmp_path: Path) -> None:
@@ -277,7 +277,11 @@ def test_java_external_chain_head_is_exempt_when_the_file_rebinds_the_name(
     is the claim stated as a test rather than as prose. Java imports resolve to
     repository files, so the file's import list is what separates the two.
     """
-    own = "package a;\npublic class Duration { public long toNanos() { return 0; } }\n"
+    own = (
+        "package a;\npublic class Duration {\n"
+        " public static Duration ofSeconds(int s) { return null; }\n"
+        " public long toNanos() { return 0; } }\n"
+    )
     use = (
         "package b;\nimport a.Duration;\n"
         "class Use { long go() { return Duration.ofSeconds(3).toNanos(); } }\n"
@@ -293,7 +297,10 @@ def test_java_external_chain_head_is_exempt_when_the_file_rebinds_the_name(
     call = _java_chain_call(parsed, "b/Use.java", "toNanos")
 
     resolved = CallResolver(
-        parsed, {"b/Use.java": {"a/Duration.java"}}, repo_path=str(tmp_path)
+        parsed,
+        {"b/Use.java": {"a/Duration.java"}},
+        repo_path=str(tmp_path),
+        return_type_chain_languages=frozenset({"java"}),
     ).resolve_file("b/Use.java", [call])
     assert len(resolved) == 1
     assert resolved[0].callee_id.endswith("::Duration::toNanos")
@@ -314,9 +321,9 @@ def test_a_table_admits_only_its_own_lane(tmp_path: Path) -> None:
     parsed = _parse(tmp_path, "Example.java", "java", source)
     call = _java_chain_call(parsed, "Example.java", "run")
 
-    resolved = CallResolver(parsed, {}, repo_path=str(tmp_path)).resolve_file(
-        "Example.java", [call]
-    )
+    resolved = CallResolver(
+        parsed, {}, repo_path=str(tmp_path), return_type_chain_languages=frozenset()
+    ).resolve_file("Example.java", [call])
     assert not any(edge.origin.startswith("return_type_") for edge in resolved)
 
 
@@ -347,9 +354,9 @@ def test_java_external_chain_head_is_exempt_when_the_repo_declares_the_name(
     parsed.update(_parse(tmp_path, "a/Use.java", "java", use))
     call = _java_chain_call(parsed, "a/Use.java", "toNanos")
 
-    resolved = CallResolver(parsed, {}, repo_path=str(tmp_path)).resolve_file(
-        "a/Use.java", [call]
-    )
+    resolved = CallResolver(
+        parsed, {}, repo_path=str(tmp_path), return_type_chain_languages=frozenset({"java"})
+    ).resolve_file("a/Use.java", [call])
     assert len(resolved) == 1
     assert resolved[0].callee_id.endswith("::Duration::toNanos")
 

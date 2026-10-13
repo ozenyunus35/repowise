@@ -57,6 +57,14 @@ that sink comes first. The plan also lists tests to run, found from coverage, th
 graph and the import graph. An opportunity with a supported shared fix links to a
 `performance_fix` plan in [REFACTORING.md](REFACTORING.md).
 
+Each loop also says what it walks: rows a query returns, a collection its caller
+passes in, the rows of one key, a registry or configuration table, a fixed set, a
+directory listing or a stream, and plan steps name it. Python, TypeScript/JavaScript,
+Go, Java, C#, Ruby, Rust, Kotlin and C++ loops say whether they grow with the data or are bounded; a
+loop whose size the code does not show stays unknown and is never treated as
+bounded. A loop that stops at the first call that answers, or feeds each call's
+result into the next, gets no batch advice (reason `loop_not_batchable`).
+
 ## The default queue
 
 The default queue holds production opportunities in the `plan_ready` and
@@ -79,7 +87,10 @@ Everything else is counted by reason, not hidden:
 | `cold_role` | Only startup, a CLI command, tooling, tests or client UI code run the loop, so no server pays it per request |
 | `background_unproven` | A scheduled job runs the loop and nothing shows it grows with the data; listed under `proof=background_unproven` |
 
-To see them, widen the filter (below). Performance work also appears in
+To see them, widen the filter (below). Each performance finding also stores the reason its cause is in or out of the queue.
+Code in a package path that only looks like an example tree (`com/example/...`) is judged as production when the index read it as production.
+
+Performance work also appears in
 [Fix first](CODE_HEALTH.md#fix-first), where it competes with other kinds of work.
 
 ## Reading it

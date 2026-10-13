@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import posixpath
+import re
 from bisect import bisect_left, bisect_right
 from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 
+from .lang_helpers.anonymous_classes import is_anonymous_member
 from .languages.receiver_types import (
     BINDING_LANGUAGES,
     CALL_TYPED_LANGUAGES,
@@ -44,7 +46,12 @@ from .models import CallSite, NamedBinding, ParsedFile, Symbol, symbol_id_langua
 from .resolved_call import ResolvedCall
 from .return_types import declared_return_type, go_first_result
 from .symbol_identity import id_segment_name
-from .type_names import POINTER_LIKE_MEMBERS, bare_type_name, type_qualifier
+from .type_names import (
+    POINTER_LIKE_MEMBERS,
+    bare_type_name,
+    strip_type_arguments,
+    type_qualifier,
+)
 
 # Which symbols own a class scope, and which of them swallow one. A class span
 # contains every method body inside it, so both sets are needed to tell a field
@@ -53,6 +60,19 @@ _TYPE_KINDS = frozenset({"class", "struct", "interface", "enum", "trait", "impl"
 _FUNCTION_KINDS = frozenset({"function", "method"})
 
 _SOURCE_CACHE_FILES = 4
+
+# Any Java type spelling before a declared name, for ``_declares_name``; the
+# words that may precede a bare name without declaring it.
+_JAVA_ANY_TYPE = r"[\w$]+(?:\.[\w$]+)*(?:<[^;{}()]*>)?(?:\[\])*"
+_NOT_A_TYPE = frozenset({"return", "throw", "new", "else", "case", "yield", "assert"})
+
+# Where a Java declaration header opens its type-parameter list: after a type's
+# name, or after a method's modifiers and annotations, before its return type.
+_JAVA_TYPE_PARAMETERS = re.compile(
+    r"\b(?:class|interface|record)\s+\w+\s*<"
+    r"|^(?:\s*(?:@[\w.]+(?:\([^)]*\))?|public|protected|private|static|final|abstract"
+    r"|synchronized|native|default|strictfp)\b)*\s*<"
+)
 
 # Languages whose grammar mints ``a.b.c.m()`` with the dotted path as its
 # receiver, every segment after the head a field. Each maps to the name that
@@ -132,6 +152,21 @@ def _types_by_name(parsed: ParsedFile) -> dict[str, list[str]]:
         if symbol.kind in _TYPE_KINDS:
             by_name.setdefault(symbol.name, []).append(symbol.id)
     return by_name
+
+
+def _header_type_parameters(header: str) -> set[str]:
+    """The names a Java declaration header's ``<...>`` list declares."""
+    opened = _JAVA_TYPE_PARAMETERS.search(header)
+    if opened is None:
+        return set()
+    depth, close = 1, opened.end()
+    while close < len(header) and depth:
+        depth += {"<": 1, ">": -1}.get(header[close], 0)
+        close += 1
+    names: set[str] = set()
+    for param in strip_type_arguments(header[opened.end() : close - 1]).split(","):
+        names.update(param.split()[:1])
+    return names
 
 
 class ReceiverTypingMixin:
@@ -246,7 +281,65 @@ class ReceiverTypingMixin:
             found = self._typed_receiver_lookup(file_path, call, caller_id, type_name)
             if found is not None and found[1] != "global":
                 return found
-        return self._typed_receiver_lookup(file_path, call, caller_id, bare)
+        found = self._typed_receiver_lookup(file_path, call, caller_id, bare, type_name)
+        if found is None and self._strategies_for(file_path).inherited_typed_receiver:
+            return self._inherited_typed_target(file_path, call, caller_id, bare)
+        return found
+
+    def _inherited_typed_target(
+        self, file_path: str, call: CallSite, caller_id: str, bare: str
+    ) -> tuple[str, str] | None:
+        """The one ancestor method a typed receiver reaches when its type lacks it.
+
+        The type is the repository's only declaration of *bare*, the repo-wide
+        tier's evidence, so the answer is scoped ``global``, and only when the
+        caller can see it and no type parameter or import shadows it. A type
+        that declares the method itself was refused above for a reason this
+        keeps.
+        """
+        if bare in self._externally_bound_names(file_path):
+            return None
+        declared = self._declared_types_named(bare)
+        if len(declared) != 1 or bare in self._java_type_parameters(file_path, caller_id):
+            return None
+        type_file, (type_id, *_), _ = declared[0]
+        if not self._visible_java_type(file_path, bare, type_file):
+            return None
+        if self._declares(type_id, call.target_name) is not None:
+            return None
+        hit = self._ancestor_method(type_id, call.target_name, caller_id, class_chain_first=True)
+        return None if hit is None else (hit, "global")
+
+    def _visible_java_type(self, file_path: str, bare: str, type_file: str) -> bool:
+        """Whether Java lets *file_path* write *bare* for the type in *type_file*.
+
+        Its own file, its package, or a single-type import of that file. A
+        wildcard import is not enough: the name may be another package's.
+        """
+        if type_file == file_path or self._import_names.get(file_path, {}).get(bare) == type_file:
+            return True
+        index = self._get_jvm_index()
+        return index is not None and type_file in index.same_package_files(file_path)
+
+    def _java_type_parameters(self, file_path: str, caller_id: str) -> set[str]:
+        """Type parameters the caller and its enclosing types declare.
+
+        Read off each declaration header, up to its body's ``{``, since no
+        parsed symbol keeps its ``<...>`` list.
+        """
+        spans = self._spans_for(file_path)
+        line = spans.get(caller_id, (0, 0))[0]
+        lines = self._text_of(file_path).splitlines()
+        names: set[str] = set()
+        for sym_id, (start, end) in spans.items():
+            symbol = self._symbols_by_id.get(sym_id)
+            if not (start <= line <= end and symbol is not None):
+                continue
+            if symbol.kind not in _TYPE_KINDS and symbol.kind not in _FUNCTION_KINDS:
+                continue
+            header = "\n".join(lines[start - 1 : end]).partition("{")[0]
+            names.update(_header_type_parameters(header))
+        return names
 
     def _typed_receiver_lookup(
         self,
@@ -254,6 +347,7 @@ class ReceiverTypingMixin:
         call: CallSite,
         caller_id: str,
         type_name: str,
+        spelled: str | None = None,
     ) -> tuple[str, str] | None:
         key = (type_name, call.target_name)
         # What an import binds is the written name, never its arity.
@@ -286,7 +380,7 @@ class ReceiverTypingMixin:
         if hit is not None:
             return hit.callee_id, "same_package"
 
-        return self._receiver_pair_match(file_path, key)
+        return self._receiver_pair_match(file_path, key, spelled)
 
     def _import_bound_method(
         self, file_path: str, bound: str, key: tuple[str, str]
@@ -332,7 +426,7 @@ class ReceiverTypingMixin:
             if language not in _CHAIN_SELF:
                 return None
             return self._resolve_chained_receiver(file_path, call, caller_id, language)
-        type_name, scope = self._receiver_type_and_scope(
+        type_name, scope, typing_file = self._receiver_type_and_scope(
             file_path, caller_id, language, receiver_name
         )
         if type_name is None:
@@ -349,7 +443,7 @@ class ReceiverTypingMixin:
         if self._means_the_wrapper(file_path, caller_id, language, call, receiver_name):
             return None
 
-        found = self._typed_receiver_target(file_path, call, caller_id, type_name)
+        found = self._typed_receiver_target(typing_file, call, caller_id, type_name)
         if found is None:
             # Last, because C# prefers an instance method to an extension.
             return self._typed_extension_call(file_path, call, caller_id, type_name, language)
@@ -366,37 +460,115 @@ class ReceiverTypingMixin:
         caller_id: str,
         language: str,
         receiver_name: str,
-    ) -> tuple[str | None, str]:
-        """The receiver's declared type and the scope that declared it.
+    ) -> tuple[str | None, str, str]:
+        """The receiver's declared type, the scope that declared it, and the file to read it in.
 
         A local shadows a field, so the body answers first and its answer
         stands — including when that answer is "declared twice, no usable
         type". Only a name the body never mentions reaches class scope, and
-        only a name neither binds reaches module scope.
+        only a name neither binds reaches module scope. A name the body binds
+        with no type it can read (`{ api -> api.m() }`) is still a local, so it
+        refuses the field too. A field a repository ancestor declares is read
+        in that ancestor's file. A name an anonymous class member's body
+        neither types nor binds is asked of the function around it, whose
+        locals it captures and whose class fields it sees.
         """
-        body_types = self._declared_types_in(file_path, caller_id, language)
+        caller_id, body_types = self._typing_scope(file_path, caller_id, language, receiver_name)
         # A builtin type answers only when nothing else does, so a local
         # ``String data`` leaves ``this.data.m()``, which reaches here as
         # ``data.m()``, to the field.
         declared = body_types.get(receiver_name)
         builtin_local = external_type_name(declared) is not None
         if receiver_name in body_types and not builtin_local:
-            return declared, "body"
+            return declared, "body", file_path
         if language in IMPLICIT_FIELD_LANGUAGES:
-            class_id = self._caller_class_id(caller_id)
-            fields = self._field_types_in(file_path, language).get(class_id, {})
-            field = fields.get(receiver_name)
-            if receiver_name in fields and not (builtin_local and external_type_name(field)):
-                return field, "field"
+            found = self._field_type(file_path, caller_id, language, receiver_name, builtin_local)
+            if found is not None:
+                return found
         if builtin_local:
-            return declared, "body"
+            return declared, "body", file_path
         # Third scope: a module-level def a framework decorator turned into an
         # instance, which is neither in the body nor a field.
         if language in FRAMEWORK_DECORATOR_LANGUAGES:
             type_name = self._framework_receiver_type(file_path, caller_id, language, receiver_name)
             if type_name is not None:
-                return type_name, "framework"
-        return self._module_receiver_type(file_path, caller_id, language, receiver_name), "body"
+                return type_name, "framework", file_path
+        type_name = self._module_receiver_type(file_path, caller_id, language, receiver_name)
+        return type_name, "body", file_path
+
+    def _field_type(
+        self, file_path: str, caller_id: str, language: str, name: str, builtin_local: bool
+    ) -> tuple[str | None, str, str] | None:
+        """The caller class's field *name*, else the one a repository ancestor declares.
+
+        A name the body binds with no readable type is a local and refuses both.
+        """
+        if not builtin_local and name in self._bound_names_in(file_path, caller_id, language):
+            return None
+        class_id = self._caller_class_id(caller_id)
+        fields = self._field_types_in(file_path, language).get(class_id, {})
+        if name in fields:
+            field = fields[name]
+            return None if builtin_local and external_type_name(field) else (field, "field", file_path)
+        if builtin_local:
+            return None
+        inherited = self._inherited_field(file_path, caller_id, class_id, name, language)
+        return None if inherited is None else (inherited[1], "field", inherited[0])
+
+    def _inherited_field(
+        self, file_path: str, caller_id: str, class_id: str, name: str, language: str
+    ) -> tuple[str, str | None] | None:
+        """``(declaring file, type)`` of the field *name* the nearest superclass declares.
+
+        Only where a typed receiver may reach an ancestor (Java). The
+        declaration scan skips a type it cannot read (``b.Reader x``,
+        ``int[] x``), so the caller, its class and each superclass passed are
+        also asked whether they declare the name at all: one that does hides
+        the rest, and refuses.
+        """
+        if not self._strategies_for(file_path).inherited_typed_receiver:
+            return None
+        if self._declares_name(file_path, caller_id, name) or self._declares_name(
+            file_path, class_id, name
+        ):
+            return None
+        for ancestor in self._superclass_chain(class_id):
+            path = self._symbol_paths_by_id.get(ancestor)
+            if path is None:
+                return None
+            fields = self._field_types_in(path, language).get(ancestor, {})
+            if name in fields:
+                return path, fields[name]
+            if self._declares_name(path, ancestor, name):
+                return None
+        return None
+
+    def _declares_name(self, file_path: str, owner_id: str, name: str) -> bool:
+        """Does *owner_id*, a method or a class's own scope, declare *name* with any type?
+
+        A scan for the one name, run only where an inherited field would
+        answer: admitting every type spelling to the declaration scan slows
+        it by about two thirds. Ceiling: a later declarator (``int a, x;``) is
+        missed.
+        """
+        spans = self._spans_for(file_path)
+        start, end = spans.get(owner_id, (1, 0))
+        owner = self._symbols_by_id.get(owner_id)
+        bodies = merge_spans(
+            span
+            for sym_id, span in spans.items()
+            if owner is not None
+            and owner.kind not in _FUNCTION_KINDS
+            and getattr(self._symbols_by_id.get(sym_id), "kind", None) in _FUNCTION_KINDS
+        )
+        declared = re.compile(rf"(?<![\w.@$])(?P<type>{_JAVA_ANY_TYPE})\s+{re.escape(name)}\s*[=;,):]")
+        lines = self._text_of(file_path).splitlines()
+        return any(
+            match.group("type") not in _NOT_A_TYPE
+            for number in range(start, min(end, len(lines)) + 1)
+            if not in_spans(bodies, number)
+            for match in declared.finditer(lines[number - 1])
+        )
 
     def _module_receiver_type(
         self,
@@ -551,8 +723,10 @@ class ReceiverTypingMixin:
             if symbol is None or symbol.kind not in _TYPE_KINDS:
                 return None
             return file_path, class_id, "same_file"
-        type_name, _ = self._receiver_type_and_scope(file_path, caller_id, language, head)
-        return None if type_name is None else self._class_named(file_path, type_name)
+        type_name, _, typing_file = self._receiver_type_and_scope(
+            file_path, caller_id, language, head
+        )
+        return None if type_name is None else self._class_named(typing_file, type_name)
 
     def _chain_hop(
         self, found: tuple[str, str, str], field: str, language: str
@@ -596,6 +770,77 @@ class ReceiverTypingMixin:
             }
         ids = self._type_ids.get(file_path, {}).get(type_name, ())
         return ids[0] if len(ids) == 1 else None
+
+    def _capture_host(
+        self,
+        file_path: str,
+        caller_id: str,
+        language: str,
+        receiver_name: str,
+        body_types: dict[str, str | None],
+    ) -> str | None:
+        """The function to ask about a name an anonymous member neither types nor binds."""
+        host = self._capturing_function(caller_id)
+        if host is None or receiver_name in body_types:
+            return None
+        if receiver_name in self._bound_names_in(file_path, caller_id, language):
+            return None
+        return host
+
+    def _typing_scope(
+        self, file_path: str, caller_id: str, language: str, receiver_name: str
+    ) -> tuple[str, dict[str, str | None]]:
+        """The function whose body answers for *receiver_name*, with that body's types.
+
+        The caller's own, else, for an anonymous class member, out through each
+        enclosing function until one types or binds the name.
+        """
+        body_types = self._declared_types_in(file_path, caller_id, language)
+        host = self._capture_host(file_path, caller_id, language, receiver_name, body_types)
+        while host is not None:
+            body_types = self._captured_types(file_path, host, caller_id, language)
+            caller_id, host = host, self._capture_host(
+                file_path, host, language, receiver_name, body_types
+            )
+        return caller_id, body_types
+
+    def _captured_types(
+        self, file_path: str, host: str, caller_id: str, language: str
+    ) -> dict[str, str | None]:
+        """``{name: type}`` for the *host* locals its anonymous member *caller_id* sees.
+
+        Those declared above the member, outside every symbol nested in the
+        host, such as another anonymous class's method. A lambda is no symbol,
+        so its locals still read as the host's, as they do for the host's own
+        calls.
+        """
+        spans = self._spans_for(file_path)
+        start, end = spans[host][0], spans[caller_id][0] - 1
+        nested = merge_spans(
+            span for sym_id, span in spans.items() if sym_id != host and start < span[0] <= end
+        )
+        declarations = tuple(
+            d for d in self._declarations_for(file_path, language) if not in_spans(nested, d.line)
+        )
+        return types_in_span(declarations, start, end)
+
+    def _capturing_function(self, caller_id: str) -> str | None:
+        """The function an anonymous class member *caller_id* is declared in.
+
+        Found by walking up the member's id to the first symbol. A class there
+        (a field initializer's anonymous class) or an overloaded function,
+        whose id carries a signature the holder segment does not, answers None.
+        """
+        caller = self._symbols_by_id.get(caller_id)
+        if caller is None or not is_anonymous_member(caller):
+            return None
+        scope = _enclosing_id(caller_id)
+        while "::" in scope:
+            scope = _enclosing_id(scope)
+            holder = self._symbols_by_id.get(scope)
+            if holder is not None:
+                return scope if holder.kind in _FUNCTION_KINDS else None
+        return None
 
     def _caller_class_id(self, caller_id: str) -> str:
         """The id of the type whose method *caller_id* is.
@@ -763,7 +1008,9 @@ class ReceiverTypingMixin:
         language = self._typed_receiver_language(file_path, call)
         if language not in EXTERNAL_TYPE_LANGUAGES:
             return False
-        type_name, _ = self._receiver_type_and_scope(file_path, caller_id, language, receiver_name)
+        type_name, _, typing_file = self._receiver_type_and_scope(
+            file_path, caller_id, language, receiver_name
+        )
         if type_name is None or "::" in type_name:
             return False
         builtin = external_type_name(type_name)
@@ -771,7 +1018,7 @@ class ReceiverTypingMixin:
         head = type_qualifier(builtin or type_name) or builtin or type_name
         if head in self._known_type_names:
             return False
-        return builtin is not None or head in self._externally_bound_names(file_path)
+        return builtin is not None or head in self._externally_bound_names(typing_file)
 
     def _externally_bound_names(self, file_path: str) -> frozenset[str]:
         """Simple names this file imports from outside the repo.

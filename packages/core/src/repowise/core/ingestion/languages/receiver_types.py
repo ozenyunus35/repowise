@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_left, bisect_right
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import NamedTuple
 
 from ..language_data import get_builtin_types
@@ -240,6 +240,27 @@ _SWIFT_CONSTRUCTED = re.compile(
     r"(?<![\w.])(?:let|var)\s+(?P<name>[a-z_]\w*)\s*=\s*(?P<type>[A-Z]\w*)\s*\((?![^()]*\)\s*\.)"
 )
 
+# Dart writes the C family's `Type name`, plus a nullable `Api? api` and a named
+# parameter closing on `}`. Fields close on `;` or `=` as Java's do. A
+# constructor is no symbol here, so its parameters sit at class scope; nothing
+# inside parentheses owns a field (`_PARAMETERS_AT_CLASS_SCOPE`), which keeps
+# out `{Dao d = const Dao()}` too. An initialising formal (`Repo(this.api)`)
+# spells no type: the field it assigns already carries one.
+_DART_TYPED = re.compile(
+    rf"(?<![\w.])(?P<type>{_TYPE})\??\s+(?P<name>[a-z_]\w*)\s*(?=(?P<closer>[=;,)}}]))"
+)
+
+# `final x = Foo()`, `var`/`const`, with `new`/`const` before the type. The
+# `=` closer makes it a field at class scope, as `_TS_CONSTRUCTED`'s does. A
+# chain is refused as `_KT_CONSTRUCTED` refuses one, but a cascade
+# (`Paint()..color = c`) is still the `Paint`. `Foo.named()` is refused too:
+# a named constructor and a static call look the same.
+_DART_CONSTRUCTED = re.compile(
+    r"(?<![\w.])(?:final|var|const)\s+(?P<name>[a-z_]\w*)\s*(?P<closer>=)\s*"
+    r"(?:(?:new|const)\s+)?(?P<type>[A-Z]\w*)\s*(?:<(?:[^<>]|<[^<>]*>)*>)?\s*"
+    r"\((?![^()]*\)\s*\.(?!\.))"
+)
+
 # C++ writes ``T name`` with differences ``_TYPE`` cannot read: ``::`` qualifies,
 # ``*``/``&`` bind between type and name, and lowercase heads (the STL) are
 # ordinary. A keyword head is refused, or ``struct foo {`` would declare ``foo``
@@ -297,12 +318,14 @@ _C_FAMILY = (_TYPED_DECLARATION, _INFERRED_FROM_NEW)
 _GO_FAMILY = (_GO_PARAM, _GO_SHORT_DECL, _GO_VAR_DECL, _GO_FIELD, _GO_EMBEDDED_FIELD)
 _KT_FAMILY = (_KT_ANNOTATED, _KT_CONSTRUCTED)
 _SWIFT_FAMILY = (_SWIFT_ANNOTATED, _SWIFT_CONSTRUCTED)
+_DART_FAMILY = (_DART_TYPED, _DART_CONSTRUCTED)
 _PY_FAMILY = (_PY_ANNOTATED, _PY_CONSTRUCTED, _PY_SELF_ANNOTATED, _PY_SELF_CONSTRUCTED)
 _TS_FAMILY = (_TS_ANNOTATED, _TS_PARAMETER_PROPERTY, _TS_CONSTRUCTED)
 
 _LANGUAGE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "cpp": (_CPP_DECLARATION,),
     "csharp": _C_FAMILY,
+    "dart": _DART_FAMILY,
     "go": _GO_FAMILY,
     "java": _C_FAMILY,
     "kotlin": _KT_FAMILY,
@@ -319,7 +342,7 @@ RECEIVER_TYPE_LANGUAGES = frozenset(_LANGUAGE_PATTERNS)
 # writes ``self.foo.bar()``, a dotted receiver the grammar mints no call site
 # for, so class scope could only bind a bare local to a field. Membership rests
 # on the scan actually finding typed fields in the language's idiom.
-IMPLICIT_FIELD_LANGUAGES = frozenset({"csharp", "java", "kotlin", "swift"})
+IMPLICIT_FIELD_LANGUAGES = frozenset({"csharp", "dart", "java", "kotlin", "swift"})
 
 # Languages whose scan keeps a declaration of a builtin type, marked external,
 # so the resolver can refuse a call on it instead of matching the method name.
@@ -482,6 +505,60 @@ def _python_target_bindings(cleaned: str) -> set[tuple[int, str]]:
 BINDING_LANGUAGES = frozenset({"javascript", "python", "typescript"})
 _BINDING_SCAN_AS = {"javascript": "typescript"}
 
+# Names a body binds whatever their type: an untyped local, a loop variable, a
+# lambda or closure parameter. The scan sees only some of them, so these never
+# prove a name unbound; they only refuse a field of the same name, which class
+# scope would otherwise answer for (`{ api -> api.m() }` is not the field).
+# `(named, listed)` shapes; a lambda's list stays on its opening line.
+_JAVA_LAMBDA = (
+    re.compile(r"(?<![\w.])var\s+(?P<name>[a-z_]\w*)"),
+    re.compile(r"(?<![\w.])(?P<name>[a-z_]\w*)\s*->"),
+), (re.compile(r"\((?P<lhs>[\w\s,]*)\)\s*->"),)
+_LOCAL_NAME_SHAPES: dict[str, tuple[tuple[re.Pattern[str], ...], ...]] = {
+    "csharp": (
+        (
+            re.compile(r"(?<![\w.])var\s+(?P<name>[a-z_]\w*)"),
+            re.compile(r"(?<![\w.])(?P<name>[a-z_]\w*)\s*=>"),
+        ),
+        (re.compile(r"\((?P<lhs>[\w\s,]*)\)\s*=>"),),
+    ),
+    "dart": (
+        (
+            re.compile(
+                r"(?<![\w.])(?:final|var|const)\s+(?P<name>[a-z_]\w*)\b(?=\s*(?:[=;,]|in\b))"
+            ),
+        ),
+        # A function literal's list follows punctuation, never a name or `if`.
+        (
+            re.compile(
+                r"(?m)(?:(?<=[(,=:>])|^)\s*\((?P<lhs>[\w\s,]*)\)\s*(?:async\s*)?(?:=>|\{)"
+            ),
+        ),
+    ),
+    "java": _JAVA_LAMBDA,
+    "kotlin": (
+        (
+            re.compile(r"(?<![\w.])va[lr]\s+(?P<name>[a-z_]\w*)"),
+            re.compile(r"\bfor\s*\(\s*(?P<name>[a-z_]\w*)\s+in\b"),
+        ),
+        (re.compile(r"\{[ \t]*(?P<lhs>[\w \t,:?()]*?)->"),),
+    ),
+    "swift": (
+        # `guard let client else` and `if let client = self.client {` unwrap
+        # the field itself, so the name keeps the field's type.
+        (
+            re.compile(
+                r"(?<![\w.])(?:let|var)\s+(?P<name>[a-z_]\w*)\b"
+                r"(?!\s*(?:=\s*(?:self\.)?(?P=name)\s*)?(?:[,{]|else\b))"
+            ),
+        ),
+        (
+            re.compile(r"\{[ \t]*(?:\[[^\]\n]*\][ \t]*)?(?P<lhs>[\w \t,:?()]*?)[ \t]+in\b"),
+            re.compile(r"\bfor\s+(?:case\s+(?:let\s+)?)?(?P<lhs>\([^()\n]*\)|[a-z_]\w*)\s+in\b"),
+        ),
+    ),
+}
+
 
 def scan_bindings(text: str, language: str) -> tuple[tuple[int, str], ...]:
     """Every ``(line, name)`` *text* binds, in line order."""
@@ -494,12 +571,15 @@ def scan_binding_positions(text: str, language: str) -> tuple[tuple[int, int, st
     Ceiling: a block comment earlier on the same line shifts the column, since
     comments are blanked without keeping their width.
     """
-    if language not in BINDING_LANGUAGES:
+    local = _LOCAL_NAME_SHAPES.get(language)
+    if language not in BINDING_LANGUAGES and local is None:
         return ()
     language = _BINDING_SCAN_AS.get(language, language)
     cleaned = _without_comments(text, language)
     starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
-    if language == "typescript":
+    if local is not None:
+        found = _named_bindings(local[0], cleaned) | _listed_bindings(local[1], _PY_NAME, cleaned)
+    elif language == "typescript":
         found = _named_bindings(_TS_BINDINGS, cleaned)
         found |= _listed_bindings(_TS_TARGET_LISTS, _TS_IDENTIFIER, cleaned)
     else:
@@ -608,6 +688,7 @@ _LANGUAGE_BLOCK_COMMENTS: dict[str, re.Pattern[str]] = {
     # C++ needs the block strip for the reason Kotlin does: doxygen writes
     # `@param Type name`, which is exactly the shape the scan reads.
     "cpp": _BLOCK_COMMENT,
+    "dart": _BLOCK_COMMENT,
     "kotlin": _BLOCK_COMMENT,
     "typescript": _BLOCK_COMMENT,
 }
@@ -615,6 +696,7 @@ _LANGUAGE_BLOCK_COMMENTS: dict[str, re.Pattern[str]] = {
 _LANGUAGE_COMMENTS: dict[str, re.Pattern[str]] = {
     "cpp": _LINE_COMMENT,
     "csharp": _LINE_COMMENT,
+    "dart": _LINE_COMMENT,
     "go": _LINE_COMMENT,
     "java": _LINE_COMMENT,
     "kotlin": _LINE_COMMENT,
@@ -668,9 +750,14 @@ class Declaration(NamedTuple):
 _FIELD_CLOSERS = frozenset({";", "="})
 
 # Where a class-scope annotation may end its line: Python's ``x: T`` and a
-# semicolon-free TypeScript ``x: T`` are fields too.
+# semicolon-free TypeScript ``x: T`` are fields too. Kotlin and Swift keep a
+# closer only on a `val`/`var`/`let` match, so no parameter reaches here: a
+# Kotlin constructor property (`class R @Inject constructor(private val api:
+# Api)`) closes on `,` or `)`, a Swift computed property on `{`.
 _LANGUAGE_FIELD_CLOSERS: dict[str, frozenset[str]] = {
+    "kotlin": frozenset({"=", "\n", ",", ")"}),
     "python": frozenset({"=", "\n"}),
+    "swift": frozenset({"=", "\n", "{"}),
     "typescript": frozenset({";", "=", "\n"}),
 }
 
@@ -707,6 +794,29 @@ def _usable_type_name(raw: str, language: str) -> tuple[str | None, bool]:
     return name, inner is not None
 
 
+# Languages whose constructor parameter lists sit at class scope, unextracted,
+# with defaults closing on `=`: a declaration inside parentheses owns no field.
+_PARAMETERS_AT_CLASS_SCOPE = frozenset({"dart"})
+_PARENTHESIS = re.compile(r"[()]")
+
+
+def _inside_parentheses(cleaned: str) -> Callable[[int], bool]:
+    """Is an offset of *cleaned* inside a parenthesis? Strings are not skipped."""
+    offsets: list[int] = []
+    depths: list[int] = []
+    depth = 0
+    for match in _PARENTHESIS.finditer(cleaned):
+        depth += 1 if match.group() == "(" else -1
+        offsets.append(match.start())
+        depths.append(depth)
+
+    def inside(offset: int) -> bool:
+        index = bisect_left(offsets, offset) - 1
+        return index >= 0 and depths[index] > 0
+
+    return inside
+
+
 def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
     """Every declaration *text* makes, in line order."""
     patterns = _LANGUAGE_PATTERNS.get(language)
@@ -722,6 +832,7 @@ def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
     # walks the string character by character. Resolve each spelling once.
     resolved: dict[str, tuple[str | None, bool]] = {}
     found: list[Declaration] = []
+    inside = _inside_parentheses(cleaned) if language in _PARAMETERS_AT_CLASS_SCOPE else None
     for pattern in patterns:
         for match in pattern.finditer(cleaned):
             raw = match.group("type")
@@ -737,6 +848,8 @@ def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
             # (see `_KT_ANNOTATED`).
             closer = groups.get("closer") or ""
             if "keyword" in groups and not groups["keyword"]:
+                closer = ""
+            if inside is not None and inside(match.start()):
                 closer = ""
             found.append(
                 Declaration(

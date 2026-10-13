@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from repowise.core.git_head import read_head_commit
 from repowise.core.index_scope import (
     CANONICAL_INDEX_SCOPE_PROJECTION,
     INDEX_SCOPE_ENV,
@@ -73,46 +74,21 @@ _STALE_AGE_FLOOR_DAYS = 90
 def read_live_head(local_path: str | None) -> str | None:
     """Read the repo's current git HEAD SHA via plain file I/O.
 
-    Returns a full 40-char SHA, or ``None`` when the repo isn't a git checkout
-    on disk (hosted indexes, ephemeral clones). Avoids spawning ``git``: we
-    parse ``.git/HEAD`` and follow at most one ref — fast enough to call on
-    every MCP tool response without caching, and never blocks the event loop.
+    Returns a full SHA, or ``None`` when the repo isn't a git checkout on
+    disk (hosted indexes, ephemeral clones). Avoids spawning ``git``: the
+    shared reader parses ``HEAD`` and follows at most one ref — fast enough
+    to call on every MCP tool response without caching, and never blocks the
+    event loop. A linked worktree or submodule, whose ``.git`` is a
+    ``gitdir:`` file, resolves the same way.
 
     Detached HEADs are handled (the HEAD file contains the SHA directly).
     Unknown ref formats just return ``None`` rather than guessing — staleness
     semantics should fail closed (no warning) rather than open (false alarms).
+
+    ``repositories.head_commit`` is written by the same helper, so the
+    freshness comparison stays symmetric with what ``update`` stored.
     """
-    if not local_path:
-        return None
-    git_dir = Path(local_path) / ".git"
-    if not git_dir.is_dir():
-        return None
-    try:
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if head.startswith("ref: "):
-        ref_rel = head[5:].strip()
-        # Try the loose ref first, then packed-refs as a fallback. Packed-refs
-        # is common right after `git gc` or on freshly cloned repos.
-        ref_file = git_dir / ref_rel
-        try:
-            return ref_file.read_text(encoding="utf-8").strip() or None
-        except OSError:
-            pass
-        packed = git_dir / "packed-refs"
-        try:
-            for raw in packed.read_text(encoding="utf-8").splitlines():
-                if raw.startswith("#") or raw.startswith("^"):
-                    continue
-                sha, _, name = raw.partition(" ")
-                if name.strip() == ref_rel:
-                    return sha.strip() or None
-        except OSError:
-            return None
-        return None
-    # Detached HEAD: the file contains the SHA verbatim.
-    return head or None
+    return read_head_commit(local_path)
 
 
 def read_state_sync_commit(local_path: str | None) -> str | None:
@@ -849,6 +825,28 @@ def _release_meta() -> dict[str, Any]:
         "newer_release": (
             f"repowise {check.latest_version} is available, this server runs "
             f"{check.current_version}; upgrade and restart the MCP server"
+        )
+    }
+
+
+def keyless_note_meta() -> dict[str, Any]:
+    """Name what a key or a local model would add, once per process, the
+    first time ``get_answer`` degrades with ``no-llm-provider`` (#3105).
+
+    The agent reading a keyless answer is told synthesis is missing, but
+    nothing says how to get it. Same once-per-process shape as
+    :func:`_release_meta`: a fact the caller only needs once, not charged
+    against every later response's budget.
+    """
+    from repowise.server.mcp_server import _state
+
+    if _state._keyless_note_announced:
+        return {}
+    _state._keyless_note_announced = True
+    return {
+        "keyless_note": (
+            "repowise generate writes synthesized answers with a model "
+            "(needs a key, or --provider ollama for a local model)"
         )
     }
 

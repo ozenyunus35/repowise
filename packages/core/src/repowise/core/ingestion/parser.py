@@ -55,6 +55,7 @@ from .extractors import (
     refine_go_type_kind,
     refine_kotlin_class_kind,
     refine_pascal_type_kind,
+    refine_swift_class_kind,
 )
 from .extractors.bindings.elixir import elixir_import_modules
 from .extractors.bindings.python import expand_bare_relative_imports
@@ -121,10 +122,15 @@ from .parser_helpers import (
     _run_query,
     _rust_shadowed_by_type_param,
     _ts_nested_object_method_owner,
+    follow_renamed_hosts,
     import_load_kind,
+    in_anonymous_class,
+    is_anonymous_member,
+    scope_segment,
 )
-from .python_local_refs import extract_python_local_refs
+from .python_local_refs import local_refs_from_tree, parse_python_module
 from .python_overload import is_python_overload as _is_python_overload
+from .python_registrars import registering_functions
 from .python_tasks import is_fire_and_forget
 from .sfc_source import component_call_sites, prepare_source
 from .special_handlers import SPECIAL_HANDLER_LANGUAGES, parse_special
@@ -566,6 +572,16 @@ def _keep_ts_overloads_beside_a_body(symbols: list[Symbol], node_types: list[str
     ]
 
 
+def _drop_swift_extensions_of_local_types(symbols: list[Symbol]) -> list[Symbol]:
+    """Drop an ``extension`` of a type the same file declares.
+
+    It shares the type's id, so it would replace the type's node and kind; its
+    members already name the type as their parent.
+    """
+    declared = {s.id for s in symbols if s.kind != "impl"}
+    return [s for s in symbols if s.kind != "impl" or s.id not in declared]
+
+
 def _is_declaration(
     def_node: Node,
     config: LanguageConfig,
@@ -722,6 +738,9 @@ def _refine_symbol_kind(
     if kind == "class" and language == "kotlin" and node_type == "class_declaration":
         kind = refine_kotlin_class_kind(def_node)
 
+    if kind == "class" and language == "swift" and node_type == "class_declaration":
+        kind = refine_swift_class_kind(def_node)
+
     # Pascal ``declType`` wraps class, record, interface, enum and more.
     if kind == "class" and language == "pascal" and node_type == "declType":
         kind = refine_pascal_type_kind(def_node)
@@ -873,10 +892,16 @@ def _rust_outer_attributes(def_node: Node, src: str) -> list[str]:
 def _leading_child_attributes(
     def_node: Node, node_type: str, opener: str, closer: str, src: str
 ) -> list[str]:
-    """Inner text of the attribute children leading *def_node*, until the first other child."""
+    """Inner text of the attribute children leading *def_node*, until the first other child.
+
+    A comment between attribute lists does not end the run, so an attribute
+    placed after one is still recorded.
+    """
     attrs: list[str] = []
     for child in def_node.children:
         if child.type != node_type:
+            if child.type == "comment":
+                continue
             break
         attr_text = _node_text(child, src).strip()
         if attr_text.startswith(opener) and attr_text.endswith(closer):
@@ -1363,6 +1388,66 @@ def _parse_tree(
     return root, parse_errors, grammar_tag, language
 
 
+def _parent_type_name(ancestor: Node, src: str) -> str | None:
+    """The name a class/impl ancestor gives its members, without type arguments."""
+    name_node = ancestor.child_by_field_name("name") or (
+        ancestor.child_by_field_name("type")  # Rust impl_item
+    )
+    if name_node is None:
+        return None
+    # For Rust impl blocks with generic types (e.g. impl<T> Foo<T>),
+    # extract only the base type name, not the full generic signature.
+    if name_node.type in ("generic_type", "scoped_type_identifier"):
+        inner = name_node.child_by_field_name(
+            "type" if name_node.type == "generic_type" else "name"
+        )
+        if inner and inner.type == "type_identifier":
+            name_node = inner
+    return _node_text(name_node, src)
+
+
+def _nesting_parent(def_node: Node, config: LanguageConfig, src: str) -> str | None:
+    """The class/impl ancestor naming *def_node*'s parent.
+
+    An anonymous class is a class of its own, so its members gain segments
+    below it: ``Gson::FILTER::Filter::check``.
+    """
+    segments: list[str] = []
+    child, ancestor = def_node, def_node.parent
+    while ancestor is not None:
+        if ancestor.type in config.parent_class_types:
+            name = _parent_type_name(ancestor, src)
+            if name is not None:
+                return "::".join([name, *reversed(segments)])
+        else:
+            segment = scope_segment(
+                ancestor, child, bool(segments), config.anonymous_class_types, src
+            )
+            if segment is not None:
+                segments.append(segment)
+        child, ancestor = ancestor, ancestor.parent
+    # A Kotlin top-level function's object expression: ``f::Foo``.
+    return "::".join(reversed(segments)) or None
+
+
+def _java_enum_constant(def_node: Node, config: LanguageConfig, src: str) -> str | None:
+    """The enum constant whose body declares *def_node*, before any enclosing type.
+
+    An anonymous class is such a type: ``_find_parent`` names its members.
+    """
+    ancestor = def_node.parent
+    while (
+        ancestor is not None
+        and ancestor.type not in config.parent_class_types
+        and ancestor.type not in config.anonymous_class_types
+    ):
+        if ancestor.type == "enum_constant":
+            name = ancestor.child_by_field_name("name")
+            return _node_text(name, src) if name else None
+        ancestor = ancestor.parent
+    return None
+
+
 class ASTParser:
     """Unified AST parser — works for all languages via .scm query files.
 
@@ -1495,8 +1580,12 @@ class ASTParser:
             existing = {(s.id, symbol_discriminator(s)) for s in symbols}
             symbols.extend(s for s in synthetic if (s.id, symbol_discriminator(s)) not in existing)
         # Before calls and references are extracted, so both attribute to the
-        # final ids.
-        disambiguate_colliding_ids(symbols, lang)
+        # final ids. Anonymous members go last, once the overloads holding them
+        # carry their discriminators.
+        anonymous = [s for s in symbols if is_anonymous_member(s)]
+        disambiguate_colliding_ids([s for s in symbols if not is_anonymous_member(s)], lang)
+        follow_renamed_hosts(symbols)
+        disambiguate_colliding_ids(anonymous, lang)
         imports = self._extract_imports(matches, config, file_info, src)
         calls = self._extract_calls(matches, config, file_info, src, symbols)
         # An SFC instantiates a component by writing its tag in the markup
@@ -1521,13 +1610,9 @@ class ASTParser:
         # (callable passed as an arg, type annotation, decorator, default)
         # carry no graph edge, so the dead-code unused-export pass would flag
         # them. Stamp the referenced names so the analyzer can rescue them.
-        local_refs: frozenset[str] = frozenset()
-        if lang == "python":
-            top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
-            nested_classes = {
-                (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
-            }
-            local_refs = extract_python_local_refs(src, top_level_names, nested_classes)
+        local_refs, registrars = (
+            _python_module_facts(src, symbols) if lang == "python" else (frozenset(), frozenset())
+        )
 
         if len(symbols) > _SYMBOL_COUNT_WARN_THRESHOLD:
             log.warning(
@@ -1551,6 +1636,7 @@ class ASTParser:
             content_hash=content_hash,
             type_refs=type_refs,
             local_refs=local_refs,
+            registrars=registrars,
             references=references,
         )
 
@@ -1628,6 +1714,9 @@ class ASTParser:
         if language in _TS_JS_LANGUAGES:
             symbols = _keep_ts_overloads_beside_a_body(symbols, node_types)
 
+        if language == "swift":
+            symbols = _drop_swift_extensions_of_local_types(symbols)
+
         # A .m file routinely declares its private methods in a class
         # extension and defines them below in the @implementation, which
         # builds each symbol id twice in one file.
@@ -1672,7 +1761,10 @@ class ASTParser:
             language,
             src,
             cpp_exports.container_ids,
-            keep_nested=object_owner is not None,
+            # An anonymous class member is a method of its own class, even
+            # inside another method's body; ``_find_parent`` names it.
+            keep_nested=object_owner is not None
+            or in_anonymous_class(def_node, config.anonymous_class_types),
         )
         if kind is None:
             return None
@@ -1724,15 +1816,15 @@ class ASTParser:
 
         params_nodes = capture_dict.get("symbol.params", [])
         params_text = _node_text(params_nodes[0], src) if params_nodes else ""
-        sym_id = (
-            f"{file_info.path}::{parent_name}::{name}"
-            if parent_name
-            else f"{file_info.path}::{name}"
-        )
+        # The id scope adds a Java enum constant to its parent, so each
+        # constant's override is its own node while the enum stays its owner.
+        constant = _java_enum_constant(def_node, config, src) if language == "java" else None
+        scope = f"{parent_name}::{constant}" if parent_name and constant else parent_name
+        sym_id = f"{file_info.path}::{scope}::{name}" if scope else f"{file_info.path}::{name}"
         symbol = Symbol(
             id=sym_id,
             name=name,
-            qualified_name=_build_qualified_name(file_info.path, parent_name, name),
+            qualified_name=_build_qualified_name(file_info.path, scope, name),
             kind=kind,  # type: ignore[arg-type]
             signature=build_signature(node_type, name, params_text, def_node, src),
             start_line=start_line,
@@ -1853,27 +1945,7 @@ class ASTParser:
             return None
 
         if config.parent_extraction in ("nesting", "impl"):
-            # Walk up the AST to find a class/impl ancestor
-            ancestor = def_node.parent
-            while ancestor is not None:
-                if ancestor.type in config.parent_class_types:
-                    name_node = ancestor.child_by_field_name("name") or (
-                        ancestor.child_by_field_name("type")  # Rust impl_item
-                    )
-                    if name_node:
-                        # For Rust impl blocks with generic types (e.g. impl<T> Foo<T>),
-                        # extract only the base type name, not the full generic signature.
-                        if name_node.type == "generic_type":
-                            inner = name_node.child_by_field_name("type")
-                            if inner and inner.type == "type_identifier":
-                                name_node = inner
-                        elif name_node.type == "scoped_type_identifier":
-                            inner = name_node.child_by_field_name("name")
-                            if inner and inner.type == "type_identifier":
-                                name_node = inner
-                        return _node_text(name_node, src)
-                ancestor = ancestor.parent
-            return None
+            return _nesting_parent(def_node, config, src)
 
         return None  # "none" mode
 
@@ -2260,6 +2332,26 @@ class ASTParser:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_PARSER: ASTParser | None = None
+
+
+def _python_module_facts(
+    src: str, symbols: list[Symbol]
+) -> tuple[frozenset[str], frozenset[str]]:
+    """``(local_refs, registrars)`` for a Python module, from one ``ast`` parse.
+
+    See ``python_local_refs`` and ``python_registrars``.
+    """
+    top_level_names = {s.name for s in symbols if s.name and not s.parent_name}
+    tree = parse_python_module(src) if top_level_names else None
+    if tree is None:
+        return frozenset(), frozenset()
+    nested_classes = {
+        (s.parent_name, s.name) for s in symbols if s.kind == "class" and s.parent_name
+    }
+    return (
+        local_refs_from_tree(tree, top_level_names, nested_classes),
+        registering_functions(tree),
+    )
 
 
 def parse_file(file_info: FileInfo, source: bytes) -> ParsedFile:

@@ -66,7 +66,7 @@ from .doc_drift import (
     serialize_doc_drift_row,
     summarize_confidence_rows,
 )
-from .function_facts import get_function_facts, write_function_facts
+from .function_facts import get_function_facts, tests_for_functions, write_function_facts
 from .health import (
     FILE_TREND_SNAPSHOT_WINDOW,
     HEALTH_SNAPSHOT_RETENTION,
@@ -99,6 +99,7 @@ from .health import (
 )
 from .performance import (
     finalize_performance_opportunities,
+    gated_performance_counts,
     get_health_finding_by_public_id,
     get_performance_opportunity,
     get_performance_plan_rows,
@@ -156,6 +157,7 @@ __all__ = [
     "finalize_refactoring_opportunities",
     "finalize_refactoring_suggestions",
     "finding_data_from_row",
+    "gated_performance_counts",
     "get_average_health",
     "get_coverage_summary",
     "get_dead_code_findings",
@@ -223,6 +225,7 @@ __all__ = [
     "summarize_open_plans",
     "tests_covering",
     "tests_covering_files",
+    "tests_for_functions",
     "update_dead_code_status",
     "update_health_finding_status",
     "update_refactoring_opportunity_status",

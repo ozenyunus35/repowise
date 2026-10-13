@@ -72,24 +72,33 @@
 ; ---------------------------------------------------------------------------
 
 ; Simple call: foo(args)
+; The "(" child is load-bearing: a subscript read ``items[0]`` parses as a
+; call_expression too, with "[" in its value_arguments, and is not a call.
 (call_expression
   (simple_identifier) @call.target
   (call_suffix
-    (value_arguments) @call.arguments
+    (value_arguments "(") @call.arguments
   )
 ) @call.site
 
 ; Member call: obj.method(args) — and self-dispatch: self.method(args).
 ; Swift spells it ``self``, which the resolver treats identically to ``this``.
 ; See typescript.scm for why this is an alternation rather than a second pattern.
+; ``self.field.method()`` captures the field, as java.scm does.
 (call_expression
   (navigation_expression
-    [(simple_identifier) (self_expression)] @call.receiver
+    [
+      (simple_identifier) @call.receiver
+      (self_expression) @call.receiver
+      (navigation_expression
+        (self_expression)
+        (navigation_suffix (simple_identifier) @call.receiver))
+    ]
     (navigation_suffix
       (simple_identifier) @call.target
     )
   )
   (call_suffix
-    (value_arguments) @call.arguments
+    (value_arguments "(") @call.arguments
   )
 ) @call.site

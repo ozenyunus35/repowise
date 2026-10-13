@@ -25,6 +25,7 @@ per strategy, and it is what the edge carries.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import PurePosixPath
 from typing import Any
@@ -40,6 +41,8 @@ from .call_receiver_typing import (
     ReceiverTypingMixin,
     _store_capped,
 )
+from .decorator_names import decorator_base
+from .lang_helpers.anonymous_classes import is_anonymous_member
 from .language_data import (
     get_builtin_methods,
     get_builtin_types,
@@ -63,7 +66,7 @@ from .return_types import (
     signature_parameter_count,
     signature_parameter_range,
 )
-from .symbol_identity import id_segment_name, split_symbol_id
+from .symbol_identity import id_segment_name, outer_scope, pair_overloads, split_symbol_id
 from .type_names import (
     csharp_extension_receiver,
     is_resolvable_type_name,
@@ -80,13 +83,11 @@ _IMPLICIT_RECEIVER_LANGUAGES = frozenset({"java", "csharp", "cpp", "kotlin"})
 # its ancestors, for an explicit ``self``/``this`` receiver and an implicit one.
 #
 # C++ is absent because its heritage binds a qualified external parent to a
-# same-named local type, putting unrelated siblings in one hierarchy. Java is
-# absent because `java.scm`'s bare-call pattern also matches `this.field.m()`,
-# which then arrives here indistinguishable from a real implicit receiver.
+# same-named local type, putting unrelated siblings in one hierarchy.
 #
 # C# is present: the tier answers with a name's overload set, and
 # ``resolve_file`` narrows it to the member the argument count names.
-_INHERITED_LANGUAGES = frozenset({"kotlin", "python", "typescript", "swift", "csharp"})
+_INHERITED_LANGUAGES = frozenset({"java", "kotlin", "python", "typescript", "swift", "csharp"})
 
 # VB.NET's own-instance receivers, lowercased: the language is case-insensitive.
 _VBNET_SELF_RECEIVERS = frozenset({"me", "myclass"})
@@ -101,6 +102,15 @@ _LEXICAL_BARE_NAME_LANGUAGES = frozenset({"elixir", "fsharp"})
 # never the rest of ``a``. Rust is not lexical above: its receiver-less call
 # sites are mostly chained method calls, which repo-wide uniqueness still serves.
 _NAMED_IMPORT_SCOPE_LANGUAGES = _LEXICAL_BARE_NAME_LANGUAGES | {"rust"}
+
+# Languages whose module-alias binding always names a module, so a call through
+# it reaches only top-level declarations. C# is absent because ``using A = N.T;``
+# may alias a type, whose members it does reach. C, C++ and Ruby are absent
+# because their "alias" is an included file's stem, which a call can only match
+# by coinciding with a variable's name.
+_MODULE_ONLY_ALIAS_LANGUAGES = frozenset(
+    {"python", "typescript", "javascript", "svelte", "vue", "dart", "go", "rust", "swift"}
+)
 
 # The sentinel an import that binds a whole module's public names carries.
 _WILDCARD_IMPORTED_NAMES = ["*"]
@@ -124,6 +134,12 @@ _MAX_ANCESTOR_EXPAND_DEPTH = 3
 # other language spells its fields ``variable``, indistinguishable by kind.
 _NON_CALLABLE_KINDS = frozenset({"property"})
 
+# A Rust ``impl`` or Swift ``extension`` block is named for the type it adds
+# members to and declares nothing itself, so no bare name means it: ``Text(..)``
+# constructs SwiftUI's ``Text``, not the repo's ``extension Text``. Kept out of
+# the bare-name indices; its members still resolve through the method index.
+_EXTENSION_KINDS = frozenset({"impl"})
+
 # A getter and its setter are two declarations under one id, which reads as an
 # overload set and is not one: the name is an attribute, not a callable.
 _PROPERTY_DECORATORS = frozenset({"property", "cached_property"})
@@ -132,7 +148,7 @@ _PROPERTY_ACCESSOR_SUFFIXES = (".setter", ".getter", ".deleter")
 
 def _is_property_accessor(sym: Any) -> bool:
     for decorator in getattr(sym, "decorators", ()) or ():
-        tail = decorator.lstrip("@").strip()
+        tail = decorator_base(decorator)
         if tail in _PROPERTY_DECORATORS or tail.endswith(_PROPERTY_ACCESSOR_SUFFIXES):
             return True
     return False
@@ -140,7 +156,7 @@ def _is_property_accessor(sym: Any) -> bool:
 
 # Languages admitted to the full return-type chain lane; each is admitted
 # explicitly, once measured.
-PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset({"cpp", "csharp", "go"})
+PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset({"cpp", "csharp", "go", "java"})
 
 # Chain lanes that need a file or import/re-export identity for the head type:
 # a repository-global simple type name is not a language binding.
@@ -168,6 +184,23 @@ def _overload_return_types(
             )
             found[key].add(normalized)
     return found
+
+
+def _overload_phase(admitted: tuple[int, int | None], argument_count: int) -> int | None:
+    """The first phase in which a member with *admitted* arguments takes the call.
+
+    0 for exactly that arity, 1 when its defaults admit the count (Java's first
+    phase, C#'s normal form), 2 when its varargs or ``params`` expand to it,
+    and None when it cannot take the call.
+    """
+    fewest, most = admitted
+    if argument_count < fewest:
+        return None
+    if most is None:
+        return 2
+    if argument_count > most:
+        return None
+    return 0 if fewest == most else 1
 
 
 def _flattened_wildcard_source(imp: Import) -> str | None:
@@ -265,8 +298,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         )
         self._ancestors: dict[str, tuple[str, ...]] = {}
         self._mros: dict[str, tuple[str, ...] | None] = {}
+        # {type name: [(file, identity, arity)]}, filled by ``_declared_types_named``.
+        self._declared_types: dict[str, list[tuple[str, tuple[str, ...], int]]] = {}
         # Per-file symbol index: {file_path: {symbol_name: symbol_id}}
         self._file_symbols: dict[str, dict[str, str]] = {}
+        # The same, top-level symbols only: what a module alias can reach.
+        self._file_top_level: dict[str, dict[str, str]] = {}
 
         # Per-file method index: {file_path: {(class_name, method_name): symbol_id}}
         self._file_methods: dict[str, dict[tuple[str, str], str]] = {}
@@ -296,6 +333,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # {representative: ((member id, (fewest, most) arguments), ...)}.
         self._overload_rep: dict[str, str] = {}
         self._overload_members: dict[str, tuple[tuple[str, tuple[int, int | None]], ...]] = {}
+        # Representatives of sets with a member whose range is unknown; a count
+        # cannot choose there, since that member may admit it too.
+        self._unranged_overload_sets: set[str] = set()
         self._symbols_by_id = {
             symbol.id: symbol for parsed in parsed_files.values() for symbol in parsed.symbols
         }
@@ -525,6 +565,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     ) -> None:
         """Index one file's symbols, collecting what is settled repo-wide later."""
         file_syms: dict[str, str] = {}
+        top_level: dict[str, str] = {}
         file_methods: dict[tuple[str, str], str] = {}
         representatives = self._index_overload_sets(parsed)
 
@@ -534,20 +575,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             decl_key = (sym.parent_name, sym.name)
             if sym.is_declaration:
                 declarations.append((path, index_id, decl_key))
-                # A declaration must never displace a definition already
-                # indexed under this name — a .cpp that forward-declares a
-                # helper above its own body holds both.
-                #
-                # A method declaration stays out: this index answers
-                # unqualified lookups from importing files, and no bare name
-                # can legally reach a method. The (class, method) index
-                # below still takes it.
-                if sym.parent_name is None:
-                    file_syms.setdefault(sym.name, index_id)
             else:
                 definitions[decl_key].append((path, index_id))
-                # File-level symbol index (top-level symbols and methods)
-                file_syms[sym.name] = index_id
+            _index_bare_name(sym, index_id, file_syms, top_level)
 
             # Method index: (class_name, method_name) → symbol_id
             if sym.parent_name:
@@ -562,6 +592,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             self._index_globally(path, sym, index_id)
 
         self._file_symbols[path] = file_syms
+        self._file_top_level[path] = top_level
         self._file_methods[path] = file_methods
 
     def _csharp_extended_type(self, sym: Symbol) -> str | None:
@@ -580,8 +611,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             self._non_callable_ids.add(index_id)
         if _is_property_accessor(sym):
             self._property_accessor_ids.add(index_id)
-        # Same rule as the per-file index, for the global-unique tier.
-        if not (sym.is_declaration and sym.parent_name is not None):
+        # Same rules as the per-file index, for the global-unique tier.
+        bodiless_method = sym.is_declaration and sym.parent_name is not None
+        if not (bodiless_method or sym.kind in _EXTENSION_KINDS or is_anonymous_member(sym)):
             self._global_symbols[sym.name].append(index_id)
 
     def _index_overload_sets(self, parsed: ParsedFile) -> dict[str, str]:
@@ -593,7 +625,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         members: dict[str, list[Symbol]] = defaultdict(list)
         for sym in parsed.symbols:
             base, payload = split_symbol_id(sym.id)
-            if payload is not None and payload.isdigit():
+            if payload is not None and payload[0].isdigit():
                 members[base].append(sym)
         representatives: dict[str, str] = {}
         for overloads in members.values():
@@ -603,7 +635,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             for sym in overloads:
                 representatives[sym.id] = rep
                 admitted = signature_parameter_range(sym.signature or "", sym.language)
-                if admitted is not None:
+                if admitted is None:
+                    self._unranged_overload_sets.add(rep)
+                else:
                     ranges.setdefault(sym.id, admitted)
             self._overload_members[rep] = tuple(ranges.items())
         self._overload_rep.update(representatives)
@@ -613,27 +647,49 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """Pair each member of a declared overload set with its definition.
 
         ``_link_declarations`` pairs a declared set with a defined one by their
-        representatives; the other members pair here by parameter count, so
-        each declaration records its definition. The definition also admits
+        representatives; the members pair here by parameter count and types
+        (``pair_overloads``), so each declaration records its definition, even
+        when the source defines one plain-id member. The definition also admits
         the defaults its declaration writes: C++ writes them on the header
         declaration only, so ``f(int, int)`` alone would refuse the one-argument
         call ``f(int, int = 0)`` admits.
         """
+        symbols = self._symbols_by_id
         for declared, defined in list(self._decl_to_def.items()):
             declared_members = self._overload_members.get(declared, ())
+            if not declared_members:
+                continue
             defined_members = self._overload_members.get(defined, ())
-            by_count = {split_symbol_id(member)[1]: member for member, _ in defined_members}
-            floors: dict[str, int] = {}
-            for member, (fewest, _most) in declared_members:
-                target = by_count.get(split_symbol_id(member)[1])
-                if target is not None:
-                    self._decl_to_def.setdefault(member, target)
-                    floors[target] = min(fewest, floors.get(target, fewest))
-            if floors:
-                self._overload_members[defined] = tuple(
-                    (member, (min(fewest, floors.get(member, fewest)), most))
-                    for member, (fewest, most) in defined_members
-                )
+            pairs = pair_overloads(
+                [symbols[member] for member, _ in declared_members],
+                [symbols[member] for member, _ in defined_members] or [symbols[defined]],
+            )
+            for member, target in pairs.items():
+                self._decl_to_def[member] = target
+            # The representative was linked by name alone; a definition its own
+            # signature does not reach belongs to another member.
+            if pairs and declared not in pairs:
+                del self._decl_to_def[declared]
+            if defined_members:
+                self._carry_declared_floors(defined, declared_members, pairs)
+
+    def _carry_declared_floors(
+        self,
+        defined: str,
+        declared_members: tuple[tuple[str, tuple[int, int | None]], ...],
+        pairs: dict[str, str],
+    ) -> None:
+        """Lower each paired definition's fewest arguments to its declaration's."""
+        floors: dict[str, int] = {}
+        for member, (fewest, _most) in declared_members:
+            target = pairs.get(member)
+            if target is not None:
+                floors[target] = min(fewest, floors.get(target, fewest))
+        if floors:
+            self._overload_members[defined] = tuple(
+                (member, (min(fewest, floors.get(member, fewest)), most))
+                for member, (fewest, most) in self._overload_members[defined]
+            )
 
     def _index_extension_methods(
         self, candidates: dict[tuple[str, str], set[tuple[str, str]]]
@@ -736,16 +792,18 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             resolved.origin,
         )
 
-    def _published(self, file_path: str, name: str) -> str | None:
+    def _published(self, file_path: str, name: str, *, top_level: bool = False) -> str | None:
         """The symbol *file_path* publishes under *name*, or None.
 
         A module may declare a symbol under one name and export it under
         another — ``export { stringType as string }`` — and every lookup that
         arrives through a namespace, a barrel or an import asks for the
         published name while the symbol table holds the local one. The table
-        answers first, so the alias can only ever add a hit.
+        answers first, so the alias can only ever add a hit. *top_level*
+        leaves class members out of the lookup.
         """
-        symbols = self._file_symbols.get(file_path, {})
+        table = self._file_top_level if top_level else self._file_symbols
+        symbols = table.get(file_path, {})
         found = symbols.get(name)
         if found is not None:
             return found
@@ -858,14 +916,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """Move an edge on an overload set onto the member its arguments call.
 
         Every tier answers with the set's representative; this is the one place
-        a member is chosen. A count no member admits, a tie, or an unknown count
-        (a method reference, a C# method group) keeps the representative. An
-        overload calling itself is recursion, which draws no edge.
+        a member is chosen (``_overload_target``). An overload calling itself is
+        recursion, which draws no edge.
         """
         rep = self._overload_rep.get(resolved.callee_id)
         if rep is None:
             return resolved
-        target = self._pick_overload(rep, call.argument_count) or rep
+        target = self._overload_target(rep, call.argument_count)
         if target == resolved.caller_id:
             return None
         return resolved if target == resolved.callee_id else replace(resolved, callee_id=target)
@@ -878,16 +935,45 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         form), then one whose varargs or ``params`` expand to it. The first
         phase with any candidate decides, and two candidates there are a tie.
         """
-        if argument_count is None:
-            return None
-        members = self._overload_members.get(rep, ())
-        phases = (
-            [m for m, (fewest, most) in members if fewest == most == argument_count],
-            [m for m, (fewest, most) in members if most is not None and fewest <= argument_count <= most],
-            [m for m, (fewest, most) in members if most is None and fewest <= argument_count],
-        )
-        found = next((phase for phase in phases if phase), [])
+        found = self._deciding_overloads(rep, argument_count)
         return found[0] if len(found) == 1 else None
+
+    def _overload_target(self, rep: str, argument_count: int | None) -> str:
+        """The member of *rep*'s set a call lands on.
+
+        The member ``_pick_overload`` names, else the representative when the
+        count cannot choose: it is unknown (a method reference, a C# method
+        group), no member admits it, or a member's range is unknown, since
+        that member may admit it too. A tie keeps the representative when it
+        is one of the tied members. A tie among others takes the first of them in declaration
+        order, the order the overload index records: ``charset(x)`` over
+        ``charset()``, ``charset(String)`` and ``charset(Charset)`` never means
+        the no-argument representative, but it does mean the set, which dead
+        code judges as one unit and a constructor set needs for any inbound
+        edge at all.
+        """
+        found = self._deciding_overloads(rep, argument_count)
+        if len(found) == 1:
+            return found[0]
+        tied = self._tied_without_representative(rep, found)
+        return tied[0] if tied else rep
+
+    def _tied_without_representative(self, rep: str, found: list[str]) -> list[str]:
+        """*found* when it is a tie the representative is not in."""
+        if len(found) > 1 and rep not in found:
+            return found
+        return []
+
+    def _deciding_overloads(self, rep: str, argument_count: int | None) -> list[str]:
+        """The members of the first phase with any candidate for *argument_count*."""
+        if argument_count is None or rep in self._unranged_overload_sets:
+            return []
+        phases: dict[int, list[str]] = defaultdict(list)
+        for member, admitted in self._overload_members.get(rep, ()):
+            phase = _overload_phase(admitted, argument_count)
+            if phase is not None:
+                phases[phase].append(member)
+        return phases[min(phases)] if phases else []
 
     def _overload_sibling_call(self, call: CallSite) -> ResolvedCall | None:
         """An overload calling another member of its own set, ``f(a)`` inside ``f(a, b)``.
@@ -913,7 +999,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         language = self._language_of(file_path) or ""
         receiver_call = call.receiver_call
-        if language == "python" and _is_super_receiver(receiver_call):
+        if _is_super_call(call, language):
             return self._with_props(self._super_call(call, caller_id), call)
         # A language with an `external_return_types` table reaches the tier for
         # that table alone; only the constant above admits the full lane.
@@ -927,12 +1013,15 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             if handled:
                 return resolved
 
+        bare_fallback = self._strategies_for(file_path).member_bare_fallback
         # --- Method call with receiver: receiver.method() ---
         if call.receiver_name:
             handled, hit = self._resolve_member_call(file_path, call, caller_id)
-            if not handled and call.bare_name_fallback:
+            if not handled and call.bare_name_fallback and bare_fallback:
                 hit = self._resolve_free_call(file_path, call, caller_id)
             return self._with_props(hit, call)
+        if receiver_call is not None and not bare_fallback:
+            return None
 
         # --- Free function call: function() ---
         return self._with_props(self._resolve_free_call(file_path, call, caller_id), call)
@@ -1166,7 +1255,18 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         callee_id = resolved_inner.callee_id
         rep = self._overload_rep.get(callee_id)
         if rep is not None:
-            callee_id = self._pick_overload(rep, inner.argument_count) or callee_id
+            tied = self._tied_without_representative(
+                rep, self._deciding_overloads(rep, inner.argument_count)
+            )
+            # A tie names a type only when every tied member returns it.
+            returns = {
+                self._callee_return_type(member, inner.argument_count, language) for member in tied
+            }
+            if len(returns) > 1 or None in returns:
+                return None
+            target = self._overload_target(rep, inner.argument_count)
+            if target != rep:
+                callee_id = target
         return callee_id
 
     def _callee_chain_return_type(
@@ -1183,11 +1283,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         A receiver records one hop, but the parser keeps every link of a chain
         as its own site on the chain's first line, so the hop below is read
-        off the site *inner* names. Only C# reads it; elsewhere an inner call
-        is still typed as if nothing were chained under it. Go reads it too, so a
-        builder chain types each link from the one before.
+        off the site *inner* names. C#, Go and Java read it, so a builder chain
+        types each link from the one before; elsewhere an inner call is still
+        typed as if nothing were chained under it.
         """
-        if language not in ("csharp", "go"):
+        if language not in ("csharp", "go", "java"):
             return None
         sites = self._chained_sites.get(file_path)
         if sites is None:
@@ -1245,16 +1345,22 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         class ``A`` would bind to class ``B``'s ``foo`` when ``B`` came later in
         the file. ``_file_methods`` carries the class. A member call on its bare
         fallback has an explicit receiver, so the caller's class is not it.
+        An anonymous class or enum-constant body (``Gson::FILTER::Filter``)
+        sees its own members first, then those of the class around it.
         """
         parsed = self._parsed_files.get(file_path)
         if parsed is None or parsed.file_info.language not in _IMPLICIT_RECEIVER_LANGUAGES:
             return None
         if call.receiver_name:
             return None
+        methods = self._file_methods.get(file_path, {})
         caller_class = _extract_class_from_symbol_id(caller_id)
-        if not caller_class:
-            return None
-        return self._file_methods.get(file_path, {}).get((caller_class, call.target_name))
+        while caller_class:
+            own = methods.get((caller_class, call.target_name))
+            if own is not None:
+                return own
+            caller_class = outer_scope(caller_class)
+        return None
 
     def _partial_fragment_member(self, file_path: str, caller_id: str, name: str) -> str | None:
         """The caller's class member *name* declared in another fragment of it.
@@ -1371,10 +1477,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         caller_id: str,
     ) -> tuple[bool, ResolvedCall | None]:
         """Tier 1, as ``(handled, edge)``: a handled None is a refusal."""
+        own = self._enclosing_class_method(file_path, call, caller_id)
+        if self._is_anonymous_id(own):
+            return True, _own_member_call(caller_id, own, call)
         callee_id = self._file_symbols.get(file_path, {}).get(call.target_name)
         if callee_id is None:
             return False, None
-        own = self._enclosing_class_method(file_path, call, caller_id)
         if own is not None and own != callee_id and _rivals_a_class_method(callee_id):
             if own == caller_id:
                 # Recursion the flat index handed to a stranger. No edge.
@@ -1383,6 +1491,10 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         if callee_id != caller_id:  # no self-recursion edges for now
             return True, ResolvedCall(caller_id, callee_id, 0.95, call.line, "same_file")
         return False, None
+
+    def _is_anonymous_id(self, sym_id: str | None) -> bool:
+        """Does *sym_id* name an anonymous class member?"""
+        return sym_id is not None and is_anonymous_member(self._symbols_by_id[sym_id])
 
     def _bound_import_call(
         self,
@@ -1451,6 +1563,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     ) -> ResolvedCall | None:
         """Tier 3 and what follows it: answers not grounded in this file or its imports."""
         target_name = call.target_name
+        # Ahead of tier 3: the caller's own hierarchy is better evidence than
+        # repo-wide uniqueness, and a JVM package sibling's member never answers.
+        inherited = self._implicit_inherited_call(file_path, call, caller_id)
+        if inherited is not None:
+            return inherited
         # Tier 3: global unique match, only within the same language.
         # Uniqueness is judged before filtering data members, on purpose: filtering
         # them out first would re-uniquify a name a field and a method share. A
@@ -1465,13 +1582,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 file_path, call, caller_id, target_name, candidates[0]
             )
 
-        inherited = self._implicit_inherited_call(file_path, call, caller_id)
-        if inherited is not None:
-            return inherited
-
-        # An overload set is several declarations under one id, not an
-        # ambiguity. Asked after the inherited tier, which answers with more
-        # confidence when the caller's own hierarchy declares the name.
+        # An overload set is several declarations under one id, not an ambiguity.
         collapsed = self._collapse_declarations(candidates)
         if len(candidates) <= 1 or len(collapsed) != 1:
             return None
@@ -1498,8 +1609,8 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     ) -> ResolvedCall | None:
         """A bare call an ancestor of the caller's class answers.
 
-        Asked after tier 3, so it can only add an edge. A member call on its
-        bare fallback is refused, as in ``_enclosing_class_method``.
+        A member call on its bare fallback is refused, as in
+        ``_enclosing_class_method``.
         """
         lang = self._language_of(file_path)
         if lang not in _IMPLICIT_RECEIVER_LANGUAGES or lang not in _INHERITED_LANGUAGES:
@@ -1613,7 +1724,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # Strategy 1: receiver is a module alias (e.g. "import models" → "models.User()")
         module_file = self._module_aliases.get(file_path, {}).get(receiver_name)
         if module_file:
-            return self._module_alias_call(module_file, call, caller_id)
+            return self._module_alias_call(file_path, module_file, call, caller_id)
 
         # Strategy 1b: receiver in import names (non-alias fallback for backward compat)
         name_to_file = self._import_names.get(file_path, {})
@@ -1626,12 +1737,19 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
     def _module_alias_call(
         self,
+        file_path: str,
         module_file: str,
         call: CallSite,
         caller_id: str,
     ) -> ResolvedCall | None:
         method_name = call.target_name
-        published = self._published_by(module_file, call.receiver_name, method_name)
+        # Where the alias can only name a module, ``log.message()`` reaches the
+        # module's own ``message``, never a same-named method of a class in it.
+        top_level = self._language_of(file_path) in _MODULE_ONLY_ALIAS_LANGUAGES
+        if top_level:
+            published = self._published(module_file, method_name, top_level=True)
+        else:
+            published = self._published_by(module_file, call.receiver_name, method_name)
         if published is not None:
             return ResolvedCall(caller_id, published, 0.88, call.line, "module_alias")
         # A namespace over a barrel declares nothing of its own, so chase the
@@ -1642,7 +1760,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         binding = self._import_bindings.get(module_file, {}).get(method_name)
         declared_name = (binding.exported_name if binding else None) or method_name
-        published = self._published(origin, declared_name)
+        published = self._published(origin, declared_name, top_level=top_level)
         if published is None:
             return None
         return ResolvedCall(caller_id, published, 0.88, call.line, "module_alias")
@@ -1750,6 +1868,8 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     def _super_call(self, call: CallSite, caller_id: str) -> ResolvedCall | None:
         """``super().m()``: the first class after the caller's own in its MRO to declare ``m``.
 
+        Java's ``super.m()`` arrives here too, with ``super`` as its receiver.
+
         Never handed to the bare-name tiers, which answered with whichever
         same-named method the file declared last. A base outside the
         repository ends the walk unresolved: it may declare ``m`` itself.
@@ -1847,14 +1967,52 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         return self._ancestor_method(class_id, method_name, caller_id)
 
-    def _ancestor_method(self, class_id: str, method_name: str, caller_id: str) -> str | None:
-        """The one method of this name *class_id*'s ancestors declare, never the caller."""
+    def _ancestor_method(
+        self, class_id: str, method_name: str, caller_id: str, *, class_chain_first: bool = False
+    ) -> str | None:
+        """The one method of this name *class_id*'s ancestors declare, never the caller.
+
+        With *class_chain_first*, Java's rule: the nearest declaration up the
+        single superclass chain overrides the rest, so it answers before the
+        uniqueness check over every ancestor.
+        """
+        if class_chain_first:
+            nearest = self._superclass_chain_method(class_id, method_name)
+            if nearest is not None:
+                return None if nearest == caller_id else nearest
         hits = set()
         for ancestor in self._ancestors_of(class_id):
             sym_id = self._declares(ancestor, method_name)
             if sym_id is not None and sym_id != caller_id:
                 hits.add(sym_id)
         return next(iter(hits)) if len(hits) == 1 else None
+
+    def _superclass_chain_method(self, class_id: str, method_name: str) -> str | None:
+        """The nearest declaration of *method_name* up the single superclass chain."""
+        for node in self._superclass_chain(class_id):
+            sym_id = self._declares(node, method_name)
+            if sym_id is not None:
+                return sym_id
+        return None
+
+    def _superclass_chain(self, class_id: str) -> Iterator[str]:
+        """*class_id*'s superclasses, nearest first.
+
+        The walk stops where a type has no class parent, more than one, or
+        one already seen.
+        """
+        node, seen = class_id, {class_id}
+        while True:
+            parents = [
+                p
+                for p in self._heritage_parents.get(node, ())
+                if getattr(self._symbols_by_id.get(p), "kind", None) == "class"
+            ]
+            if len(parents) != 1 or parents[0] in seen:
+                return
+            seen.add(parents[0])
+            node = parents[0]
+            yield node
 
     def _declares(self, class_id: str, method_name: str) -> str | None:
         """The symbol a type node declares under *method_name*, or None.
@@ -1888,12 +2046,14 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         self,
         file_path: str,
         key: tuple[str, str],
+        spelled: str | None = None,
     ) -> tuple[str, str] | None:
         """The symbol a ``(class, method)`` pair names, and the scope that held it.
 
         No class declares the pair unless the global method index holds it, and
         that check also keeps the merged-import view from being built for a
-        pair that cannot be in it.
+        pair that cannot be in it. *spelled* is the type as the call site
+        wrote it when that carries a C# arity (``Policy`1``) the key drops.
         """
         if key not in self._global_methods:
             return None
@@ -1906,20 +2066,65 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         if key in merged_methods:
             return merged_methods[key], "import"
 
-        # Trait method dispatch — the method may be defined on a trait's impl
-        # block in another file. The global index preserves file-insertion
-        # match order; the caller's own file is skipped.
-        for path, sym_id in self._global_methods[key]:
-            if path != file_path:
-                return sym_id, "global"
+        return self._repo_wide_method(key, spelled or key[0])
 
-        return None
+    def _repo_wide_method(self, key: tuple[str, str], spelled: str) -> tuple[str, str] | None:
+        """The global tier: the one method *key* can name anywhere, or None.
+
+        Nothing at this scope tells two same-named types apart, so it answers
+        only when one repository type can be meant and one method of it
+        matches. Otherwise a call on one project's ``MainWindow`` binds to
+        whichever ``MainWindow`` sorts first, even one that merely inherits
+        the method. A file declaring only a type the call cannot mean (another
+        arity of a C# generic) holds no candidate; any other file, including
+        one with no type of that name (a trait ``impl``, an out-of-line C++
+        body), still does.
+        """
+        bare, _, arity = spelled.partition("`")
+        declared = self._declared_types_named(bare)
+        meant = {identity for _, identity, count in declared if count == int(arity or 0)}
+        if len(meant) > 1:
+            return None
+        owners: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+        for path, identity, _ in declared:
+            owners[path].add(identity)
+        candidates = self._collapse_declarations(
+            [
+                sym_id
+                for path, sym_id in self._global_methods[key]
+                if len(owners.get(path, ())) != 1 or owners[path] <= meant
+            ]
+        )
+        if len(candidates) != 1:
+            return None
+        return next(iter(candidates)), "global"
+
+    def _declared_types_named(self, name: str) -> list[tuple[str, tuple[str, ...], int]]:
+        """``(file, identity, arity)`` for each repository type declared as *name*.
+
+        The fragments of one ``partial`` type share an identity. A forward
+        declaration and a Rust ``impl`` block declare no type.
+        """
+        found = self._declared_types.get(name)
+        if found is not None:
+            return found
+        found = []
+        for sym_id in self._global_symbols.get(name, ()):
+            symbol = self._symbols_by_id[sym_id]
+            if symbol.kind not in _TYPE_KINDS or symbol.kind == "impl" or symbol.is_declaration:
+                continue
+            path = self._symbol_paths_by_id[sym_id]
+            arity = symbol.type_parameter_count or 0
+            identity = self._partial_fragments.get((path, name)) or (sym_id,)
+            found.append((path, (*identity, str(arity)), arity))
+        self._declared_types[name] = found
+        return found
 
     def _answers_for_a_foreign_type(self, file_path: str, receiver_name: str) -> bool:
         """Is the repo-wide tier about to answer a call on a type we do not own?
 
-        Asked only of the ``global`` tier, which takes the first file-order
-        match for a ``(type, method)`` pair with no uniqueness check. A
+        Asked only of the ``global`` tier, which answers whenever the
+        repository declares one type of that name with the method. A
         repository that writes ``impl Trait for Vec<Entity>`` declares a
         ``Vec::new``, and without this every ``Vec::new()`` in the tree would
         bind to it. The narrower tiers are grounded in the caller's own file or
@@ -1960,6 +2165,44 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         return names
 
 
+def _index_bare_name(
+    sym: Symbol, index_id: str, file_syms: dict[str, str], top_level: dict[str, str]
+) -> None:
+    """Index *sym* under its bare name in one file's flat and top-level tables."""
+    if sym.is_declaration:
+        # A declaration must never displace a definition already
+        # indexed under this name — a .cpp that forward-declares a
+        # helper above its own body holds both.
+        #
+        # A method declaration stays out: this index answers
+        # unqualified lookups from importing files, and no bare name
+        # can legally reach a method. The (class, method) index
+        # still takes it.
+        if sym.parent_name is None:
+            file_syms.setdefault(sym.name, index_id)
+            top_level.setdefault(sym.name, index_id)
+        return
+    if sym.kind in _EXTENSION_KINDS:
+        return
+    # Top-level symbols and methods. An anonymous class member stays out: only
+    # its own class body names it bare, through the (class, method) index. It
+    # is never top-level, so ``top_level`` needs no such check.
+    if not is_anonymous_member(sym):
+        file_syms[sym.name] = index_id
+    if sym.parent_name is None:
+        top_level[sym.name] = index_id
+
+
+def _own_member_call(caller_id: str, own: str, call: CallSite) -> ResolvedCall | None:
+    """An anonymous class body's call to its own member *own*, before any flat name.
+
+    A same-file top-level function of the name included. Recursion: no edge.
+    """
+    if own == caller_id:
+        return None
+    return ResolvedCall(caller_id, own, 0.95, call.line, "same_file")
+
+
 def _rivals_a_class_method(symbol_id: str) -> bool:
     """Another class's ordinary method — the one shape that proves last-wins.
 
@@ -1972,9 +2215,17 @@ def _rivals_a_class_method(symbol_id: str) -> bool:
     return len(parts) >= 3 and id_segment_name(parts[-1]) != id_segment_name(parts[-2])
 
 
-def _is_super_receiver(receiver: CallReceiver | None) -> bool:
-    """Is this chained call's receiver Python's ``super(...)``?"""
-    return receiver is not None and receiver.target_name == "super" and receiver.receiver_name is None
+def _is_super_call(call: CallSite, language: str) -> bool:
+    """Python's ``super().m()`` (a chained call) or Java's ``super.m()``."""
+    if language == "java":
+        return call.receiver_name == "super"
+    receiver = call.receiver_call
+    return (
+        language == "python"
+        and receiver is not None
+        and receiver.target_name == "super"
+        and receiver.receiver_name is None
+    )
 
 
 def _c3_merge(sequences: list[tuple[str, ...]]) -> list[str] | None:
@@ -2005,8 +2256,12 @@ def _extract_class_id(symbol_id: str) -> str | None:
 
 
 def _extract_class_from_symbol_id(symbol_id: str) -> str | None:
-    """Extract parent class name from a symbol ID like 'path::ClassName::method'."""
+    """The parent from a symbol ID like 'path::ClassName::method'.
+
+    Every segment between path and name, the key ``_file_methods`` uses: an
+    anonymous class or enum-constant body spans several (``Op::PLUS``).
+    """
     parts = symbol_id.split("::")
     if len(parts) >= 3:
-        return parts[-2]
+        return "::".join(parts[1:-1])
     return None

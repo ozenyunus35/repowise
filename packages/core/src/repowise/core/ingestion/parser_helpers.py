@@ -14,6 +14,12 @@ from tree_sitter import Node
 
 from .extractors import node_text
 from .extractors.bindings.ts_js import is_type_only_ts_js_import
+from .lang_helpers.anonymous_classes import (
+    follow_renamed_hosts,
+    in_anonymous_class,
+    is_anonymous_member,
+    scope_segment,
+)
 from .lang_helpers.elixir import (
     _elixir_call_is_definitional,
     _elixir_is_template_definition,
@@ -82,9 +88,13 @@ __all__ = [
     "_rust_head_type_identifier",
     "_rust_shadowed_by_type_param",
     "_ts_nested_object_method_owner",
+    "follow_renamed_hosts",
     "import_load_kind",
+    "in_anonymous_class",
+    "is_anonymous_member",
     "prepare_objectivec_source",
     "prepare_pascal_source",
+    "scope_segment",
 ]
 
 
@@ -285,7 +295,7 @@ def _qualified_cpp_parent(name_node: Node, src: str) -> str | None:
 def _build_qualified_name(file_path: str, parent_name: str | None, name: str) -> str:
     module = Path(file_path).with_suffix("").as_posix().replace("/", ".")
     if parent_name:
-        return f"{module}.{parent_name}.{name}"
+        return f"{module}.{parent_name.replace('::', '.')}.{name}"
     return f"{module}.{name}"
 
 
