@@ -132,19 +132,31 @@ def _build_best_guesses(hits: list[dict]) -> list[dict]:
     Lets the agent pick ONE file to verify on an ambiguous retrieval. ``file``
     goes through ``hit_file_path`` and unresolvable hits are skipped, since a
     spotlight or module page's ``target_path`` is not an openable file.
+
+    One row per file: a symbol page resolves to the same file as its file
+    page, so a later hit for a file already listed is skipped and the slot
+    goes to the next distinct file, as in ``serialize_candidate_files``.
     """
-    return [
-        {
-            "file": hit_file_path(h),
-            "why_relevant": _candidate_justification(h),
-            "score": round(h.get("score", 0.0), 3),
-            # Absent rather than null: most rows carry no penalty.
-            **({"domain_penalty": h["_domain_penalty"]} if h.get("_domain_penalty") else {}),
-            **({"excerpt": h["excerpt"]} if h.get("excerpt") else {}),
-        }
-        for h in hits[:_GATED_RETURN_HITS]
-        if hit_file_path(h)
-    ]
+    guesses: list[dict] = []
+    seen: set[str] = set()
+    for h in hits:
+        path = hit_file_path(h)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        guesses.append(
+            {
+                "file": path,
+                "why_relevant": _candidate_justification(h),
+                "score": round(h.get("score", 0.0), 3),
+                # Absent rather than null: most rows carry no penalty.
+                **({"domain_penalty": h["_domain_penalty"]} if h.get("_domain_penalty") else {}),
+                **({"excerpt": h["excerpt"]} if h.get("excerpt") else {}),
+            }
+        )
+        if len(guesses) >= _GATED_RETURN_HITS:
+            break
+    return guesses
 
 
 def _with_candidates(payload: dict, resolved_pool: list[dict]) -> dict:
@@ -240,9 +252,9 @@ def _union_answer_payload(
         "; use them directly, no verification Read."
         if not union_truncated
         else ". At least one body was truncated: see "
-             "symbol_bodies[].withheld_symbols for what was not served, "
-             "and call get_symbol with the continuation before relying "
-             "on behaviour you cannot see."
+        "symbol_bodies[].withheld_symbols for what was not served, "
+        "and call get_symbol with the continuation before relying "
+        "on behaviour you cannot see."
     )
     if more_defs:
         note += (
@@ -571,8 +583,7 @@ def _high_confidence_note(grade: _Grade, tail: str) -> str:
     if grade.high_reason == "sole_hit":
         return (
             "High confidence: one page matched, so there was no competing "
-            f"candidate to be ambiguous against (top score {grade.top_score:.2f}). "
-            + tail
+            f"candidate to be ambiguous against (top score {grade.top_score:.2f}). " + tail
         )
     return (
         "High confidence: top retrieval result clearly dominates "
@@ -697,13 +708,12 @@ async def _graded_payload(
         # "No hedging" is not cited as evidence: the prompt forbids hedging, so
         # reading its absence back as a signal would be circular.
         _tail = (
-            "Cite this answer; do not re-read the source unless a specific "
-            "detail is missing."
+            "Cite this answer; do not re-read the source unless a specific detail is missing."
             if not any(b.get("truncated") for b in symbol_bodies)
             # Never say "skip re-reading" when the payload admits it withheld
             # part of a cited body.
             else "Some cited bodies were truncated; see "
-                 "symbol_bodies[].withheld_symbols for what was not served."
+            "symbol_bodies[].withheld_symbols for what was not served."
         )
         payload["note"] = _high_confidence_note(grade, _tail)
 
