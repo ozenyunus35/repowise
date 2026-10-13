@@ -1043,8 +1043,9 @@ language with no row produces no signal.
   and `validate` match production functions, not assertions). Oracles that are
   not plain assertion statements are counted at the broad tier too:
   `with pytest.raises(...)`, Java's split `object` + `name` call shape, chai
-  property chains (`expect(x).to.be.null`), expression-bodied test lambdas and
-  private `_assert_*` helpers.
+  property chains (`expect(x).to.be.null`), AVA's `t.is` / `t.deepEqual` /
+  `t.throwsAsync` methods on the test handle, expression-bodied test lambdas
+  and private `_assert_*` helpers.
 - **Mock saturation** (`analysis/health/mocks/lexicon.py`, `MOCK_DIALECTS`) has
   rows for Python and JS/TS only. Go has no mock vocabulary. Java is held out
   because Mockito states its checks as `verify(...)`, which counts toward
