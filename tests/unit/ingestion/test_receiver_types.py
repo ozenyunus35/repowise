@@ -744,6 +744,35 @@ class TestGoFields:
         assert declared_types(body, "go") == {}
 
 
+class TestKotlinTrailingLambda:
+    """A trailing lambda is the call's last argument, not more expression (#3761)."""
+
+    def test_a_call_with_a_trailing_lambda_is_a_call_assignment(self) -> None:
+        body = 'fun f() {\n    val n = build(1) { x -> println(")}") }\n    n.go()\n}'
+        assert scan_call_assignments(body, "kotlin") == (CallAssignment(2, "n", None, "build"),)
+
+    def test_a_lambda_across_lines_still_ends_the_statement(self) -> None:
+        body = 'fun f() {\n    val n = build("a") {\n        println("x")\n    }\n    n.go()\n}'
+        assert [a.name for a in scan_call_assignments(body, "kotlin")] == ["n"]
+
+    def test_a_chain_after_the_lambda_is_not_the_call(self) -> None:
+        for rest in ("{ }.bar()", "{ } ?: y", "{ }\n        .bar()"):
+            body = f"fun f() {{\n    val n = build(1) {rest}\n}}"
+            assert scan_call_assignments(body, "kotlin") == (), rest
+
+    def test_a_constructor_with_only_a_trailing_lambda(self) -> None:
+        body = 'fun f() {\n    val c = Client {\n        println("}")\n    }\n    c.get()\n}'
+        assert declared_types(body, "kotlin")["c"] == "Client"
+
+    def test_a_constructor_lambda_followed_by_a_chain_is_not_a_construction(self) -> None:
+        body = "fun f() {\n    val c = Client { }.build()\n}"
+        assert "c" not in declared_types(body, "kotlin")
+
+    def test_a_lowercase_lambda_only_call_is_not_a_construction(self) -> None:
+        body = "fun f() {\n    val x = remember { Foo() }\n}"
+        assert "x" not in declared_types(body, "kotlin")
+
+
 class TestGoCallAssignments:
     """``x := f(..)``: the call the resolver reads a return type from."""
 

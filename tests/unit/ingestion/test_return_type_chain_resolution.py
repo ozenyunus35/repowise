@@ -894,6 +894,7 @@ _KOTLIN_LOCALS = (
     "class Repo {\n    fun load() {}\n}\n"
     "class Other {\n    fun load() {}\n}\n"
     "fun makeRepo(): Repo = Repo()\n"
+    "fun build(name: String, block: () -> Unit): Repo = Repo()\n"
     "fun mk(a: Int): Repo = Repo()\nfun mk(a: String): Other = Other()\n"
     "fun <T> gen(): T = TODO()\n"
     "object Factory {\n    fun other(): Other = Other()\n}\n"
@@ -932,6 +933,8 @@ def _last_line_callees(tmp_path: Path, language: str, body: str) -> set[str]:
     [
         ("kotlin", "val r = makeRepo()\nr.load()", "a.kt::Repo::load"),
         ("kotlin", "val r = Factory.other()\nr.load()", "a.kt::Other::load"),
+        ("kotlin", 'val r = build("a") { }\nr.load()', "a.kt::Repo::load"),
+        ("kotlin", 'val r = build("a") {\n    println("x")\n}\nr.load()', "a.kt::Repo::load"),
         ("swift", "let r = try makeRepo()\nr.load()", "a.swift::Repo::load"),
         ("swift", "let r = await Factory.other()\nr.load()", "a.swift::Other::load"),
         ("swift", "let r = try? makeRepo()\nr?.load()", "a.swift::Repo::load"),
@@ -952,6 +955,8 @@ def test_kotlin_and_swift_local_takes_the_type_its_call_returns(
         ("swift", "var r = try makeRepo()\n    .other()"),
         ("kotlin", "val r = makeRepo()\n    ?: Other()"),
         ("kotlin", "val r = makeRepo()\n    as Other"),
+        ("kotlin", 'val r = build("a") { }.let { Other() }'),
+        ("kotlin", 'val r = build("a") { } ?: Other()'),
         ("swift", "let r = try makeRepo()\n    as! Other"),
         ("kotlin", "val r = mk(1)"),  # overloads of one arity that return different types
         ("swift", "let r = mk(a: 1)"),
