@@ -135,7 +135,10 @@ def _build_best_guesses(hits: list[dict]) -> list[dict]:
 
     One row per file: a symbol page resolves to the same file as its file
     page, so a later hit for a file already listed is skipped and the slot
-    goes to the next distinct file, as in ``serialize_candidate_files``.
+    goes to the next distinct file. This is the same per-file dedupe as
+    ``serialize_candidate_file_facts``, with this list's own cap. The loop
+    deliberately walks past the first ``_GATED_RETURN_HITS`` hits, so a
+    skipped repeat is replaced rather than leaving the list short.
     """
     guesses: list[dict] = []
     seen: set[str] = set()
