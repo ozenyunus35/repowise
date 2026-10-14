@@ -19,7 +19,7 @@ requests needs only git and a report (see [Patch coverage in CI](#patch-coverage
 ```bash
 # 1. Produce a report. Any supported format works.
 pytest --cov --cov-report=lcov:coverage.lcov
-coverage run --contexts=test -m pytest      # also records which test ran each line
+pytest --cov=<package> --cov-context=test   # also records which test ran each line (needs pytest-cov)
 
 # 2. Ingest it.
 repowise coverage add coverage.lcov
@@ -91,7 +91,7 @@ once there are three; partial ingests are left out of the trend.
 | **Clover** XML | `<coverage` plus `<project` | No |
 | **JaCoCo** XML | The JaCoCo doctype, or a `<report` root | No |
 | **Go coverprofile** (`go test -coverprofile`) | Leading `mode:` line | No |
-| **coverage.py `.coverage`** | SQLite file | Yes, when written with `--contexts` |
+| **coverage.py `.coverage`** | SQLite file | Yes, when recorded with per-test contexts |
 | **Normalized JSON** (`repowise-coverage-v1`) | Leading `{` plus `repowise-coverage` or `line_coverage_pct` | No |
 
 Force a parser with `--format lcov|cobertura|clover|repowise-json|go-coverprofile|jacoco`.
@@ -133,7 +133,7 @@ The per-test map needs a report that records which test covered each line.
 **coverage.py dynamic contexts** (the main path):
 
 ```bash
-coverage run --contexts=test -m pytest
+pytest --cov=<package> --cov-context=test   # needs pytest-cov
 repowise coverage add .coverage
 ```
 
@@ -368,8 +368,8 @@ breadth. Full block: [CONFIG.md](../reference/CONFIG.md).
 
 ## Accuracy and limits
 
-Inferred tier, dogfooded on this repository against a real
-`coverage run --contexts=test` over a slice with complete per-test attribution
+Inferred tier, dogfooded on this repository against real per-test
+coverage over a slice with complete per-test attribution
 (37 test files, 159 production files provably executed):
 
 - **"What reaches this file"** (suppresses `untested_hotspot`): **95.7%

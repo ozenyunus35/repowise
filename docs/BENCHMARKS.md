@@ -545,7 +545,7 @@ this machine move by up to 2x between runs.
 
 Repowise links tests to the code they exercise from the call graph, with no
 coverage run needed. To check those inferred links, we compared them against a
-real `coverage run --contexts=test` on this repository, over a slice with
+real per-test coverage run on this repository, over a slice with
 complete per-test attribution (37 test files, 159 production files). Measured
 August 2026.
 
