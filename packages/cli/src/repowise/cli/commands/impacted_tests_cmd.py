@@ -396,7 +396,8 @@ def _print_map_state(result: dict) -> None:
         console.print(
             "[yellow]No test-to-code map ingested.[/yellow] Run "
             "[cyan]repowise coverage add[/cyan] on a coverage.py report written with "
-            f"[cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] to get exact impacted tests. "
+            f"[cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] (needs pytest-cov) to get exact "
+            "impacted tests. "
             "Falling back to the dependency graph and filename patterns below."
         )
     elif not result["map_current"]:

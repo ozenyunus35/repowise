@@ -159,7 +159,8 @@ def coverage_add(
             console.print(
                 "[yellow]No coverage report found.[/yellow] Looked for "
                 "coverage/lcov.info, .coverage, **/cobertura.xml, and similar.\n"
-                f"Generate one (e.g. [cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] "
+                f"Generate one (e.g. [cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan], "
+                "which needs pytest-cov, "
                 "or [cyan]cargo llvm-cov --lcov --output-path coverage/lcov.info[/cyan]) "
                 "then re-run, or pass a path:\n"
                 "  [cyan]repowise coverage add path/to/report[/cyan]"
@@ -436,8 +437,8 @@ def coverage_status(repo: str | None, fmt: str) -> None:
                 console.print(
                     "[yellow]No coverage ingested.[/yellow] Run "
                     "[cyan]repowise coverage add <report>[/cyan]. A .coverage file "
-                    f"recorded with [cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] also builds the "
-                    "per-test map."
+                    f"recorded with [cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] (needs pytest-cov) "
+                    "also builds the per-test map."
                 )
                 return
 
@@ -480,7 +481,7 @@ def coverage_status(repo: str | None, fmt: str) -> None:
             else:
                 console.print(
                     "[dim]No test-to-code map yet - record one with "
-                    f"[cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan], then "
+                    f"[cyan]{PER_TEST_COVERAGE_COMMAND}[/cyan] (needs pytest-cov), then "
                     "[cyan]repowise coverage add .coverage[/cyan].[/dim]"
                 )
 
