@@ -39,7 +39,8 @@ class _LanguageCallStrategies:
     Strategies are named rather than bound so a probe can substitute one.
 
     ``member_bare_fallback`` lets a member or chained call nothing claimed fall
-    back to the bare-name tiers. ``inherited_typed_receiver`` lets a typed
+    back to the bare-name tiers; ``chain_bare_fallback`` can withhold that from
+    chained calls alone. ``inherited_typed_receiver`` lets a typed
     receiver whose type lacks the method answer with the one ancestor that
     declares it.
     """
@@ -49,6 +50,7 @@ class _LanguageCallStrategies:
     member: tuple[str, ...] = ()
     member_fallback: tuple[str, ...] = ()
     member_bare_fallback: bool = True
+    chain_bare_fallback: bool = True
     inherited_typed_receiver: bool = False
 
 
@@ -110,7 +112,11 @@ _LANGUAGE_CALL_STRATEGIES: dict[str, _LanguageCallStrategies] = {
         member_bare_fallback=False,
         inherited_typed_receiver=True,
     ),
-    "kotlin": replace(_JVM_STRATEGIES, member_fallback=_TYPED_RECEIVER),
+    # A Kotlin chained call is typed by its inner call's return type or not at
+    # all, as Dart's is.
+    "kotlin": replace(
+        _JVM_STRATEGIES, member_fallback=_TYPED_RECEIVER, chain_bare_fallback=False
+    ),
     "csharp": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     "python": _LanguageCallStrategies(member_fallback=_TYPED_RECEIVER),
     # Swift and Dart register the fallback: neither has a package tier of its

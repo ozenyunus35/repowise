@@ -79,6 +79,15 @@
   (value_arguments) @call.arguments
 ) @call.site
 
+; Chained call: client.request().send(), Builder().a().build(), also through ?..
+(call_expression
+  (navigation_expression
+    (call_expression) @call.receiver_call
+    (identifier) @call.target
+  )
+  (value_arguments) @call.arguments
+) @call.site
+
 ; ---------------------------------------------------------------------------
 ; Callable references — a function named without being called
 ; ---------------------------------------------------------------------------

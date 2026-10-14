@@ -199,6 +199,8 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
 
     if node.type == "identifier":
         return _dart_call_receiver(node, src)
+    if node.type == "call_expression" and not node.child_by_field_name("function"):
+        return _kotlin_call_receiver(node, src)
     arguments = node.child_by_field_name("arguments")
     argument_count = _count_arguments(arguments) if arguments is not None else None
 
@@ -269,6 +271,31 @@ def _dart_call_receiver(name: Node, src: str) -> CallReceiver | None:
     return CallReceiver(
         _node_text(name, src).strip(), receiver, _dart_argument_count(head.next_named_sibling)
     )
+
+
+def _kotlin_call_receiver(call: Node, src: str) -> CallReceiver | None:
+    """The Kotlin call *call*: a.b(..), b(..) or A.B(..).
+
+    tree-sitter-kotlin names no fields, so the callee is the call's first
+    child and its arguments the value_arguments after it.
+    """
+    callee = call.named_children[0] if call.named_children else None
+    arguments = next((c for c in call.named_children if c.type == "value_arguments"), None)
+    argument_count = _count_arguments(arguments) if arguments is not None else None
+    if callee is None:
+        return None
+    if callee.type == "identifier":
+        return CallReceiver(_node_text(callee, src).strip(), None, argument_count)
+    if callee.type != "navigation_expression":
+        return None
+    parts = callee.named_children
+    if len(parts) != 2 or parts[1].type != "identifier":
+        return None
+    head = parts[0]
+    receiver = (
+        _node_text(head, src).strip() if head.type in ("identifier", "this_expression") else None
+    )
+    return CallReceiver(_node_text(parts[1], src).strip(), receiver, argument_count)
 
 
 def _dart_argument_count(selector: Node | None) -> int | None:

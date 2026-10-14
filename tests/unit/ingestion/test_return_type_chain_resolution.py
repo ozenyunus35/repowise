@@ -216,7 +216,7 @@ def test_unbound_global_return_type_preserves_legacy_fallback(
 
 def test_only_audited_lanes_are_enabled_by_default() -> None:
     assert (
-        frozenset({"cpp", "csharp", "dart", "go", "java", "python"})
+        frozenset({"cpp", "csharp", "dart", "go", "java", "kotlin", "python"})
         == PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES
     )
 
@@ -982,3 +982,75 @@ def test_kotlin_return_type_an_external_import_names_is_not_the_repo_class(
 
     assert ("Use.kt::Socket::source" in callees) == (not imported)
 
+
+
+_KOTLIN_CHAINS = (
+    "package app\n"
+    "class Response {\n    class Builder {\n"
+    "        fun setHeaders(h: String): Builder = this\n"
+    "        fun makeUnsafe(): Builder = this\n"
+    "        fun build(): Response = Response()\n    }\n}\n"
+    "class Client {\n    fun request(): Request = Request()\n}\n"
+    "class Request {\n    fun send(): Int = 0\n}\n"
+    "class Repo {\n    fun load() {}\n}\n"
+    "class Other {\n    fun load() {}\n}\n"
+    "fun mk(a: Int): Repo = Repo()\nfun mk(a: String): Other = Other()\n"
+    "fun <T> gen(): T = TODO()\n"
+    "class Use {\n    fun go(client: Client) {\n{body}\n    }\n}\n"
+)
+
+
+def _kotlin_chain_callees(tmp_path: Path, body: str) -> set[str]:
+    source = _KOTLIN_CHAINS.replace("{body}", body)
+    parsed = _parse(tmp_path, "a.kt", "kotlin", source)
+    resolver = CallResolver(parsed, {"a.kt": set()})
+    return {rc.callee_id for rc in resolver.resolve_file("a.kt", parsed["a.kt"].calls)}
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("client.request().send()", {"a.kt::Request::send"}),
+        ("client.request()?.send()", {"a.kt::Request::send"}),
+        ("Response.Builder().build()", {"a.kt::Builder::build"}),
+        (
+            'Response.Builder()\n    .setHeaders("a")\n    .makeUnsafe()\n    .build()',
+            {
+                "a.kt::Builder::setHeaders",
+                "a.kt::Builder::makeUnsafe",
+                "a.kt::Builder::build",
+            },
+        ),
+    ],
+)
+def test_kotlin_call_chained_on_a_call_takes_the_type_it_returns(
+    tmp_path: Path, body: str, expected: set[str]
+) -> None:
+    assert expected <= _kotlin_chain_callees(tmp_path, body)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "mk(1).load()",  # overloads of one arity that return different types
+        "gen().load()",  # a type parameter is no class
+    ],
+)
+def test_kotlin_chain_without_a_typed_inner_call_binds_nothing(
+    tmp_path: Path, body: str
+) -> None:
+    callees = _kotlin_chain_callees(tmp_path, body)
+
+    assert not {callee for callee in callees if callee.endswith("::load")}
+
+
+def test_kotlin_chained_call_site_carries_the_inner_call(tmp_path: Path) -> None:
+    source = "fun f(client: Client) {\n    client.request(1, 2).send()\n}\n"
+    parsed = _parse(tmp_path, "b.kt", "kotlin", source)
+
+    (outer,) = [c for c in parsed["b.kt"].calls if c.target_name == "send"]
+
+    assert outer.receiver_call is not None
+    assert outer.receiver_call.target_name == "request"
+    assert outer.receiver_call.receiver_name == "client"
+    assert outer.receiver_call.argument_count == 2
