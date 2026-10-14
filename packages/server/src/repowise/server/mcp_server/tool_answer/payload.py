@@ -346,15 +346,21 @@ def build_value_payload(
 
     The verbatim assignment line (read live by the hydrator) IS the answer.
     Not cached: extraction is cheap and must reflect the current source.
+    Only a constant the question names exactly is ``high``: one whose name the
+    question only spells out may not be the one meant. The coverage gate does
+    not apply: an exact name is the match, and the words around it ("default",
+    "value") are the question's frame, so it would only demote right answers.
     """
     top_score_fp = hits[0].get("score", 0.0) if hits else 0.0
     answer_text = extraction["answer"]
     if extraction.get("value_source"):
         answer_text += "\n\n" + extraction["value_source"]
+    exact = bool(extraction.get("exact_name"))
+    confidence = "high" if exact else "medium"
     return {
         "answer": answer_text,
         "citations": [extraction["file"]],
-        "confidence": "high",
+        "confidence": confidence,
         "retrieval_quality": (
             "high" if top_score_fp >= _HIGH_CONFIDENCE_SCORE_FLOOR else "partial"
         ),
@@ -363,13 +369,18 @@ def build_value_payload(
         "retrieval": [],
         "note": (
             "Extracted verbatim from the live source line — no LLM "
-            "synthesis involved. Cite directly; no verification "
-            "Read needed. candidate_files holds the files retrieval ranked, "
+            "synthesis involved. "
+            + (
+                "Cite directly; no verification Read needed. "
+                if exact
+                else "The question does not name it exactly; confirm it is the one meant. "
+            )
+            + "candidate_files holds the files retrieval ranked, "
             "for the wider question the value sits inside."
         ),
         "_meta": _build_meta(
             timing_ms=(time.perf_counter() - t0) * 1000,
-            hint=_answer_hint("high"),
+            hint=_answer_hint(confidence),
             repository=repository,
             targets=[extraction["file"], *fallback_targets],
         ),
@@ -692,6 +703,12 @@ async def _graded_payload(
         )
         payload["next_action_hint"] = (
             f"call get_symbol id='{cut['continuation']}' for the rest of {cut['name']}"
+        )
+    elif grade.uncovered:
+        payload["note"] = (
+            f"Coverage gate: the top source does not mention {', '.join(grade.uncovered[:4])}, "
+            "so it may answer a different question. Held at medium; confirm against "
+            "the next evidence row or candidate_files."
         )
     elif confidence == "high":
         # "No hedging" is not cited as evidence: the prompt forbids hedging, so

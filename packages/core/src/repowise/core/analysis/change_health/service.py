@@ -12,6 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from ...support_paths import is_doc_or_config_path
 from ...test_paths import is_test_related_path
@@ -19,11 +20,13 @@ from ..finding_registry import excluded_types, gate_for, is_served, language_lab
 from ..health import HEALTH_ANALYZER_VERSION, HealthFindingData
 from ..health.perf.causal import PERFORMANCE_MODEL_VERSION
 from ..health.scoring import ADVISORY_DIMENSION, is_advisory
-from .analyzer import RevisionHealthAnalyzer, language_for, language_of
+from .analyzer import RevisionAnalysis, RevisionHealthAnalyzer, language_for, language_of
 from .attribution import FindingAttributor, changed_symbols_for
 from .identity import change_finding_id, finding_key, severity_rank
 from .matcher import FindingMatcher, MatchedFinding
 from .models import (
+    NO_CODE_GAP,
+    NOT_ANALYZABLE_DATA,
     NOT_CODE,
     AnalysisFingerprint,
     ChangeFinding,
@@ -46,6 +49,12 @@ MAX_CHANGED_FILES = 300
 #: Documentation and configuration languages. Anything else with no health
 #: dialect (HTML, schemas, shell) may carry logic, so it stays a gap.
 _NOT_CODE_LANGUAGES = frozenset({"json", "yaml", "toml", "markdown"})
+
+#: Tree-sitter query files: patterns no health detector reads. ``.scm`` is also
+#: Scheme source, so only the tree-sitter layout (a ``queries`` directory)
+#: counts; any other ``.scm`` stays a gap.
+_QUERY_SUFFIX = ".scm"
+_QUERY_DIR = "queries"
 
 #: Comparisons kept in the process cache.
 _CACHE_CAPACITY = 32
@@ -147,7 +156,8 @@ class ChangeHealthDeltaService:
         """Identity of a comparison: the two sides plus how they were analysed."""
         if pair.working_tree:
             # Content identity: HEAD alone does not describe an edited tree.
-            paths = sorted(p for p in pair.head_paths)
+            # Only the compared files: an excluded untracked blob is not read.
+            paths = sorted(c.head_path for c in _filter(pair.changes, request) if c.head_path)
             blobs = self.source.read_working_tree(paths)
             digest = hashlib.sha256()
             for path in paths:
@@ -163,8 +173,10 @@ class ChangeHealthDeltaService:
             str(HEALTH_ANALYZER_VERSION),
             self.rules_fingerprint,
             str(PERFORMANCE_MODEL_VERSION),
-            ",".join(request.extensions),
-            ",".join(request.exclude_patterns),
+            # repr, not a join: a comma is legal inside a pattern.
+            repr(tuple(request.extensions)),
+            repr(tuple(request.exclude_patterns)),
+            repr(tuple(request.include_paths)),
         )
         return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
@@ -215,19 +227,10 @@ class ChangeHealthDeltaService:
         basis = "both_sides_analyzed"
 
         if not eligible:
-            if not changes:
-                explanation = "This change touches no files."
-            elif all(r == NOT_CODE for r in skipped.values()):
-                explanation = (
-                    "Only documentation or configuration files changed; "
-                    "health analysis does not cover them."
-                )
-            else:
-                explanation = "No changed file is health-analyzable, so nothing was compared."
             delta = ChangeHealthDelta(
                 # Nothing was compared either way, so neither case is a clean bill.
                 status="unavailable",
-                explanation=explanation,
+                explanation=_nothing_compared(changes, skipped),
                 base=base_id,
                 head=head_id,
                 comparison_basis=basis,
@@ -258,8 +261,11 @@ class ChangeHealthDeltaService:
         )
         base_sources = self.source.read(pair.base_sha, base_paths)
 
+        rename = pair.rename_map()
         head_run = self.analyzer.analyze(head_sources, subject_paths=set(head_paths))
-        base_run = self.analyzer.analyze(base_sources, subject_paths=set(base_paths))
+        base_run = self.analyzer.analyze(
+            base_sources, subject_paths=set(base_paths), dependents=_on_base(head_run, rename)
+        )
 
         skipped.update(head_run.skipped)
         # A file whose BASE side failed has no baseline, so every finding at its
@@ -280,8 +286,7 @@ class ChangeHealthDeltaService:
             1 for r in skipped.values() if r.removeprefix("base_") in {"parse_failed", "unreadable"}
         )
 
-        rename = pair.rename_map()
-        matcher = FindingMatcher(rename)
+        matcher = FindingMatcher(rename, _hunks(eligible))
         # Both sides are restricted to the same comparable set, so an excluded
         # file cannot contribute a one-sided "introduced" or "resolved".
         # Advisory markers deduct nothing, so adding one is not a regression
@@ -387,6 +392,20 @@ def _filter(changes: list[FileChange], request: DeltaRequest) -> list[FileChange
     )
 
 
+def _nothing_compared(changes: list[FileChange], skipped: dict[str, str]) -> str:
+    """Why no changed file reached the analyzer, for the explanation."""
+    if not changes:
+        return "This change touches no files."
+    if all(r == NOT_CODE for r in skipped.values()):
+        return (
+            "Only documentation or configuration files changed; "
+            "health analysis does not cover them."
+        )
+    if all(r in NO_CODE_GAP for r in skipped.values()):
+        return "Only query or other data files changed; health analysis does not cover them."
+    return "No changed file is health-analyzable, so nothing was compared."
+
+
 def _skip_reason(change: FileChange) -> str:
     """Why a changed path never reached the analyzer."""
     if change.head_path is None:
@@ -395,6 +414,9 @@ def _skip_reason(change: FileChange) -> str:
     if language in _NOT_CODE_LANGUAGES or is_doc_or_config_path(change.head_path):
         return NOT_CODE
     if language is None:
+        path = PurePosixPath(change.head_path)
+        if path.suffix.lower() == _QUERY_SUFFIX and _QUERY_DIR in path.parts[:-1]:
+            return NOT_ANALYZABLE_DATA
         return "unsupported_language"
     return "not_health_analyzable"
 
@@ -408,7 +430,7 @@ def _status_for(
             f"{'file' if scope.changed == 1 else 'files'} could be analysed."
         )
     # Docs, config and data hold no code, so skipping them leaves nothing unexamined.
-    code_skipped = sum(1 for r in skipped.values() if r != NOT_CODE)
+    code_skipped = sum(1 for r in skipped.values() if r not in NO_CODE_GAP)
     if code_skipped or scope.failed:
         return (
             "partial",
@@ -441,6 +463,21 @@ def _limits(head_findings: list[HealthFindingData]) -> list[str]:
             "are not compared: they are held back pending verification there."
         )
     return limits
+
+
+def _on_base(head_run: RevisionAnalysis, rename: dict[str, str]) -> dict[str, int]:
+    """Head's dependents counts under base-side paths, to score base against.
+
+    See :meth:`RevisionHealthAnalyzer.analyze`: one centrality context for both
+    sides, so only the code can move a centrality-gated finding.
+    """
+    to_base = {head: base for base, head in rename.items()}
+    return {to_base.get(path, path): count for path, count in head_run.dependents.items()}
+
+
+def _hunks(changes: list[FileChange]) -> dict[str, list[tuple[int, int, int, int]]]:
+    """Each changed file's diff hunks, by head path, for the matcher's line map."""
+    return {c.head_path: c.diff.hunks for c in changes if c.head_path and c.diff}
 
 
 def _comparable(finding: HealthFindingData, withheld: frozenset[str]) -> bool:

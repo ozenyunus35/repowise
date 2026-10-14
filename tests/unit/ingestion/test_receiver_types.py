@@ -289,11 +289,11 @@ class TestKotlinShapes:
 
 
 class TestKotlinRefusals:
-    def test_a_builtin_generic_is_refused(self) -> None:
-        """``List<Header>`` bares to ``List``, which the language spec refuses
-        — and must, because the value is a List and not a Header."""
+    def test_a_builtin_generic_is_marked_external(self) -> None:
+        """``List<Header>`` bares to ``List``, marked a builtin: the value is a
+        List and not a Header, so only a repo extension on ``List`` answers."""
         body = "fun run() {\n    val items: List<Header> = call.headers\n}"
-        assert "items" not in declared_types(body, "kotlin")
+        assert external_type_name(declared_types(body, "kotlin")["items"]) == "List"
 
     def test_a_named_argument_is_not_a_declaration(self) -> None:
         """Kotlin spells a named argument with ``=``, which is why the
@@ -314,8 +314,12 @@ class TestKotlinRefusals:
         body = 'class C {\n    @get:JvmName("x")\n    fun f() { }\n}'
         assert declared_types(body, "kotlin") == {}
 
-    def test_a_builtin_type_is_refused(self) -> None:
-        assert declared_types("fun run(name: String, n: Int) { }", "kotlin") == {}
+    def test_a_builtin_type_is_marked_external(self) -> None:
+        types = declared_types("fun run(name: String, n: Int) { }", "kotlin")
+        assert {name: external_type_name(t) for name, t in types.items()} == {
+            "name": "String",
+            "n": "Int",
+        }
 
     def test_a_declaration_in_a_line_comment_is_ignored(self) -> None:
         body = "fun run() { // a val node: Node once lived here\n }"
@@ -773,6 +777,73 @@ class TestGoCallAssignments:
 
     def test_other_languages_scan_nothing(self) -> None:
         assert scan_call_assignments("x := f()\n", "java") == ()
+
+
+class TestPythonCallAssignments:
+    """``x = f(..)``: a whole-statement call, awaited or not."""
+
+    def test_a_dotted_call_and_an_awaited_one(self) -> None:
+        body = "def f():\n    r = self.client.get(\n        ')'\n    )\n    s = await g()\n"
+        assert scan_call_assignments(body, "python") == (
+            CallAssignment(2, "r", "self.client", "get"),
+            CallAssignment(5, "s", None, "g", awaited=True),
+        )
+
+    def test_a_comparison_a_chain_and_a_target_list_are_refused(self) -> None:
+        body = "def f():\n    x == g()\n    y = g().h()\n    a, b = g()\n    c = g() or d\n"
+        assert scan_call_assignments(body, "python") == ()
+
+    def test_a_statement_after_a_semicolon_is_refused(self) -> None:
+        """``u = f(); u = 3`` rebinds where no binding scan looks."""
+        assert scan_call_assignments("def f():\n    u = g(); u = 3\n", "python") == ()
+
+
+class TestKotlinSwiftDartCallAssignments:
+    """``val x = f(..)``, ``let x = try f(..)``, ``final x = await f(..);``."""
+
+    @pytest.mark.parametrize(
+        ("language", "statement", "expected"),
+        [
+            ("kotlin", "val r = repo.make(1)", CallAssignment(2, "r", "repo", "make")),
+            ("swift", "let r = try await make()", CallAssignment(2, "r", None, "make")),
+            ("swift", "var r = try? A.make()", CallAssignment(2, "r", "A", "make")),
+            (
+                "dart",
+                "final r = await make(\n    ')');",
+                CallAssignment(2, "r", None, "make", awaited=True),
+            ),
+            ("dart", "var r = Repo.create();", CallAssignment(2, "r", "Repo", "create")),
+        ],
+    )
+    def test_a_whole_statement_call(
+        self, language: str, statement: str, expected: CallAssignment
+    ) -> None:
+        body = f"f() {{\n  {statement}\n}}"
+        assert scan_call_assignments(body, language) == (expected,)
+
+    @pytest.mark.parametrize(
+        ("language", "statement"),
+        [
+            ("kotlin", "val r = make()\n    .other()"),
+            ("kotlin", "val r = make()\n    ?.other()"),
+            ("kotlin", "val r = make()\n    ?: Other()"),
+            ("kotlin", "val r = make()\n    as Other"),
+            ("kotlin", "val r = make()\n    && ok"),
+            ("kotlin", "val r: Repo = make()"),  # its declaration types it
+            ("swift", "let r = make()\n    .other()"),
+            ("swift", "let r = make()\n    as! Other"),
+            ("dart", "final r = make()\n    .other();"),
+            ("dart", "final r = make()\n    ..other();"),
+        ],
+    )
+    def test_a_call_continued_on_the_next_line_is_refused(
+        self, language: str, statement: str
+    ) -> None:
+        assert scan_call_assignments(f"f() {{\n  {statement}\n}}", language) == ()
+
+    def test_a_new_statement_on_the_next_line_keeps_the_call(self) -> None:
+        body = "f() {\n  val r = make()\n  r.load()\n}"
+        assert scan_call_assignments(body, "kotlin") == (CallAssignment(2, "r", None, "make"),)
 
 
 class TestClassScope:

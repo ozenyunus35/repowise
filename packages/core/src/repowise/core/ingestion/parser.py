@@ -91,6 +91,8 @@ from .models import (
 )
 from .parser_helpers import (
     TYPE_HEAD_EXTRACTORS,
+    _argument_literal_types,
+    _argument_names,
     _build_qualified_name,
     _classify_param_origin,
     _collect_error_nodes,
@@ -117,6 +119,7 @@ from .parser_helpers import (
     _objc_is_macro_enum,
     _objc_message_selector,
     _objc_symbol_name,
+    _overload_arguments,
     _qualified_cpp_parent,
     _qualified_pascal_parent,
     _run_query,
@@ -193,6 +196,8 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
     which call is carried into resolution.
     """
 
+    if node.type == "identifier":
+        return _dart_call_receiver(node, src)
     arguments = node.child_by_field_name("arguments")
     argument_count = _count_arguments(arguments) if arguments is not None else None
 
@@ -210,6 +215,19 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
                 (child for child in function.named_children if child.type == "identifier"), None
             )
             receiver = None
+        elif function.type == "attribute":
+            # Python ``obj.m()``: the receiver is kept as a plain dotted path,
+            # and a call on anything else is not carried at all.
+            target = function.child_by_field_name("attribute")
+            obj = function.child_by_field_name("object")
+            path = (
+                _receiver_text("python", obj, src)
+                if obj is not None and obj.type in ("identifier", "attribute")
+                else None
+            )
+            if target is None or path is None:
+                return None
+            return CallReceiver(_node_text(target, src).strip(), path, argument_count)
         else:
             target = (
                 function.child_by_field_name("name")
@@ -233,6 +251,30 @@ def _call_receiver_from_node(node: Node, src: str) -> CallReceiver | None:
     if receiver is not None and receiver.type in ("identifier", "this"):
         receiver_name = _node_text(receiver, src).strip() or None
     return CallReceiver(target_name, receiver_name, argument_count)
+
+
+def _dart_call_receiver(name: Node, src: str) -> CallReceiver | None:
+    """The Dart call whose *name* the query captured: ``a.b(..)``, ``B(..)``.
+
+    A Dart call is a flat selector run with no call node, so the name's
+    siblings are read: the selector after it holds the arguments, and the
+    node before a ``.b`` selector is its receiver.
+    """
+    if name.parent.type == "unconditional_assignable_selector":
+        head = name.parent.parent
+        receiver: str | None = _node_text(head.prev_named_sibling, src).strip()
+    else:
+        head, receiver = name, None
+    return CallReceiver(
+        _node_text(name, src).strip(), receiver, _dart_argument_count(head.next_named_sibling)
+    )
+
+
+def _dart_argument_count(selector: Node | None) -> int | None:
+    """The arguments a Dart ``(selector (argument_part (arguments)))`` passes."""
+    parts = selector.named_children if selector is not None else ()
+    found = [arg for part in parts for arg in part.named_children if arg.type == "arguments"]
+    return _count_arguments(found[0]) if found else None
 
 
 @cache
@@ -469,6 +511,10 @@ def _receiver_text(language: str, node: Node, src: str) -> str | None:
     names: a call, subscript or optional hop inside it types nothing, and
     dropping the site keeps it off the bare-call tiers.
     """
+    sibling = node.next_named_sibling
+    if language == "java" and node.type != "super" and getattr(sibling, "type", None) == "super":
+        # ``S.super.m()``: ``S`` qualifies the ``super`` its own pattern captures.
+        return None
     text = _node_text(node, src).strip()
     if (language, node.type) not in _PATH_RECEIVERS:
         return text
@@ -2120,6 +2166,7 @@ class ASTParser:
 
             arg_count = _count_arguments(arg_nodes[0]) if arg_nodes else None
             caller_id = _find_enclosing_symbol(line, symbol_ranges)
+            arguments = _overload_arguments(file_info.language, arg_nodes)
 
             calls.append(
                 (
@@ -2131,6 +2178,8 @@ class ASTParser:
                         line=line,
                         argument_count=arg_count,
                         receiver_call=receiver_call,
+                        argument_types=_argument_literal_types(arguments, src),
+                        argument_names=_argument_names(arguments, src),
                         scope_name=scope_name,
                         edge_type=(
                             "references"

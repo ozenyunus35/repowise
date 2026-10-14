@@ -26,14 +26,15 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping
 from typing import NamedTuple
 
+from ..framework_routes import scan_code
 from ..language_data import get_builtin_types
 from ..type_names import (
     bare_type_name,
     is_resolvable_type_name,
     strip_type_arguments,
-    type_argument_count,
     type_qualifier,
     unwrap_pointer_like,
+    written_type_key,
 )
 
 # A type as written before a declared name: optionally qualified, generic to two
@@ -312,6 +313,21 @@ _RUST_CONSTRUCTED = re.compile(
 )
 
 _C_FAMILY = (_TYPED_DECLARATION, _INFERRED_FROM_NEW)
+
+# A Java primitive or primitive array, ``long start`` / ``int[] xs``. Kept as an
+# external type: no call is made on one, but an overload is chosen by it.
+_JAVA_PRIMITIVE_DECLARATION = re.compile(
+    r"(?<![\w.])(?P<type>(?:boolean|byte|char|short|int|long|float|double)(?:\[\])*(?:\.\.\.)?)"
+    r"\s+(?P<name>[a-z_]\w*)\s*(?=(?P<closer>[=;,):]))"
+)
+# A varargs parameter, ``Foo... xs``: the array it is.
+_JAVA_VARARGS_DECLARATION = re.compile(
+    rf"(?<![\w.])(?P<type>{_TYPE}\.\.\.)\s+(?P<name>[a-z_]\w*)\s*(?=(?P<closer>[,)]))"
+)
+# A pattern variable, ``x instanceof Foo f && ...``: a local wherever it ends.
+_JAVA_PATTERN_VARIABLE = re.compile(
+    rf"(?<![\w.])instanceof\s+(?:final\s+)?(?P<type>{_TYPE})\s+(?P<name>[a-z_]\w*)\b(?!\s*[.(])"
+)
 # Only the field shapes reach class scope. Go is still not in
 # IMPLICIT_FIELD_LANGUAGES: a field is read through its receiver (``c.parent``),
 # so it types a chain hop and never a bare name.
@@ -327,7 +343,12 @@ _LANGUAGE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "csharp": _C_FAMILY,
     "dart": _DART_FAMILY,
     "go": _GO_FAMILY,
-    "java": _C_FAMILY,
+    "java": (
+        *_C_FAMILY,
+        _JAVA_PRIMITIVE_DECLARATION,
+        _JAVA_VARARGS_DECLARATION,
+        _JAVA_PATTERN_VARIABLE,
+    ),
     "kotlin": _KT_FAMILY,
     "python": _PY_FAMILY,
     "rust": (_RUST_ANNOTATED, _RUST_CONSTRUCTED),
@@ -349,6 +370,9 @@ IMPLICIT_FIELD_LANGUAGES = frozenset({"csharp", "dart", "java", "kotlin", "swift
 # Only where nothing in the repo can add a method to a builtin type: C#
 # extension methods, Kotlin and Swift extensions and Rust trait impls all can.
 EXTERNAL_TYPE_LANGUAGES = frozenset({"java"})
+# Those, and Kotlin, whose scan keeps the marked declaration without refusing:
+# a call on it may still reach a repo extension of the builtin.
+_MARKED_BUILTIN_LANGUAGES = EXTERNAL_TYPE_LANGUAGES | {"kotlin"}
 _EXTERNAL_TYPE = "external:"
 
 # A decorator that changes what the symbol it wraps *is*: `@shared_task` leaves
@@ -593,6 +617,148 @@ def scan_binding_positions(text: str, language: str) -> tuple[tuple[int, int, st
     return tuple(sorted(positions))
 
 
+# Languages where a parameter or local hides a bare call of its name from every
+# repo symbol of that name. Kotlin, Swift and Dart read their own shapes below.
+CALL_SHADOW_LANGUAGES = BINDING_LANGUAGES | {"dart", "kotlin", "swift"}
+
+# Kotlin resolves `f()` past a binding that cannot be invoked, so only a
+# function-typed one hides `f`: `onClick: () -> Unit`, `r: Call.() -> T`,
+# `val f = { .. }`. Ceiling: a class type with `operator fun invoke` is missed.
+_KT_INVOKABLE = (
+    re.compile(
+        r"(?<![\w.@])(?P<name>[a-z_]\w*)\s*:\s*(?:@\w+(?:\([^()\n]*\))?\s+)*"
+        r"(?:suspend\s+)?(?:[\w.]+(?:<[^\n]*?>)?\??\.)?\("
+    ),
+    re.compile(r"(?<![\w.])va[lr]\s+(?P<name>[a-z_]\w*)\s*=\s*\{"),
+)
+_SWIFT_INVOKABLE = re.compile(
+    r"(?<![\w.])(?:let|var)\s+(?P<name>[a-z_]\w*)\s*(?::\s*(?:@\w+\s+)*\(|=\s*\{)"
+)
+
+
+def holds_function(declaration: str, name: str, language: str) -> bool:
+    """Does Kotlin or Swift *declaration* give property *name* a function value?
+
+    Read with comments and string literals blanked, so text inside them never
+    looks like a function type.
+    """
+    code = [" "] * len(declaration)
+    quotes = "\"'" if language == "kotlin" else '"'
+    for index, char, _ in scan_code(declaration, quotes=quotes, text_blocks=True):
+        code[index] = char
+    masked = "".join(code)
+    shapes = _KT_INVOKABLE if language == "kotlin" else (_SWIFT_INVOKABLE,)
+    return any(match.group("name") == name for shape in shapes for match in shape.finditer(masked))
+
+
+# Where a declared parameter list opens. Dart's header is told from a call by
+# the body that follows its list (`_DART_BODY`).
+_GENERIC = r"(?:<[^<>\n]*(?:<[^<>\n]*>[^<>\n]*)*>)?"
+_SWIFT_HEADER = re.compile(rf"(?<![\w.])(?:func\s+[^\s(<]+|init[?!]?|subscript)\s*{_GENERIC}\s*\(")
+_DART_HEADER = re.compile(rf"(?<![\w$.])(?P<fn>[A-Za-z_$][\w$]*)\s*{_GENERIC}\s*\(")
+_DART_BODY = re.compile(r"\s*(?:async\*?|sync\*)?\s*(?:\{|=>)")
+_DART_NOT_HEADERS = frozenset({"if", "for", "while", "switch", "catch", "super", "this", "assert"})
+_GROUP_BRACKETS = str.maketrans("{}[]", "    ")
+_TRAILING_NAME = re.compile(r"(?P<name>[A-Za-z_$][\w$]*)\s*$")
+
+
+def _parameter_pieces(cleaned: str, open_paren: int) -> tuple[list[tuple[int, str]], int]:
+    """``(offset, text)`` of each top-level parameter in the list at *open_paren*, and its end.
+
+    A Dart `{..}` / `[..]` optional group at the top is read through, and an
+    arrow (`->`, `=>`) closes nothing.
+    """
+    pieces: list[tuple[int, str]] = []
+    depth, start, index = 0, open_paren + 1, open_paren + 1
+    while index < len(cleaned):
+        char = cleaned[index]
+        if char in "(<" or (char in "{[" and depth):
+            depth += 1
+        elif char == ">" and cleaned[index - 1] in "-=":
+            pass
+        elif char in ")>" or (char in "}]" and depth):
+            if not depth and char == ")":
+                pieces.append((start, cleaned[start:index]))
+                return pieces, index
+            depth = max(depth - 1, 0)
+        elif char == "," and not depth:
+            pieces.append((start, cleaned[start:index]))
+            start = index + 1
+        index += 1
+    return pieces, index
+
+
+def _swift_parameter(piece: str) -> str | None:
+    """The name a Swift parameter binds in the body: the last word before its type."""
+    words = piece.partition(":")[0].split()
+    return words[-1] if words and words[-1] != "_" and words[-1].isidentifier() else None
+
+
+def _dart_parameter(piece: str) -> str | None:
+    """The name a Dart parameter binds; a `this.x` / `super.x` one binds no new name."""
+    # An optional group's brackets (`{required T name}`, `[T name]`) are not the name.
+    head = re.split(r"[=:]", piece.translate(_GROUP_BRACKETS), maxsplit=1)[0].strip()
+    if re.search(r"\b(?:this|super)\.", head):
+        return None
+    found = _TRAILING_NAME.search(head)
+    return found.group("name") if found else None
+
+
+def _listed_parameters(
+    cleaned: str, header: re.Pattern[str], name_of: Callable[[str], str | None], body: bool
+) -> set[tuple[int, str]]:
+    found: set[tuple[int, str]] = set()
+    for match in header.finditer(cleaned):
+        if body and match.group("fn") in _DART_NOT_HEADERS:
+            continue
+        pieces, end = _parameter_pieces(cleaned, match.end() - 1)
+        if body and not _DART_BODY.match(cleaned, end + 1):
+            continue
+        for offset, piece in pieces:
+            name = name_of(piece)
+            if name is not None:
+                found.add((offset + piece.find(name), name))
+    return found
+
+
+def scan_call_shadows(text: str, language: str) -> tuple[tuple[int, str], ...]:
+    """Every ``(line, name)`` binding in *text* that hides a bare call of that name.
+
+    Everything ``scan_bindings`` reads, but for Kotlin only invokable bindings,
+    and Swift and Dart add their declared parameters.
+    """
+    if language in BINDING_LANGUAGES:
+        return scan_bindings(text, language)
+    if language not in CALL_SHADOW_LANGUAGES:
+        return ()
+    cleaned = _without_comments(text, language)
+    if language == "kotlin":
+        found = _named_bindings(_KT_INVOKABLE, cleaned)
+    elif language == "swift":
+        found = _listed_parameters(cleaned, _SWIFT_HEADER, _swift_parameter, body=False)
+    else:
+        found = _listed_parameters(cleaned, _DART_HEADER, _dart_parameter, body=True)
+    starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
+    lines = {(bisect_right(starts, offset), name) for offset, name in found}
+    if language != "kotlin":
+        lines.update(scan_bindings(text, language))
+    return tuple(sorted(lines))
+
+
+def dart_named_constructors(body: str, class_name: str) -> frozenset[str]:
+    """The names *class_name*'s Dart *body* declares constructors under: ``Foo.named(``.
+
+    Read where a declaration starts a line, with comments blanked. Ceiling: a
+    body-internal ``Foo.x(..)`` call at a line's start reads as one, which a
+    valid program only writes for a constructor or a static of the class.
+    """
+    declared = re.compile(
+        rf"^[ \t]*(?:(?:const|factory|external)\s+)*{re.escape(class_name)}\s*\.\s*(\w+)\s*\(",
+        re.MULTILINE,
+    )
+    return frozenset(declared.findall(_without_comments(body, "dart")))
+
+
 # What a scope binds beyond its positional bindings. A TypeScript/JavaScript
 # ``function`` declaration is hoisted, so it binds from the top of its scope
 # whatever its line. A Python ``global`` name is the module's in that scope,
@@ -775,23 +941,26 @@ def _nests_in_a_builtin(raw: str, language: str) -> bool:
     return bool(separator) and head in get_builtin_types(language)
 
 
+def _is_java_array(raw: str, language: str) -> bool:
+    return language == "java" and raw.endswith(("]", "..."))
+
+
 def _usable_type_name(raw: str, language: str) -> tuple[str | None, bool]:
     """``(bare name, unwrapped)`` for *raw*, or ``(None, False)``.
 
     Only C++ looks inside the spelling: ``shared_ptr<Foo>`` is a ``Foo`` behind
     the arrow. Elsewhere the generic head is the value's real type. A C# head
     keeps its arity, ``IFoo`1``, since a same-file ``IFoo`` may be another type;
-    the lookup falls back to the bare name.
+    the lookup falls back to the bare name. A Java ``Token.Tag`` keeps its
+    outer type, which picks the member type the lookup means.
     """
-    if _nests_in_a_builtin(raw, language):
+    if _nests_in_a_builtin(raw, language) or _is_java_array(raw, language):
         return None, False
     inner = unwrap_pointer_like(raw) if language == "cpp" else None
     name = inner or (raw if raw.isidentifier() else bare_type_name(raw))
     if not is_resolvable_type_name(name, language):
         return None, False
-    if language == "csharp" and (arity := type_argument_count(raw)):
-        name = f"{name}`{arity}"
-    return name, inner is not None
+    return written_type_key(name, raw, language), inner is not None
 
 
 # Languages whose constructor parameter lists sit at class scope, unextracted,
@@ -838,7 +1007,7 @@ def scan_declarations(text: str, language: str) -> tuple[Declaration, ...]:
             raw = match.group("type")
             if raw not in resolved:
                 resolved[raw] = _usable_type_name(raw, language)
-                if resolved[raw][0] is None and language in EXTERNAL_TYPE_LANGUAGES:
+                if resolved[raw][0] is None and language in _MARKED_BUILTIN_LANGUAGES:
                     resolved[raw] = (_builtin_type_name(raw, language), False)
             type_name, unwrapped = resolved[raw]
             if type_name is None:
@@ -873,6 +1042,11 @@ def _builtin_type_name(raw: str, language: str) -> str | None:
     refused rather than left to name matching. A generic parameter (``T``) or
     any other unknown name stays dropped: unknown is not external.
     """
+    if _is_java_array(raw, language):
+        # Any array is a builtin, ``Foo[]`` too, so no call on it reaches ``Foo``.
+        dimensions = raw.replace(" ", "").count("[]") + raw.endswith("...")
+        element = strip_type_arguments(raw.removesuffix("...")).strip()
+        return _EXTERNAL_TYPE + element + "[]" * dimensions
     if _nests_in_a_builtin(raw, language):
         return _EXTERNAL_TYPE + strip_type_arguments(raw).strip()
     name = raw if raw.isidentifier() else bare_type_name(raw)
@@ -893,15 +1067,54 @@ class CallAssignment(NamedTuple):
     name: str
     receiver: str | None
     target: str
+    # Python ``x = await f()``: an ``async def`` yields its annotation only then.
+    awaited: bool = False
 
 
-_CALL_ASSIGNMENT_PATTERNS: dict[str, re.Pattern[str]] = {"go": _GO_CALL_DECL}
+# The call a local is assigned from: ``[receiver.]target(``. A Kotlin, Swift or
+# Dart local annotated with its type is typed by its declaration instead.
+_CALL_HEAD = r"(?:(?P<receiver>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.)?(?P<target>[A-Za-z_]\w*)\s*\("
+
+# ``x = f(..)``, ``x = await obj.f(..)``: a plain statement-start assignment
+# that ends its line. The resolver refuses a name the body also binds elsewhere.
+_PY_CALL_ASSIGNMENT = re.compile(
+    rf"(?m)^[ \t]*(?P<name>[a-z_]\w*)[ \t]*=[ \t]*(?P<awaited>await[ \t]+)?{_CALL_HEAD}"
+)
+
+# ``val x = f(..)``, ``let x = try await obj.f(..)``, ``final x = await f(..);``.
+# Swift's ``try?`` value still calls the callee type's methods. A Dart
+# ``await`` unwraps the ``Future`` the callee declares.
+_KT_CALL_ASSIGNMENT = re.compile(rf"(?<![\w.])va[lr]\s+(?P<name>[a-z_]\w*)\s*=\s*{_CALL_HEAD}")
+_SWIFT_CALL_ASSIGNMENT = re.compile(
+    rf"(?<![\w.])(?:let|var)\s+(?P<name>[a-z_]\w*)\s*=\s*(?:try[?!]?\s+)?(?:await\s+)?{_CALL_HEAD}"
+)
+_DART_CALL_ASSIGNMENT = re.compile(
+    rf"(?<![\w.])(?:final|var|const)\s+(?P<name>[a-z_]\w*)\s*=\s*(?P<awaited>await\s+)?"
+    rf"(?:(?:new|const)\s+)?{_CALL_HEAD}"
+)
+
+_CALL_ASSIGNMENT_PATTERNS: dict[str, re.Pattern[str]] = {
+    "dart": _DART_CALL_ASSIGNMENT,
+    "go": _GO_CALL_DECL,
+    "kotlin": _KT_CALL_ASSIGNMENT,
+    "python": _PY_CALL_ASSIGNMENT,
+    "swift": _SWIFT_CALL_ASSIGNMENT,
+}
 
 # Languages whose locals may be typed from a call's declared return type.
 CALL_TYPED_LANGUAGES = frozenset(_CALL_ASSIGNMENT_PATTERNS)
 
 _QUOTES = frozenset("\"'`")
 _STATEMENT_ENDS = frozenset("\n;}")
+# A Python ``;`` may rebind the name later on the line, where no scan sees it.
+# Dart ends a statement only at ``;``, so ``f()\n.g()`` is one statement.
+_LANGUAGE_STATEMENT_ENDS = {"python": frozenset("\n"), "dart": frozenset(";")}
+# Kotlin and Swift may carry a statement onto a line that starts with a member
+# access or an operator (``.f()``, ``?: x``, ``as T``, ``&& y``). Refused
+# wholesale: a new statement starting so only costs the local its type.
+_NEXT_LINE_CONTINUES = {
+    language: re.compile(r"[.?:+\-*/%&|=!<>]|(?:as|is)\b") for language in ("kotlin", "swift")
+}
 
 
 def _call_end(text: str, index: int) -> int:
@@ -924,6 +1137,18 @@ def _call_end(text: str, index: int) -> int:
     return -1
 
 
+def _call_ends_statement(cleaned: str, opened: int, language: str) -> bool:
+    """Does the call whose ``(`` ends just before *opened* end its statement?"""
+    end = _call_end(cleaned, opened)
+    if end < 0:
+        return False
+    rest = cleaned[end:].lstrip(" \t\n" if language == "dart" else " \t")
+    if rest and rest[0] not in _LANGUAGE_STATEMENT_ENDS.get(language, _STATEMENT_ENDS):
+        return False
+    continues = _NEXT_LINE_CONTINUES.get(language)
+    return continues is None or not continues.match(rest.lstrip())
+
+
 def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...]:
     """Every local *text* declares from a single call, in line order.
 
@@ -937,9 +1162,7 @@ def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...
     starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
     found: list[CallAssignment] = []
     for match in pattern.finditer(cleaned):
-        end = _call_end(cleaned, match.end())
-        rest = cleaned[end:].lstrip(" \t") if end >= 0 else ""
-        if end < 0 or (rest and rest[0] not in _STATEMENT_ENDS):
+        if not _call_ends_statement(cleaned, match.end(), language):
             continue
         found.append(
             CallAssignment(
@@ -947,6 +1170,7 @@ def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...
                 match.group("name"),
                 match.group("receiver"),
                 match.group("target"),
+                bool(match.groupdict().get("awaited")),
             )
         )
     return tuple(found)

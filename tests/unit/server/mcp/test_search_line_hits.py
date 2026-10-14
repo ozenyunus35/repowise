@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import shutil
 import subprocess
 from datetime import UTC, datetime
 
 import pytest
 
 from repowise.core.persistence.models import GraphEdge, GraphNode
-from repowise.server.mcp_server import _edit_sites, _line_hits, _meta
+from repowise.server.mcp_server import _edit_sites, _line_hits, _meta, _state
 from repowise.server.mcp_server._budget import enforce_response_budget
 from repowise.server.mcp_server.tool_search import search_codebase
 
@@ -27,6 +28,9 @@ _FILES = {
         "x = 147821\n"
     ),
 }
+
+
+_REAL_DIRTY = _meta._working_tree_dirty_paths
 
 
 def _dirty(monkeypatch, paths: frozenset[str]) -> None:
@@ -142,6 +146,39 @@ async def test_quoted_string_is_scanned_as_a_substring(tree):
 
 
 @pytest.mark.asyncio
+async def test_a_name_with_no_symbol_but_live_lines_is_not_reported_missing(tree):
+    """The symbol stage's miss advice is written before any line is read.
+
+    Next to the lines it found, "recheck the spelling" and "grep the name" say
+    the opposite of what the reply holds; ``exact_match`` still says no symbol.
+    """
+    out = await search_codebase("connect", mode="symbol")
+
+    assert _rows(out) == [("app/widget.py", 4, "match")]
+    assert out["complete"] is True
+    assert out["exact_match"] is False
+    assert "grep_hint" not in out
+    assert "note" not in out
+
+
+def test_fuzzy_results_beside_literal_lines_keep_a_short_label():
+    out = {"results": [{"name": "connect_pool"}], "exact_match": False, "note": "x", "grep_hint": "y"}
+
+    _line_hits._reconcile_symbol_miss(out, literal_scan=True)
+
+    assert "grep_hint" not in out
+    assert "other symbols" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_a_name_with_no_symbol_and_no_lines_keeps_its_miss_advice(tree):
+    out = await search_codebase("disconnect", mode="symbol")
+
+    assert "lines" not in out or out["lines"] == []
+    assert "grep_hint" in out
+
+
+@pytest.mark.asyncio
 async def test_cap_hit_marks_lines_incomplete(tree, monkeypatch):
     monkeypatch.setattr(_line_hits, "MAX_LINES_PER_FILE", 0)
 
@@ -168,6 +205,29 @@ async def test_uncommitted_unindexed_file_is_scanned(tree):
 
     assert ("app/new.py", 1, "match") in _rows(out)
     assert out["complete"] is True
+
+
+@pytest.mark.asyncio
+async def test_unindexed_file_is_read_from_the_served_checkout(
+    tree, setup_mcp, tmp_path_factory, monkeypatch
+):
+    # The stored local_path (tree) is an older copy; the server serves another.
+    tree_repo_id = setup_mcp
+    for module in (_edit_sites, _meta):
+        monkeypatch.setattr(module, "_working_tree_dirty_paths", _REAL_DIRTY)
+    served = tmp_path_factory.mktemp("served") / "repo"
+    shutil.copytree(tree, served)
+    (served / ".repowise").mkdir()
+    (served / "app" / "later.py").write_text(
+        "from pkg.catalog import backend_of\n\nbackend_of('x')\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(_state, "_repo_path", str(served))
+    monkeypatch.setattr(_state, "_served_repo_id", tree_repo_id)
+    _meta._dirty_paths_cache.clear()
+
+    out = await search_codebase("backend_of", mode="symbol")
+
+    assert {"app/later.py", "app/widget.py"} <= {r["path"] for r in out["lines"]}
 
 
 @pytest.mark.asyncio

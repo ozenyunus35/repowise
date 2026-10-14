@@ -326,7 +326,8 @@ class CallSite:
     receiver_call: CallReceiver | None = None  # set only for a captured chained call
     # C++ `Ns::f()` / `Class::m()`: the qualifier as written. Kept apart from
     # ``receiver_name`` because that field routes to the member strategies,
-    # and cpp has none -- a scoped call must stay on the free-call path.
+    # and cpp has none -- a scoped call must stay on the free-call path. Java
+    # writes the ``S`` of ``S.super.m()`` here.
     scope_name: str | None = None
     edge_type: CallSiteEdgeType = "calls"  # see ``CallSiteEdgeType``
     supplied_props: set[str] | None = None  # prop names supplied in JSX element (None if unknown/spread)
@@ -337,6 +338,12 @@ class CallSite:
     # Handed straight to a task scheduler (``asyncio.create_task(f())``): it runs
     # later, beside its caller, so the caller neither waits for it nor repeats it.
     spawned: bool = False
+    # Java: each argument's type where it is a literal (``"String"``, ``"int"``,
+    # ``"null"``), else None; None overall when no argument is one.
+    argument_types: tuple[str | None, ...] | None = None
+    # Java: each argument that is a bare name (``start``), else None; None overall
+    # when no argument is one. The resolver reads its declared type.
+    argument_names: tuple[str | None, ...] | None = None
 
 
 # Raw extractor kinds, not the TS ``HeritageKind`` (a different payload);

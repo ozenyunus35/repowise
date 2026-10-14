@@ -490,8 +490,14 @@ def save_state(repo_path: Path, state: dict[str, Any], *, full_index: bool = Fal
     incremental persist leaves it False and the version clamps below any
     ``REINDEX_RECOMMENDED`` gate, keeping a reindex recommendation alive until
     an actual re-index clears it.
+
+    A write that changes ``last_sync_commit`` moves the repository row's
+    ``head_commit`` to the same commit, so the two stamps never disagree.
     """
+    from repowise.core.workspace.update import read_state_commit, restamp_changed_sync_commit
+
     ensure_repowise_dir(repo_path)
+    previous = read_state_commit(Path(repo_path))
     try:
         from repowise.cli import __version__ as _pkg_version
         from repowise.core.upgrade import stamp as _stamp_store_version
@@ -505,6 +511,7 @@ def save_state(repo_path: Path, state: dict[str, Any], *, full_index: bool = Fal
     # every later update would fail to parse it and demand a full re-init.
     state_path = get_repowise_dir(repo_path) / STATE_FILENAME
     atomic_write_text(state_path, json.dumps(state, indent=2))
+    restamp_changed_sync_commit(Path(repo_path), previous, state.get("last_sync_commit"))
 
 
 # ---------------------------------------------------------------------------

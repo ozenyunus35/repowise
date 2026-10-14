@@ -34,7 +34,7 @@ log = structlog.get_logger(__name__)
 _INCLUDE_RE = re.compile(r'include\s*\(\s*((?:"[^"]+"\s*,?\s*)+)\)')
 _INCLUDE_ITEM_RE = re.compile(r'"([^"]+)"')
 _INCLUDE_LINE_RE = re.compile(r'include\s+([\'"])([^\'"]+)\1')
-_INCLUDE_BUILD_RE = re.compile(r'includeBuild\s*\(\s*"([^"]+)"\s*\)')
+_INCLUDE_BUILD_RE = re.compile(r"""includeBuild\s*\(?\s*(["'])([^"']+)\1""")
 _PROJECT_DIR_RE = re.compile(
     r'project\s*\(\s*"([^"]+)"\s*\)\s*\.\s*projectDir\s*=\s*file\s*\(\s*"([^"]+)"\s*\)'
 )
@@ -64,6 +64,11 @@ _ROOT_PROJECT_NAME_RE = re.compile(r'rootProject\s*\.\s*name\s*=\s*"([^"]+)"')
 # A quoted fully-qualified class name: lowercase package segments, then a
 # capitalised type (``'org.elasticsearch.system.indices.SystemIndicesQA'``).
 _QUOTED_FQN_RE = re.compile(r"""['"]((?:[a-z_]\w*\.)+[A-Z]\w*)['"]""")
+# A default-package class (``build-logic`` convention plugins) has no dots, so
+# only a class-naming key vouches for the bare name.
+_KEYED_BARE_CLASS_RE = re.compile(
+    r"""\b(?:implementationClass|mainClass)\s*(?:=|\.set\s*\()\s*['"]([A-Z]\w*)['"]"""
+)
 
 _DEFAULT_MAIN_SRC_ROOTS = ("src/main/java", "src/main/kotlin")
 _DEFAULT_TEST_SRC_ROOTS = ("src/test/java", "src/test/kotlin")
@@ -164,6 +169,11 @@ def parse_settings(settings_file: Path) -> tuple[list[str], dict[str, str]]:
     return result, overrides
 
 
+def included_builds(settings_text: str) -> list[str]:
+    """The directories a settings script composes in with ``includeBuild``, as written."""
+    return [match.group(2) for match in _INCLUDE_BUILD_RE.finditer(settings_text)]
+
+
 def _module_dir(repo_path: Path, module_name: str, overrides: dict[str, str]) -> Path:
     if module_name in overrides:
         return repo_path / overrides[module_name]
@@ -173,6 +183,33 @@ def _module_dir(repo_path: Path, module_name: str, overrides: dict[str, str]) ->
 # ---------------------------------------------------------------------------
 # Source-set discovery
 # ---------------------------------------------------------------------------
+
+# ``<module>/src/<set>/kotlin/``: the source-set directory a JVM file sits in.
+_SOURCE_SET_DIR_RE = re.compile(r"(?:^|/)src/[^/]+/(?=(?:java|kotlin)/)")
+
+
+def source_set_dir(path: str) -> str | None:
+    """The source-set directory *path* sits in (``okio/src/jvmMain/``), or None."""
+    match = _SOURCE_SET_DIR_RE.search(path)
+    return path[: match.end()] if match else None
+
+
+def declaration_rank(importer: str, candidate: str, is_expect: bool) -> int:
+    """How directly *importer* sees *candidate*, one of a name's declarations; lowest wins.
+
+    Kotlin Multiplatform declares a name once per source set: ``expect`` in
+    common code and ``actual`` in each platform's. A file binds its own source
+    set's declaration (0), else the ``expect`` its set depends on (1); any
+    other declaration (2) is a guess, since source-set dependencies are not
+    read: an intermediate set's ``actual`` may be visible, another platform's
+    is not. Ties keep their order. Outside multiplatform only a declaration in
+    the file's own source set (``src/main`` over ``src/test``) moves ahead.
+    """
+    own = source_set_dir(importer)
+    if own is not None and source_set_dir(candidate) == own:
+        return 0
+    return 1 if is_expect else 2
+
 
 def _is_test_source_set(name: str) -> bool:
     lower = name.lower()
@@ -441,13 +478,14 @@ def build_jvm_gradle_index(
 
 
 def build_script_class_names(ctx: ResolverContext) -> set[str]:
-    """Fully-qualified class names quoted in any Gradle build script.
+    """Class names quoted in any Gradle build script, fully qualified or bare.
 
     A build names a class it loads by reflection: a plugin's
     ``esplugin { classname '...' }``, ``gradlePlugin`` ``implementationClass``,
     an application ``mainClass``. Every build script in the tree is read,
     since a settings file that adds projects by walking directories names
     none of them. A name only counts once it resolves to a class in the repo.
+    A name without a package is the default package's class.
     """
     names: set[str] = set()
     if ctx.repo_path is None:
@@ -459,9 +497,11 @@ def build_script_class_names(ctx: ResolverContext) -> set[str]:
         prune_nested_git=ctx.prune_nested_git,
     ):
         try:
-            names.update(_QUOTED_FQN_RE.findall(script.read_text(encoding="utf-8", errors="ignore")))
+            text = script.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        names.update(_QUOTED_FQN_RE.findall(text))
+        names.update(_KEYED_BARE_CLASS_RE.findall(text))
     return names
 
 

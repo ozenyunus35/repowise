@@ -197,24 +197,9 @@ async def _resolve_repo_context(repo: str | None = None) -> Any:
     if isinstance(resolved, list):
         raise ValueError(
             "repo='all' must be handled explicitly by each tool. "
-            "Use _resolve_all_contexts() instead."
+            "Fan out with _federation.Federation instead."
         )
     return await registry.get(resolved)
-
-
-async def _resolve_all_contexts() -> list[Any]:
-    """Return ``RepoContext`` objects for all repos in the workspace.
-
-    In single-repo mode, returns a single-element list wrapping ``_state``.
-    """
-    registry = _state._registry
-    if registry is None:
-        ctx = await _resolve_repo_context(None)
-        return [ctx]
-    contexts = []
-    for alias in registry.get_all_aliases():
-        contexts.append(await registry.get(alias))
-    return contexts
 
 
 def _unsupported_repo_all(tool_name: str) -> dict:
@@ -556,12 +541,17 @@ def _compute_alignment(
     reachable from any caller that forgot it.
     """
     if not governing:
+        # With nothing accepted anywhere, "ungoverned" describes the index, not
+        # this file, so say that instead.
+        reason = (
+            "This file is ungoverned — it may be an outlier or simply undocumented."
+            if currencies
+            else "This index holds no accepted decisions, so no file is governed "
+            "yet; a person accepts a candidate with `repowise decision confirm`."
+        )
         return {
             "score": "none",
-            "explanation": (
-                f"No architectural decisions govern {file_path}. "
-                "This file is ungoverned — it may be an outlier or simply undocumented."
-            ),
+            "explanation": f"No architectural decisions govern {file_path}. {reason}",
             "governing_count": 0,
             "active_count": 0,
             "candidate_count": 0,

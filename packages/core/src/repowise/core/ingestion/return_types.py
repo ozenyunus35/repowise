@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .type_names import bare_type_name, type_argument_count
+from .type_names import bare_type_name, written_type_key
 
 _NULLISH_UNION = re.compile(r"\s*\|\s*(?:null|undefined)\b")
 _CPP_PREFIX = re.compile(r"^(?:(?:const|volatile|typename|class|struct)\s+)+")
@@ -12,10 +12,22 @@ _CPP_SUFFIX = re.compile(r"\s*(?:\*|&|&&)\s*$")
 
 
 def declared_return_type(signature: str) -> str | None:
-    """Return the declared portion of a stored symbol signature, if present."""
+    """Return the declared portion of a stored symbol signature, if present.
 
-    _, separator, raw = signature.partition(" -> ")
-    value = raw.strip() if separator else ""
+    The arrow is the one after the first parameter list, so a function-typed
+    parameter (``f(cb: () -> Foo) -> Bar``) does not end the list early.
+    """
+
+    opened = signature.find("(")
+    arrow = signature.find(" -> ")
+    if 0 <= opened < arrow:
+        depth = 0
+        for index in range(opened, len(signature)):
+            depth += {"(": 1, ")": -1}.get(signature[index], 0)
+            if depth == 0:
+                arrow = signature.find(" -> ", index)
+                break
+    value = signature[arrow + 4 :].strip() if arrow >= 0 else ""
     return value or None
 
 
@@ -137,6 +149,4 @@ def normalize_return_type(raw: str, language: str) -> str | None:
     name = bare_type_name(value).strip()
     if not name.isidentifier():
         return None
-    if language == "csharp" and (arity := type_argument_count(value)):
-        return f"{name}`{arity}"
-    return name
+    return written_type_key(name, value, language)

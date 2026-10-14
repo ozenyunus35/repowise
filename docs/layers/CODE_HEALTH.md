@@ -97,7 +97,8 @@ duplicated code when part of it is a copy.
 
 Left out, and counted with a reason:
 
-- test files, tooling, generated and vendored code, docs and examples
+- test files, tooling (including Dart's `tool/` scripts), generated and vendored code,
+  docs and examples
 - files whose only findings come from git history
 - changes that would recover under half a point, and items with no concrete first
   edit
@@ -216,6 +217,7 @@ below 9.0 from history alone.
 
 On a small team, `knowledge_loss` and `ownership_risk` are capped at low severity
 unless the file is a hotspot, and the `small-team` profile lowers them further.
+`ownership_risk` is also low on a file under 40 code lines.
 `large_assertion_block` and `duplicated_assertion_block` fire only in test files.
 House assertion helpers go in the [`assertions:` block](../reference/CONFIG.md#the-assertions-block).
 Per-language coverage: [LANGUAGE_SUPPORT.md](LANGUAGE_SUPPORT.md#code-health-coverage).

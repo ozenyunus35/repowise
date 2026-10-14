@@ -164,3 +164,34 @@ def test_json_marks_an_export_its_own_file_uses_as_export_only(indexed_repo):
     assert site["safe_to_delete"] is False
     (link,) = [f for f in findings if f["symbol_name"] == "link"]
     assert link["export_only"] is False
+
+
+def _md(root: Path, *args: str) -> str:
+    result = CliRunner().invoke(
+        dead_code_command, [str(root), "--format", "md", "--no-workspace", *args]
+    )
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_safe_only_says_why_it_is_empty(indexed_repo, monkeypatch):
+    monkeypatch.setattr(dead_code_cmd, "_analyze_live", None)
+    assert "none deletion-ready" not in _md(indexed_repo, "--safe-only")
+
+    unproven = {**_STORED_ONLY, "confidence": 0.6, "safe_to_delete": False}
+    run_async(_store(indexed_repo, [unproven]))
+    out = _md(indexed_repo, "--safe-only")
+    assert "1 finding(s), none deletion-ready" in out
+    assert "none deletion-ready" not in _md(indexed_repo)
+
+
+def test_safe_only_rereads_a_stored_safe_flag_through_the_gate(indexed_repo, monkeypatch):
+    # Stored safe, but a runtime-loaded config path: the read surfaces'
+    # gate downgrades it, so --safe-only hides it and explains why.
+    monkeypatch.setattr(dead_code_cmd, "_analyze_live", None)
+    risky = {**_STORED_ONLY, "file_path": "gone/settings.py"}
+    run_async(_store(indexed_repo, [risky]))
+
+    out = _md(indexed_repo, "--safe-only")
+    assert "gone/settings.py" not in out
+    assert "1 finding(s), none deletion-ready" in out

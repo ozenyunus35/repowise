@@ -36,12 +36,13 @@ import structlog
 from .call_language_strategies import _LANGUAGE_CALL_STRATEGIES as _LANGUAGE_CALL_STRATEGIES
 from .call_language_strategies import LanguageStrategiesMixin
 from .call_receiver_typing import (
+    _FUNCTION_KINDS,
     _SOURCE_CACHE_FILES,
     _TYPE_KINDS,
     ReceiverTypingMixin,
     _store_capped,
 )
-from .decorator_names import decorator_base
+from .decorator_names import is_property_accessor
 from .lang_helpers.anonymous_classes import is_anonymous_member
 from .language_data import (
     get_builtin_methods,
@@ -49,6 +50,7 @@ from .language_data import (
     get_external_receiver_types,
     get_external_return_types,
 )
+from .languages.receiver_types import external_type_name, holds_function
 from .models import (
     CallReceiver,
     CallSite,
@@ -60,14 +62,23 @@ from .models import (
 )
 from .resolved_call import ResolvedCall
 from .resolvers.cpp import _SOURCE_TU_EXTS
+from .resolvers.jvm_workspace import classify_jvm_import
 from .return_types import (
     declared_return_type,
     normalize_return_type,
     signature_parameter_count,
     signature_parameter_range,
 )
-from .symbol_identity import id_segment_name, outer_scope, pair_overloads, split_symbol_id
+from .symbol_identity import (
+    erased_parameter_types,
+    erased_type,
+    id_segment_name,
+    outer_scope,
+    pair_overloads,
+    split_symbol_id,
+)
 from .type_names import (
+    bare_type_name,
     csharp_extension_receiver,
     is_resolvable_type_name,
 )
@@ -133,6 +144,33 @@ _MAX_ANCESTOR_EXPAND_DEPTH = 3
 # ``property`` is the only kind that means "data member" and nothing else; every
 # other language spells its fields ``variable``, indistinguishable by kind.
 _NON_CALLABLE_KINDS = frozenset({"property"})
+# Languages whose ``variable`` is always a property (`val`/`var`/`let`): a data
+# member. Calling one invokes the value it holds, which is not this symbol.
+_PROPERTY_VARIABLE_LANGUAGES = frozenset({"kotlin", "swift"})
+
+
+# Kotlin's call operator: ``f(x)`` on a value is ``f.invoke(x)`` when its type
+# declares an ``operator fun invoke``.
+_INVOKE_OPERATOR = "invoke"
+_OPERATOR_MODIFIER = "operator"
+
+
+def _imports_a_library(imp: Import) -> bool:
+    """Does *imp* name a JVM library namespace the repository does not hold?"""
+    if classify_jvm_import(imp.module_path, kotlin=True) is None:
+        return False
+    return not imp.resolved_file or imp.resolved_file.startswith(_EXTERNAL_PREFIX)
+
+
+def _is_kotlin_alias(sym: Symbol | None) -> bool:
+    return sym is not None and sym.kind == "type_alias" and sym.language == "kotlin"
+
+
+def _is_data_member(sym: Symbol) -> bool:
+    if sym.kind in _NON_CALLABLE_KINDS:
+        return True
+    return sym.kind == "variable" and sym.language in _PROPERTY_VARIABLE_LANGUAGES
+
 
 # A Rust ``impl`` or Swift ``extension`` block is named for the type it adds
 # members to and declares nothing itself, so no bare name means it: ``Text(..)``
@@ -140,23 +178,15 @@ _NON_CALLABLE_KINDS = frozenset({"property"})
 # the bare-name indices; its members still resolve through the method index.
 _EXTENSION_KINDS = frozenset({"impl"})
 
-# A getter and its setter are two declarations under one id, which reads as an
-# overload set and is not one: the name is an attribute, not a callable.
-_PROPERTY_DECORATORS = frozenset({"property", "cached_property"})
-_PROPERTY_ACCESSOR_SUFFIXES = (".setter", ".getter", ".deleter")
-
-
-def _is_property_accessor(sym: Any) -> bool:
-    for decorator in getattr(sym, "decorators", ()) or ():
-        tail = decorator_base(decorator)
-        if tail in _PROPERTY_DECORATORS or tail.endswith(_PROPERTY_ACCESSOR_SUFFIXES):
-            return True
-    return False
-
-
 # Languages admitted to the full return-type chain lane; each is admitted
 # explicitly, once measured.
-PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset({"cpp", "csharp", "go", "java"})
+PRODUCTION_RETURN_TYPE_CHAIN_LANGUAGES: frozenset[str] = frozenset(
+    {"cpp", "csharp", "dart", "go", "java", "python"}
+)
+
+# Chain languages that type the inner call by the identity of the type it
+# returns (``_returned_type_id``); the rest read its type name.
+_RETURNED_TYPE_ID_LANGUAGES = frozenset({"dart", "go", "python"})
 
 # Chain lanes that need a file or import/re-export identity for the head type:
 # a repository-global simple type name is not a language binding.
@@ -201,6 +231,177 @@ def _overload_phase(admitted: tuple[int, int | None], argument_count: int) -> in
     if argument_count > most:
         return None
     return 0 if fewest == most else 1
+
+
+_ArgumentTypes = tuple[str | None, ...] | None
+
+# The Java primitives a value of each type widens to, nearest first.
+_JAVA_WIDENING: dict[str, tuple[str, ...]] = {
+    "boolean": ("boolean",),
+    "byte": ("byte", "short", "int", "long", "float", "double"),
+    "short": ("short", "int", "long", "float", "double"),
+    "char": ("char", "int", "long", "float", "double"),
+    "int": ("int", "long", "float", "double"),
+    "long": ("long", "float", "double"),
+    "float": ("float", "double"),
+    "double": ("double",),
+}
+_JAVA_BOXES = {
+    "boolean": "Boolean", "byte": "Byte", "short": "Short", "char": "Character",
+    "int": "Integer", "long": "Long", "float": "Float", "double": "Double",
+}
+_JAVA_UNBOXED = {box: primitive for primitive, box in _JAVA_BOXES.items()}
+_JAVA_PRIMITIVES = frozenset(_JAVA_WIDENING)
+# Parameter types a literal is judged against; any other (``Object``, a type
+# variable, a class) takes a literal by boxing, or as a ``String``'s supertype.
+_JAVA_JUDGED_PARAMETERS = _JAVA_PRIMITIVES | frozenset(
+    {*_JAVA_BOXES.values(), "String", "CharSequence"}
+)
+# Final classes: a parameter of one takes no other class.
+_JAVA_FINAL_PARAMETERS = frozenset({*_JAVA_BOXES.values(), "String"})
+# {literal: {judged parameter: how it is reached}}: 0 exactly, 1 widened, 2 boxed.
+_JAVA_LITERAL_LEVELS: dict[str, dict[str, int]] = {
+    **{
+        literal: {p: int(p != literal) for p in widened} | {_JAVA_BOXES[literal]: 2}
+        for literal, widened in _JAVA_WIDENING.items()
+    },
+    "String": {"String": 0, "CharSequence": 1},
+    "null": dict.fromkeys(_JAVA_JUDGED_PARAMETERS - _JAVA_PRIMITIVES, 1),
+}
+_UNJUDGED_LEVEL = {**dict.fromkeys(_JAVA_WIDENING, 2), "String": 1, "null": 1}
+
+
+def _argument_fit(parameter: str, argument: str) -> int | None:
+    """How near a Java argument reaches *parameter*: 0 exactly, 1 widened, 2 boxed; None never.
+
+    *argument* is a literal's type or a named argument's declared one; a
+    named ``String`` or primitive takes the literal path. A coarse form of the
+    most-specific rule: a call ``f(true)`` takes ``f(boolean)`` over
+    ``f(Object)``, and ``f('c')`` takes ``f(int)`` over it.
+    """
+    levels = _JAVA_LITERAL_LEVELS.get(argument)
+    if levels is None:
+        return _reference_fit(parameter, argument)
+    if parameter.endswith("[]"):
+        return 1 if argument == "null" else None
+    if parameter not in _JAVA_JUDGED_PARAMETERS:
+        return _UNJUDGED_LEVEL[argument]
+    return levels.get(parameter)
+
+
+def _reference_fit(parameter: str, argument: str) -> int | None:
+    """How a value of class or array type *argument* reaches *parameter*.
+
+    0 as itself; 2 unboxed, 3 unboxed and widened; None where it never can
+    (a primitive, another final class, an array it is not). An array reaches
+    a covariant array at 1 and anything else (``Object``) at 2. Any other
+    parameter may be a supertype or a type variable: 1, which an exact
+    match beats and nothing else tells apart.
+    """
+    if parameter == argument:
+        return 0
+    if parameter in _JAVA_PRIMITIVES:
+        return _unboxed_fit(parameter, argument)
+    if argument.endswith("[]"):
+        return _array_fit(parameter, argument)
+    if parameter in _JAVA_FINAL_PARAMETERS or parameter.endswith("[]"):
+        return None
+    return 1
+
+
+def _unboxed_fit(parameter: str, argument: str) -> int | None:
+    """A box reaching primitive *parameter*: 2 unboxed, 3 unboxed and widened; None never."""
+    unboxed = _JAVA_UNBOXED.get(argument)
+    if unboxed is None or parameter not in _JAVA_WIDENING[unboxed]:
+        return None
+    return 2 if parameter == unboxed else 3
+
+
+def _array_fit(parameter: str, argument: str) -> int | None:
+    """``String[]`` reaches ``Object[]`` (1, covariance) and ``Object`` (2).
+
+    A primitive array reaches no other array, and no array a final class.
+    """
+    if not parameter.endswith("[]"):
+        return None if parameter in _JAVA_FINAL_PARAMETERS else 2
+    element, takes = argument.removesuffix("[]"), parameter.removesuffix("[]")
+    if element in _JAVA_PRIMITIVES or takes in _JAVA_PRIMITIVES:
+        return None
+    return None if _argument_fit(takes, element) is None else 1
+
+
+def _closest_fit(
+    members: list[tuple[str, list[str]]], argument_types: tuple[str | None, ...], expanded: bool
+) -> str | None:
+    """The one member the typed arguments fit most closely, or None on a tie.
+
+    Only where the members agree on every untyped argument's parameter:
+    there the typed ones are all that tells them apart. *expanded* says the
+    members take the call through their varargs.
+    """
+    if not _untyped_agree(members, argument_types, expanded):
+        return None
+    ranked: dict[int, list[str]] = defaultdict(list)
+    for member, parameters in members:
+        fits = [
+            _argument_fit(_parameter_taking(parameters, argument_types, index, expanded), argument)
+            for index, argument in enumerate(argument_types)
+            if argument is not None
+        ]
+        if all(fit is not None for fit in fits):
+            ranked[max(fits, default=0)].append(member)
+    best = ranked[min(ranked)] if ranked else []
+    return best[0] if len(best) == 1 else None
+
+
+def _untyped_agree(
+    members: list[tuple[str, list[str]]], argument_types: tuple[str | None, ...], expanded: bool
+) -> bool:
+    """Whether every member takes each untyped argument as the same parameter type."""
+    return all(
+        len({_parameter_at(parameters, index, expanded) for _, parameters in members}) == 1
+        for index, argument in enumerate(argument_types)
+        if argument is None
+    )
+
+
+def _parameter_taking(
+    parameters: list[str], argument_types: tuple[str | None, ...], index: int, expanded: bool
+) -> str:
+    """The parameter type typed argument *index* is judged against.
+
+    An array that alone fills the varargs position is passed as the array
+    itself (``addChildren(index, children)``), not expanded into it.
+    """
+    argument = argument_types[index] or ""
+    alone = index == len(parameters) - 1 == len(argument_types) - 1
+    if expanded and alone and argument.endswith("[]"):
+        return parameters[-1]
+    return _parameter_at(parameters, index, expanded) or ""
+
+
+def _parameter_at(parameters: list[str], index: int, expanded: bool) -> str | None:
+    """The parameter type that takes argument *index*.
+
+    Through *expanded* varargs, the trailing array's element type takes the
+    argument at its position and every one after it.
+    """
+    if expanded and parameters and index >= len(parameters) - 1:
+        return parameters[-1].removesuffix("[]")
+    return parameters[index] if index < len(parameters) else None
+
+
+def _java_method_refusing(symbol: Symbol | None, argument_count: int | None) -> bool:
+    """Whether *symbol* is a Java method whose parameters cannot take *argument_count*."""
+    if symbol is None or argument_count is None:
+        return False
+    return symbol.language == "java" and symbol.kind == "method" and not _takes(symbol, argument_count)
+
+
+def _takes(symbol: Symbol, argument_count: int) -> bool:
+    """Whether *symbol*'s parameters admit *argument_count*; an unread signature does."""
+    admitted = signature_parameter_range(symbol.signature or "", symbol.language)
+    return admitted is None or _overload_phase(admitted, argument_count) is not None
 
 
 def _flattened_wildcard_source(imp: Import) -> str | None:
@@ -313,8 +514,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # every file's method dict with one short-list lookup.
         self._global_methods: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
 
-        # C# extension methods, keyed on the type they extend rather than on
-        # their holder class: {(type, method): (file_path, symbol_id)} and the
+        # C# extension methods and Kotlin extension functions, keyed on the
+        # type they extend rather than on their holder: {(type, method):
+        # (file_path, symbol_id)} and the
         # per-file view of the same. Held apart from the method index on
         # purpose — merging them would leak C# keys into the C++ and JVM tiers
         # that read ``_global_methods``, and would let an extension answer a
@@ -361,6 +563,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         # Held as an id set rather than a full id->kind map: it is the only
         # kind question asked of it and the set is small.
         self._non_callable_ids: set[str] = set()
+        self._callable_ids: set[str] = set()
+        # {Kotlin file: names it imports from a library namespace}
+        self._library_names: dict[str, frozenset[str]] = {}
+        # The lines of the file whose declarations are being read; see ``_lines_of``.
+        self._indexed_lines: tuple[str, list[str]] = ("", [])
         # C/C++ symbols with internal linkage; see ``_reachable_by_name``.
         self._tu_local_ids: set[str] = set()
         self._property_accessor_ids: set[str] = set()
@@ -410,6 +617,8 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
 
         self._build_indices(parsed_files)
         self._follow_barrel_exports()
+        # Only a call to one of these has its named arguments typed.
+        self._overloaded_names = frozenset(self._symbols_by_id[m].name for m in self._overload_rep)
 
     def _follow_barrel_exports(self) -> None:
         """Detect barrel/re-export files and record origin mappings.
@@ -585,9 +794,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 file_methods[key] = index_id
                 self._global_methods[key].append((path, index_id))
 
-                extended = self._csharp_extended_type(sym)
-                if extended is not None:
-                    extensions[(extended, sym.name)].add((path, index_id))
+            extended = (
+                self._csharp_extended_type(sym)
+                if sym.parent_name
+                else self._kotlin_extended_type(sym)
+            )
+            if extended is not None:
+                extensions[(extended, sym.name)].add((path, index_id))
 
             self._index_globally(path, sym, index_id)
 
@@ -604,17 +817,58 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         return extended if extended in self._csharp_type_names else None
 
+    def _kotlin_extended_type(self, sym: Symbol) -> str | None:
+        """The type a top-level Kotlin extension function extends, a library one included.
+
+        Unlike C#, a library receiver is kept: Kotlin types a ``ByteArray`` or
+        ``List`` receiver too, and only an extension can be the repo's callee.
+        A member extension is left out, since only its holder's scope sees it.
+
+        Ceiling: the key is the bare type, so ``List<String>.f`` and
+        ``List<Int>.f`` collide (and refuse as ambiguous), and ``Foo?`` keys as
+        ``Foo``. Keying on type arguments would need the receiver's too.
+        """
+        if sym.language != "kotlin" or sym.kind not in _FUNCTION_KINDS:
+            return None
+        return self._kotlin_receiver(sym)
+
     def _index_globally(self, path: str, sym: Symbol, index_id: str) -> None:
         if _has_internal_linkage(path, sym):
             self._tu_local_ids.add(index_id)
-        if sym.kind in _NON_CALLABLE_KINDS:
-            self._non_callable_ids.add(index_id)
-        if _is_property_accessor(sym):
+        self._record_callability(path, sym, index_id)
+        # A getter and its setter are two declarations under one id, which reads
+        # as an overload set and is not one: the name is an attribute.
+        if is_property_accessor(sym.decorators):
             self._property_accessor_ids.add(index_id)
         # Same rules as the per-file index, for the global-unique tier.
         bodiless_method = sym.is_declaration and sym.parent_name is not None
         if not (bodiless_method or sym.kind in _EXTENSION_KINDS or is_anonymous_member(sym)):
             self._global_symbols[sym.name].append(index_id)
+
+    def _record_callability(self, path: str, sym: Symbol, index_id: str) -> None:
+        """Mark *index_id* a data member's, unless anything callable shares it.
+
+        A Kotlin `val isDark` and `fun isDark()` in one file are one id.
+        """
+        if _is_data_member(sym) and not self._holds_function(path, sym):
+            if index_id not in self._callable_ids:
+                self._non_callable_ids.add(index_id)
+        else:
+            self._callable_ids.add(index_id)
+            self._non_callable_ids.discard(index_id)
+
+    def _holds_function(self, path: str, sym: Symbol) -> bool:
+        """Is property *sym* declared with a function value (`val f: () -> Unit`)?"""
+        if sym.kind != "variable" or sym.language not in _PROPERTY_VARIABLE_LANGUAGES:
+            return False
+        lines = self._lines_of(path)[sym.start_line - 1 : max(sym.end_line, sym.start_line)]
+        return holds_function("\n".join(lines), sym.name, sym.language)
+
+    def _lines_of(self, path: str) -> list[str]:
+        """*path*'s lines, split once while its symbols are read one by one."""
+        if self._indexed_lines[0] != path:
+            self._indexed_lines = (path, self._text_of(path).splitlines())
+        return self._indexed_lines[1]
 
     def _index_overload_sets(self, parsed: ParsedFile) -> dict[str, str]:
         """Record *parsed*'s overload sets; ``{member id: representative}``.
@@ -897,6 +1151,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             if not call.caller_symbol_id:
                 # Module-level call — assign to synthetic __module__ symbol
                 call = replace(call, caller_symbol_id=f"{file_path}::__module__")
+            call = self._typed_arguments(file_path, call)
 
             resolved = self._overload_sibling_call(call) or self._resolve_one(file_path, call)
             if resolved:
@@ -921,13 +1176,63 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """
         rep = self._overload_rep.get(resolved.callee_id)
         if rep is None:
-            return resolved
-        target = self._overload_target(rep, call.argument_count)
+            return self._inherited_overload(resolved, call)
+        target = self._overload_target(rep, call.argument_count, call.argument_types)
         if target == resolved.caller_id:
             return None
         return resolved if target == resolved.callee_id else replace(resolved, callee_id=target)
 
-    def _pick_overload(self, rep: str, argument_count: int | None) -> str | None:
+    def _inherited_overload(self, resolved: ResolvedCall, call: CallSite) -> ResolvedCall | None:
+        """A Java callee that cannot take the call's arguments yields to an inherited overload.
+
+        ``getField(i)`` in a class that overrides only ``getField(int, Chronology)``
+        calls the one-parameter ``getField`` a superclass declares. With no
+        ancestor overload that takes the count, the edge goes: its callee
+        cannot be what the call means, and a constructor inherits none. Java
+        only, where arity is binding.
+        """
+        callee = self._symbols_by_id.get(resolved.callee_id)
+        if not _java_method_refusing(callee, call.argument_count):
+            return resolved
+        assert callee is not None
+        target = None if callee.name == callee.parent_name else self._inherited_taker(resolved, call)
+        return None if target in (None, resolved.caller_id) else replace(resolved, callee_id=target)
+
+    def _inherited_taker(self, resolved: ResolvedCall, call: CallSite) -> str | None:
+        """The ancestor overload of the callee's name that takes *call*, or None.
+
+        Java looks the name up through the whole hierarchy, so a nearer
+        declaration that cannot take the count does not hide a farther one
+        that can. The superclass chain answers nearest first; past it, one
+        other ancestor (an interface default) must be the only taker.
+        """
+        class_id = self._caller_class_id(resolved.callee_id)
+        name = self._symbols_by_id[resolved.callee_id].name
+        chain = tuple(self._superclass_chain(class_id))
+        for ancestor in chain:
+            target = self._taker_in(ancestor, name, call)
+            if target is not None:
+                return target
+        takers = {
+            self._taker_in(ancestor, name, call)
+            for ancestor in self._ancestors_of(class_id)
+            if ancestor not in chain
+        } - {None}
+        return takers.pop() if len(takers) == 1 else None
+
+    def _taker_in(self, type_id: str, name: str, call: CallSite) -> str | None:
+        """The member of *type_id*'s own *name* overloads that takes *call*, or None."""
+        declared = self._declares(type_id, name)
+        if declared is None or self._symbols_by_id[declared].kind != "method":
+            return None
+        count = call.argument_count or 0
+        rep = self._overload_rep.get(declared)
+        target = declared if rep is None else self._overload_target(rep, count, call.argument_types)
+        return target if _takes(self._symbols_by_id[target], count) else None
+
+    def _pick_overload(
+        self, rep: str, argument_count: int | None, argument_types: _ArgumentTypes = None
+    ) -> str | None:
         """The one member of *rep*'s set a call with *argument_count* arguments means.
 
         Asked in the order the languages apply: a member of exactly that arity,
@@ -935,10 +1240,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         form), then one whose varargs or ``params`` expand to it. The first
         phase with any candidate decides, and two candidates there are a tie.
         """
-        found = self._deciding_overloads(rep, argument_count)
+        found = self._deciding_overloads(rep, argument_count, argument_types)
         return found[0] if len(found) == 1 else None
 
-    def _overload_target(self, rep: str, argument_count: int | None) -> str:
+    def _overload_target(
+        self, rep: str, argument_count: int | None, argument_types: _ArgumentTypes = None
+    ) -> str:
         """The member of *rep*'s set a call lands on.
 
         The member ``_pick_overload`` names, else the representative when the
@@ -952,7 +1259,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         code judges as one unit and a constructor set needs for any inbound
         edge at all.
         """
-        found = self._deciding_overloads(rep, argument_count)
+        found = self._deciding_overloads(rep, argument_count, argument_types)
         if len(found) == 1:
             return found[0]
         tied = self._tied_without_representative(rep, found)
@@ -964,8 +1271,14 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return found
         return []
 
-    def _deciding_overloads(self, rep: str, argument_count: int | None) -> list[str]:
-        """The members of the first phase with any candidate for *argument_count*."""
+    def _deciding_overloads(
+        self, rep: str, argument_count: int | None, argument_types: _ArgumentTypes = None
+    ) -> list[str]:
+        """The members of the first phase with any candidate for *argument_count*.
+
+        A tie there is broken by *argument_types* when the typed arguments
+        fit exactly one member's parameters (``value(true)`` over ``value(String)``).
+        """
         if argument_count is None or rep in self._unranged_overload_sets:
             return []
         phases: dict[int, list[str]] = defaultdict(list)
@@ -973,7 +1286,58 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             phase = _overload_phase(admitted, argument_count)
             if phase is not None:
                 phases[phase].append(member)
-        return phases[min(phases)] if phases else []
+        phase = min(phases, default=None)
+        found = phases[phase] if phases else []
+        return self._typed_tie_break(found, argument_types, expanded=phase == 2)
+
+    def _typed_tie_break(
+        self, found: list[str], argument_types: _ArgumentTypes, *, expanded: bool
+    ) -> list[str]:
+        """*found* narrowed to the one member its typed arguments fit closest, if one does."""
+        if len(found) < 2 or not argument_types:
+            return found
+        typed = [(m, erased_parameter_types(self._symbols_by_id[m])) for m in found]
+        closest = _closest_fit(typed, argument_types, expanded)
+        return found if closest is None else [closest]
+
+    def _typed_arguments(self, file_path: str, call: CallSite) -> CallSite:
+        """*call* with each named argument's declared type beside its literals' types.
+
+        So ``f(start, n)`` is judged as ``f(1L, 2)`` is. Asked only of a call
+        to a name an overload set carries.
+        """
+        names = call.argument_names
+        if not names or call.target_name not in self._overloaded_names:
+            return call
+        caller_id = call.caller_symbol_id or ""
+        literals = call.argument_types or (None,) * len(names)
+        types = tuple(
+            literal or (self._argument_type(file_path, caller_id, name) if name else None)
+            for literal, name in zip(literals, names, strict=True)
+        )
+        return replace(call, argument_types=types if any(types) else None)
+
+    def _argument_type(self, file_path: str, caller_id: str, name: str) -> str | None:
+        """Argument *name*'s declared type, spelled as an overload id spells a parameter.
+
+        Read as a receiver's is, except that a local of a builtin type stands
+        (a receiver yields it to a field) and a field stands only where the
+        body declares *name* with no type the scan reads: a wrong type here
+        picks a wrong member, and nothing later checks it.
+        """
+        language = self._language_of(file_path) or ""
+        _, body_types = self._typing_scope(file_path, caller_id, language, name)
+        if name in body_types:
+            type_name = body_types[name]
+        else:
+            type_name, scope, _ = self._receiver_type_and_scope(
+                file_path, caller_id, language, name
+            )
+            if scope == "field" and self._declares_name(file_path, caller_id, name):
+                return None
+        if type_name is None or "::" in type_name:
+            return None
+        return erased_type(external_type_name(type_name) or type_name)
 
     def _overload_sibling_call(self, call: CallSite) -> ResolvedCall | None:
         """An overload calling another member of its own set, ``f(a)`` inside ``f(a, b)``.
@@ -987,7 +1351,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         if self._symbols_by_id[caller_id].name != call.target_name:
             return None
-        target = self._pick_overload(rep, call.argument_count)
+        target = self._pick_overload(rep, call.argument_count, call.argument_types)
         if target is None or target == caller_id:
             return None
         return ResolvedCall(caller_id, target, 0.95, call.line, "same_file")
@@ -1024,7 +1388,120 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
 
         # --- Free function call: function() ---
-        return self._with_props(self._resolve_free_call(file_path, call, caller_id), call)
+        return self._with_props(self._resolve_bare_call(file_path, call, caller_id), call)
+
+    def _resolve_bare_call(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+    ) -> ResolvedCall | None:
+        """A receiver-less call, refused where it lands on an extension it has no receiver for.
+
+        Also refused on a Kotlin ``typealias``: ``IOException(..)`` through
+        ``actual typealias IOException = java.io.IOException`` constructs the
+        aliased type, which the alias is not. Ceiling: an alias of a repo class
+        draws no edge to that class.
+        """
+        invoked = self._operator_invoke_call(file_path, call, caller_id)
+        if invoked is not None:
+            return invoked
+        hit = self._resolve_free_call(file_path, call, caller_id)
+        if hit is not None and _is_kotlin_alias(self._symbols_by_id.get(hit.callee_id)):
+            return None
+        if hit is None or call.receiver_call is not None:
+            return hit
+        return None if self._lacks_extension_receiver(file_path, call, hit.callee_id) else hit
+
+    def _operator_invoke_call(
+        self,
+        file_path: str,
+        call: CallSite,
+        caller_id: str,
+    ) -> ResolvedCall | None:
+        """``useCase(args)`` on a Kotlin value whose type declares ``operator fun invoke``.
+
+        The name is typed as the receiver of ``useCase.invoke(args)``: a local,
+        a parameter, a property of the caller's class or of its file. A local or
+        parameter outranks every function of the name. A property does not
+        outrank a function its own scope declares (Kotlin prefers the function
+        at one level), so a member or top-level ``fun`` of the name leaves the
+        call to the function tiers. The operator may be inherited. A name no
+        declaration types, or a type with no such operator, falls through to
+        the function tiers too.
+        """
+        if not self._may_invoke(file_path, call):
+            return None
+        typed = self._invoked_value_type(file_path, call, caller_id)
+        if typed is None:
+            return None
+        type_name, scope, typing_file = typed
+        as_member = replace(call, receiver_name=call.target_name, target_name=_INVOKE_OPERATOR)
+        if "::" in type_name:
+            hit = self._call_typed_receiver(file_path, as_member, caller_id, type_name)
+            return hit if hit is not None and self._is_operator_invoke(hit.callee_id) else None
+        found = self._invoke_target(typing_file, as_member, caller_id, type_name)
+        if found is None:
+            return None
+        typed_call = self._field_typed_call if scope == "field" else self._body_typed_call
+        return typed_call(caller_id, found[0], found[1], call.line)
+
+    def _may_invoke(self, file_path: str, call: CallSite) -> bool:
+        """Is *call* a bare Kotlin call in a repo that declares some ``invoke`` method?"""
+        return (
+            call.receiver_call is None
+            and self._language_of(file_path) == "kotlin"
+            and _INVOKE_OPERATOR in self._method_names()
+        )
+
+    def _invoke_target(
+        self, typing_file: str, as_member: CallSite, caller_id: str, type_name: str
+    ) -> tuple[str, str] | None:
+        """``(operator invoke id, tier)`` *type_name* declares or inherits, if any."""
+        found = self._typed_receiver_target(
+            typing_file, as_member, caller_id, type_name
+        ) or self._inherited_typed_target(
+            typing_file, as_member, caller_id, id_segment_name(type_name)
+        )
+        return found if found is not None and self._is_operator_invoke(found[0]) else None
+
+    def _invoked_value_type(
+        self, file_path: str, call: CallSite, caller_id: str
+    ) -> tuple[str, str, str] | None:
+        """``(type, scope, typing file)`` of the value a bare Kotlin call names, if it may invoke.
+
+        None for an untyped or builtin-typed name, and for a property (not a
+        local or parameter) whose scope also declares a function of the name.
+        """
+        name = call.target_name
+        type_name, scope, typing_file = self._receiver_type_and_scope(
+            file_path, caller_id, "kotlin", name
+        )
+        if type_name is None:
+            type_name, scope = self._module_types_in(file_path, "kotlin").get(name), "module"
+        if type_name is None or external_type_name(type_name) is not None:
+            return None
+        if scope != "body" and self._function_in_scope(file_path, call, caller_id):
+            return None
+        return type_name, scope, typing_file
+
+    def _is_operator_invoke(self, sym_id: str) -> bool:
+        symbol = self._symbols_by_id.get(sym_id)
+        return (
+            symbol is not None
+            and symbol.name == _INVOKE_OPERATOR
+            and _OPERATOR_MODIFIER in symbol.modifiers
+        )
+
+    def _function_in_scope(self, file_path: str, call: CallSite, caller_id: str) -> bool:
+        """Does the caller's class, or its file at top level, declare a function *call* names?
+
+        A Kotlin ``val`` and ``fun`` of one name share an id; the id is callable
+        when the function is there.
+        """
+        own = self._enclosing_class_method(file_path, call, caller_id)
+        top = self._file_top_level.get(file_path, {}).get(call.target_name)
+        return any(sym_id in self._callable_ids for sym_id in (own, top) if sym_id is not None)
 
     def _with_props(self, res: ResolvedCall | None, call: CallSite) -> ResolvedCall | None:
         if res is not None and call.supplied_props is not None:
@@ -1055,9 +1532,10 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             if tabled is not None
             else self._chain_inner_callee(file_path, call, inner, caller_id, language)
         )
-        if language == "go" and inner_callee is not None:
+        if language in _RETURNED_TYPE_ID_LANGUAGES and inner_callee is not None:
             # A go method may sit in any file of its type's package, so the
             # type is read by identity and the method asked for across it.
+            # Python and Dart read the return type in the callee's file the same way.
             type_id = self._returned_type_id(inner_callee)
             hit = (
                 None
@@ -1067,6 +1545,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             if hit is not None:
                 tier = hit.origin.removeprefix("receiver_typed_")
                 return True, self._return_typed_call(caller_id, hit.callee_id, tier, call.line)
+        if language in ("python", "dart"):
+            # A type name read in the caller's file is not evidence, and an
+            # inherited method is not a refusal: the bare name keeps the site
+            # where the language allows one.
+            return False, None
         type_name = (
             tabled
             if tabled is not None
@@ -1121,7 +1604,7 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         unless an extension the index leaves out carries the name: one on a
         type parameter (``this TBuilder b``) or an external type may be it.
         """
-        type_id = self._csharp_type_id(type_name)
+        type_id = self._unique_type_id(type_name, "csharp")
         if type_id is not None:
             inherited = self._ancestor_method(type_id, call.target_name, caller_id)
             if inherited is not None:
@@ -1129,21 +1612,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 tier = "same_file" if same_file else "import"
                 return True, self._return_typed_call(caller_id, inherited, tier, call.line)
 
-        own = self._typed_extension_call(file_path, call, caller_id, type_name, "csharp")
-        if own is not None:
-            return True, own
-        ancestor_names = [
-            symbol.name
-            for ancestor in (self._ancestors_of(type_id) if type_id is not None else ())
-            if (symbol := self._symbols_by_id.get(ancestor)) is not None
-        ]
-        hits = {}
-        for name in ancestor_names:
-            hit = self._typed_extension_call(file_path, call, caller_id, name, "csharp")
-            if hit is not None:
-                hits[hit.callee_id] = hit
-        if hits:
-            return True, next(iter(hits.values())) if len(hits) == 1 else None
+        answered, hit = self._extension_call(file_path, call, caller_id, type_name)
+        if answered:
+            return True, hit
         # Proven only for a type whose members were all asked: one whose every
         # base is a repository type, or a builtin. A name the repository does
         # not declare may be a type parameter (``TBuilder``), whose members are
@@ -1163,15 +1634,15 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
                 return False
         return True
 
-    def _csharp_type_id(self, type_name: str) -> str | None:
-        """The one C# type *type_name* (``IFoo`1`` or ``IFoo``) names repo-wide, or None."""
+    def _unique_type_id(self, type_name: str, language: str) -> str | None:
+        """The one *language* type *type_name* (``IFoo`1`` or ``IFoo``) names repo-wide, or None."""
         bare, _, arity = type_name.partition("`")
+        shape = (language, int(arity or 0))
         candidates = [
             symbol
             for sym_id in self._global_symbols.get(bare, ())
             if (symbol := self._symbols_by_id[sym_id]).kind in _TYPE_KINDS
-            and symbol.language == "csharp"
-            and (symbol.type_parameter_count or 0) == int(arity or 0)
+            and (symbol.language, symbol.type_parameter_count or 0) == shape
         ]
         return candidates[0].id if len(candidates) == 1 else None
 
@@ -1315,12 +1786,11 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         symbol_path = self._symbol_paths_by_id.get(callee_id)
         if symbol_path is None:
             return None
-        # Overloads the arguments may mean, and declarations sharing this id
-        # (an extension is called one argument short of its parameters).
-        for count in {argument_count, signature_parameter_count(symbol.signature or "")}:
-            key = (symbol_path, symbol.parent_name, symbol.name, count)
-            if len(self._overload_return_types.get(key, ())) > 1:
-                return None
+        if self._overloads_disagree(symbol, symbol_path, argument_count):
+            return None
+        if type_name is not None and language == "java":
+            # Read where the method declares it, with its member types in scope.
+            return self._read_java_type(symbol_path, callee_id, type_name)
         return type_name
 
     def _return_typed_call(self, caller_id: str, sym_id: str, tier: str, line: int) -> ResolvedCall:
@@ -1448,7 +1918,9 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             and self._language_of(file_path) == "python"
         ):
             return None
-        if not declared:
+        # A Kotlin import from a library namespace the repo does not hold
+        # (``import java.io.IOException``) binds the name just as surely.
+        if not declared or target_name in self._library_imported_names(file_path):
             return None
         return (
             self._named_import_call(file_path, call, caller_id, binding)
@@ -1555,6 +2027,28 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
             return None
         return ResolvedCall(caller_id, sym_id, 0.85, call.line, "import_merged")
 
+    def _library_imported_names(self, file_path: str) -> frozenset[str]:
+        """The names a Kotlin file binds by importing a JVM library namespace.
+
+        A namespace ``classify_jvm_import`` knows (the JDK, the Kotlin stdlib,
+        ``kotlinx``, ``androidx``) counts unless the import resolved into the
+        repo, which may be that library. An aliased import binds the alias only.
+        """
+        names = self._library_names.get(file_path)
+        if names is not None:
+            return names
+        parsed = self._parsed_files.get(file_path)
+        kotlin = parsed is not None and parsed.file_info.language == "kotlin"
+        imports = parsed.imports if kotlin else ()
+        names = frozenset(
+            name
+            for imp in imports
+            if _imports_a_library(imp)
+            for name in imp.local_names or [bare_type_name(imp.module_path)]
+        ) - {"*"}
+        self._library_names[file_path] = names
+        return names
+
     def _repo_wide_free_call(
         self,
         file_path: str,
@@ -1597,9 +2091,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         Not when *sym_id* has internal linkage in another translation unit: a
         ``static`` function in one .c file cannot be linked from any other. The
         include-grounded tiers need no check, since an included file is part of
-        the includer's translation unit.
+        the includer's translation unit. Nor across independent builds
+        (``_in_reach_of_build``).
         """
-        return sym_id not in self._tu_local_ids or self._symbol_paths_by_id.get(sym_id) == file_path
+        path = self._symbol_paths_by_id.get(sym_id, "")
+        if sym_id in self._tu_local_ids and path != file_path:
+            return False
+        return self._in_reach_of_build(file_path, path)
 
     def _implicit_inherited_call(
         self,
@@ -1661,6 +2159,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         receiver_name = call.receiver_name
         method_name = call.target_name
         assert receiver_name is not None
+
+        hit = self._first_strategy_hit(
+            self._strategies_for(file_path).constructor, file_path, call, caller_id
+        )
+        if hit is not None:
+            return True, hit
 
         # Every strategy below ends in a lookup keyed on the method name, so a
         # name the repo declares nowhere cannot resolve.
@@ -1880,14 +2384,35 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         close it.
         """
         class_id = _extract_class_id(caller_id)
+        skip = 1
+        if call.scope_name:
+            class_id, skip = self._qualified_super(caller_id, call.scope_name)
         mro = self._mro(class_id) if class_id is not None else None
-        for ancestor in (mro or ())[1:]:
+        for ancestor in (mro or ())[skip:]:
             if ancestor.startswith(_EXTERNAL_PREFIX):
                 return None
             sym_id = self._declares(ancestor, call.target_name)
             if sym_id is not None:
                 return ResolvedCall(caller_id, sym_id, 0.90, call.line, "self_inherited")
         return None
+
+    def _qualified_super(self, caller_id: str, qualifier: str) -> tuple[str | None, int]:
+        """Where Java's ``S.super.m()`` starts its walk, and how many classes it skips.
+
+        ``S`` names an enclosing class, whose superclass is meant, or a direct
+        superinterface of the caller's class, whose own ``m`` is.
+        """
+        def named(type_id: str) -> bool:
+            return getattr(self._symbols_by_id.get(type_id), "name", None) == qualifier
+
+        class_id = self._caller_class_id(caller_id)
+        node = class_id
+        while "::" in node:
+            if named(node):
+                return node, 1
+            node = outer_scope(node)
+        interfaces = [p for p in self._heritage_parents.get(class_id, ()) if named(p)]
+        return (interfaces[0], 0) if len(interfaces) == 1 else (None, 0)
 
     def _mro(self, class_id: str, visiting: frozenset[str] = frozenset()) -> tuple[str, ...] | None:
         """Python's C3 linearization of *class_id*, or None when it cannot be built.

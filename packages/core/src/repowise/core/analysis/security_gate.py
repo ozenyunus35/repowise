@@ -15,12 +15,14 @@ Only the masked snippet (:func:`~.security_scan._snippet`) leaves this module,
 and the fingerprint is taken over it too, so neither a CI log nor the committed
 baseline holds a raw value.
 
-Two repository-owned inputs shape a scan. ``security.patterns`` in
+Three repository-owned inputs shape a scan. ``security.patterns`` in
 ``.repowise/config.yaml`` adds secret kinds (``custom:<name>``, see
 :func:`custom_patterns`), treated like the built-in ones. A
 ``repowise-security-ignore`` marker on a finding's own line silences it (all
 kinds, or only the ``: kind, kind`` it lists); a silenced finding never fails
 the gate or enters a baseline, but every output still counts and lists it.
+A path the repo's ``.gitleaks.toml`` allowlists has no secret findings at all
+(:mod:`~.secret_allowlist`).
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import hashlib
 import re
 import string
 import subprocess
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -41,10 +43,10 @@ from repowise.core.support_paths import DOC_EXTENSIONS
 
 from .change_risk.features import GIT_TIMEOUT_SECONDS, _git, revspec_head, split_revspec
 from .changed_lines import DIFF_ARGS, parse_unified_diff
+from .secret_allowlist import secret_path_allowlist
 from .security_scan import (
     SECRET_KINDS,
-    _detect_secrets_allowlisted,
-    _mask_comments_and_strings,
+    _allowlisted_lines,
     marker_silences,
     masked_snippet,
     scan_source,
@@ -414,6 +416,7 @@ def _scoped(
     *,
     secrets_only: bool,
     patterns: Sequence[CustomPattern] = (),
+    path_allowlisted: bool = False,
 ) -> tuple[list[dict], set[tuple[str, str]]]:
     """Findings in *source* that span a line in *lines*, as gate rows, and the long lines skipped.
 
@@ -421,7 +424,8 @@ def _scoped(
     call, but a key pasted into a README is still a leak. Custom patterns are
     secret kinds, matched on the lines in *lines* only; a custom match is also
     masked in a built-in finding's snippet on its line, while that finding keeps
-    the fingerprint it has without patterns.
+    the fingerprint it has without patterns. *path_allowlisted* drops every
+    secret kind, as an allow marker on each line would.
     """
     secrets_only = secrets_only or PurePosixPath(path).suffix.lower() in DOC_EXTENSIONS
     text = _Text(path, source_lines(source), patterns)
@@ -431,16 +435,12 @@ def _scoped(
         if (entry := _builtin_entry(text, f, lines, secrets_only)) is not None
     ]
     custom, long_lines = _custom_entries(text, lines)
-    uncommented = (
-        source_lines(_mask_comments_and_strings(source, strings=False))
-        if "pragma: allowlist" in source
-        else text.lines
-    )
+    allowed = _allowlisted_lines(path, source)
     return [
         _row(text, entry)
         for entry in [*found, *custom]
         if (entry[1] not in SECRET_KINDS and not entry[1].startswith("custom:"))
-        or not _detect_secrets_allowlisted(text.lines, uncommented, entry[0])
+        or not (path_allowlisted or entry[0] in allowed)
     ], long_lines
 
 
@@ -556,7 +556,10 @@ def _log_range(root: str, revspec: str) -> list[str]:
 
 
 def _history_secrets(
-    root: str, revspec: str, patterns: Sequence[CustomPattern]
+    root: str,
+    revspec: str,
+    patterns: Sequence[CustomPattern],
+    allowlisted: Callable[[str], bool],
 ) -> tuple[list[dict], int, set[tuple[str, str]]]:
     """Secret rows on the lines each commit in the change added, oldest first.
 
@@ -583,7 +586,11 @@ def _history_secrets(
                 "clone, so every line it holds would read as added. Fetch the full "
                 "history (fetch-depth: 0)."
             )
-        added = {p: d.new_lines for p, d in parse_unified_diff(diff).items() if d.new_lines}
+        added = {
+            p: d.new_lines
+            for p, d in parse_unified_diff(diff).items()
+            if d.new_lines and not allowlisted(p)
+        }
         # One read per commit bounds memory to the files a single commit touched.
         paths = sorted(added)
         texts = _read_blobs(root, [f"{sha}:{p}" for p in paths])
@@ -645,20 +652,26 @@ def scan_change(
     rows: list[dict] = []
     scanned = 0
     skipped: set[tuple[str, str]] = set()
+    allowlisted = secret_path_allowlist(root)
     texts = _read_blobs(root, [f"{rev}:{p}" for p in paths])
     for path, text in zip(paths, texts, strict=True):
         if text is None:
             continue
         scanned += 1
         scoped, long_lines = _scoped(
-            path, text, changed[path], secrets_only=False, patterns=patterns
+            path,
+            text,
+            changed[path],
+            secrets_only=False,
+            patterns=patterns,
+            path_allowlisted=allowlisted(path),
         )
         rows += scoped
         skipped |= long_lines
     history: list[dict] = []
     commits = 0
     if not staged:
-        history, commits, long_lines = _history_secrets(root, revspec, patterns)
+        history, commits, long_lines = _history_secrets(root, revspec, patterns, allowlisted)
         skipped |= long_lines
     findings, suppressed = _merge(rows, history)
     return ChangeScan(

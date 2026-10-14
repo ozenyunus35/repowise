@@ -336,6 +336,77 @@ def _count_arguments(arg_node: Node) -> int:
     )
 
 
+# Java literal nodes and the type each one has, for the overload tie-break.
+_JAVA_LITERAL_TYPES = {
+    "true": "boolean",
+    "false": "boolean",
+    "character_literal": "char",
+    "string_literal": "String",
+    "null_literal": "null",
+}
+_JAVA_INTEGER_LITERALS = frozenset(
+    {"decimal_integer_literal", "hex_integer_literal", "octal_integer_literal", "binary_integer_literal"}
+)
+_JAVA_FLOATING_LITERALS = frozenset({"decimal_floating_point_literal", "hex_floating_point_literal"})
+
+
+def _overload_arguments(language: str, arg_nodes: list[Node]) -> list[Node]:
+    """A call's argument expressions, for a language whose overloads read them (Java).
+
+    Read from the argument list already in hand, the way ``_count_arguments``
+    counts it.
+    """
+    if language != "java" or not arg_nodes:
+        return []
+    skip_types = frozenset({"(", ")", ","})
+    return [
+        c for c in arg_nodes[0].children if c.type not in skip_types and "comment" not in c.type
+    ]
+
+
+def _argument_literal_types(arguments: list[Node], src: str) -> tuple[str | None, ...] | None:
+    """The type of each literal argument, None where an argument is no literal.
+
+    None overall when no argument is a literal.
+    """
+    types = tuple(_java_literal_type(argument, src) for argument in arguments)
+    return types if any(types) else None
+
+
+def _argument_names(arguments: list[Node], src: str) -> tuple[str | None, ...] | None:
+    """Each argument that is a bare name (a local, parameter or field), else None.
+
+    None overall when no argument is one. The resolver reads their declared types.
+    """
+    names = tuple(node_text(a, src) if a.type == "identifier" else None for a in arguments)
+    return names if any(names) else None
+
+
+# A unary operator on a literal, by operand type: ``-'a'`` promotes to int.
+_JAVA_SIGN_TYPES = {"char": "int", "int": "int", "long": "long", "float": "float", "double": "double"}
+_JAVA_UNARY_TYPES: dict[str, dict[str, str]] = {
+    "-": _JAVA_SIGN_TYPES,
+    "+": _JAVA_SIGN_TYPES,
+    "~": {"char": "int", "int": "int", "long": "long"},
+    "!": {"boolean": "boolean"},
+}
+
+
+def _java_literal_type(node: Node, src: str) -> str | None:
+    if node.type == "unary_expression":
+        operator = node.child_by_field_name("operator")
+        operand = node.child_by_field_name("operand")
+        if operator is None or operand is None:
+            return None
+        literal = _java_literal_type(operand, src)
+        return _JAVA_UNARY_TYPES.get(node_text(operator, src), {}).get(literal or "")
+    if node.type in _JAVA_INTEGER_LITERALS:
+        return "long" if node_text(node, src).endswith(("l", "L")) else "int"
+    if node.type in _JAVA_FLOATING_LITERALS:
+        return "float" if node_text(node, src).endswith(("f", "F")) else "double"
+    return _JAVA_LITERAL_TYPES.get(node.type)
+
+
 def _find_enclosing_symbol(
     line: int,
     symbol_ranges: list[tuple[int, int, str]],

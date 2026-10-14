@@ -22,6 +22,17 @@ Performance risk is one of the three signals in [Code Health](CODE_HEALTH.md).
 That is 21 performance detectors plus `sql_cartesian_join`. They move only the
 performance signal, never the defect score.
 
+A loop that appends to one string several times is one `string_concat_in_loop`
+finding that lists every append line. TypeScript and JavaScript never get this
+finding, because JavaScript engines make repeated `+=` linear.
+
+A TypeScript or JavaScript `includes` check against a short `const` table of
+literals that the file never changes is not flagged, because a table of fixed
+size costs the same at any scale.
+
+An awaited call on a line that an ESLint `no-await-in-loop` suppression covers is
+not reported at all: the comment states that the sequential await is intended.
+
 The loop and the I/O call do not have to be in the same function. Repowise
 follows the resolved call graph up to three hops and attaches the
 caller-to-sink path. Per-function linters cannot see that case.
@@ -29,6 +40,11 @@ An I/O call is recognised by the library its receiver was imported from. In
 TypeScript and JavaScript only the module name counts, so a local variable named
 like a package (`ws`) or a module path that contains a library name
 (`plugin-sdk/provider-http`) is not read as that library.
+In Java, any call on a Spring Data repository or a MyBatis mapper inside a `for`
+loop counts as a database call, whatever the method is named. The receiver's
+declared type decides: an interface that extends a Spring Data repository, carries
+`@Mapper`, or sits in a `@MapperScan` package. JPA lazy associations read in a loop
+are not reported yet.
 
 Performance analysis covers Python, TypeScript/JavaScript (including Vue and
 Svelte scripts), Java, Go, C# (including Razor), Rust, Kotlin, Scala, Ruby, C++,

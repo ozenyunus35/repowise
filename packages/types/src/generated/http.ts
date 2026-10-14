@@ -105,21 +105,36 @@ export interface AgentPromptResponse {
   text: string;
 }
 
-/** One month of agent-vs-human commit volume. */
+/** One month of commits by attribution label. */
 export interface AgentTrendBucket {
+  total_commits?: number;
+  agent_commits?: number;
+  human_attested_commits?: number;
+  unknown_commits?: number;
+  coverage_pct?: number | null;
+  agent_pct_of_covered?: number | null;
+  suppressed_reason?: string | null;
   month: string;
-  total_commits: number;
-  agent_commits: number;
-  agent_pct: number;
   tier_counts?: Record<string, unknown>;
 }
 
-/** Monthly agent-share trend across the indexed commit window. */
+/**
+ * Monthly attribution trend across the indexed commit window.
+ *
+ * ``enabled`` is false, with every figure empty, when AI attribution is off
+ * for the repository.
+ */
 export interface AgentTrendResponse {
-  buckets: AgentTrendBucket[];
-  total_commits: number;
-  agent_commits: number;
-  agent_pct: number;
+  total_commits?: number;
+  agent_commits?: number;
+  human_attested_commits?: number;
+  unknown_commits?: number;
+  coverage_pct?: number | null;
+  agent_pct_of_covered?: number | null;
+  suppressed_reason?: string | null;
+  enabled?: boolean;
+  coverage_floor_pct: number;
+  buckets?: AgentTrendBucket[];
   agent_names?: Record<string, unknown>[];
 }
 
@@ -519,6 +534,7 @@ export interface CommitDetailResponse {
   agent_name?: string | null;
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
+  attribution?: string | null;
   drivers?: RiskDriverResponse[];
   agent_channel?: string | null;
   files?: CommitFileResponse[];
@@ -629,6 +645,7 @@ export interface CommitResponse {
   agent_name?: string | null;
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
+  attribution?: string | null;
 }
 
 /**
@@ -643,7 +660,9 @@ export interface CommitStatsResponse {
   total_commits: number;
   high_priority_count: number;
   fix_commit_count: number;
-  agent_commit_count: number;
+  agent_commit_count?: number | null;
+  agent_pct_of_covered?: number | null;
+  attribution_coverage_pct?: number | null;
   avg_entropy: number;
   risk_histogram?: RiskHistogramBucket[];
   moderate_cut?: number | null;
@@ -1780,9 +1799,11 @@ export interface GitMetadataResponse {
   commit_count_capped?: boolean;
   original_path?: string | null;
   test_gap?: boolean | null;
-  agent_commit_count?: number;
+  agent_commit_count?: number | null;
   agent_authored_pct?: number | null;
-  agent_tier_counts?: Record<string, unknown>;
+  agent_tier_counts?: Record<string, unknown> | null;
+  attribution_coverage?: number | null;
+  agent_share_suppressed?: string | null;
 }
 
 export interface GitSummaryResponse {
@@ -2301,20 +2322,6 @@ export interface OkResponse {
   ok?: boolean;
 }
 
-/**
- * How much coding-agent activity lands on the files this person owns.
- *
- * Aggregated from the per-file agent-provenance rollup (GitMetadata) over
- * the owner's primary-owned files — agent identity per commit lives on the
- * commits surface, the per-file rollup only carries counts and tiers.
- */
-export interface OwnerAgentCollab {
-  files_with_agent_commits: number;
-  agent_commit_count: number;
-  agent_share_pct: number | null;
-  tier_counts?: Record<string, unknown>;
-}
-
 export interface OwnerCoAuthor {
   name: string;
   email: string | null;
@@ -2375,7 +2382,6 @@ export interface OwnerProfileResponse {
   co_authors: OwnerCoAuthor[];
   co_authors_total?: number;
   commit_categories: Record<string, unknown>;
-  agent_collab?: OwnerAgentCollab | null;
 }
 
 export interface OwnershipEntry {
@@ -2493,7 +2499,7 @@ export interface PatchCoverageBranches {
 
 export interface PatchCoverageFile {
   file_path: string;
-  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes";
+  status: "measured" | "not_in_report" | "no_line_data" | "no_coverable_changes" | "stale_file";
   changed_line_count: number;
   coverable_line_count: number;
   covered_line_count: number;
@@ -2511,6 +2517,7 @@ export interface PatchCoverageFileCounts {
   not_in_report: number;
   no_line_data: number;
   no_coverable_changes: number;
+  stale_file: number;
   out_of_scope: number;
 }
 
@@ -2727,6 +2734,7 @@ export interface QueueCounts {
   due?: number;
   shown?: number;
   excluded?: Record<string, number>;
+  gated?: number;
 }
 
 /** What the ``fix_first`` scope leaves out of a page's filtered set. */

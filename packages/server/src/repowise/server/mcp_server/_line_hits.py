@@ -47,6 +47,7 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
     read_repo_file_text,
 )
+from repowise.server.mcp_server._meta import served_root
 from repowise.server.mcp_server._query_shape import (
     _canonical_symbol_query,
     _identifier_candidates,
@@ -237,6 +238,14 @@ def _scan_listed(root: Path, needle: str, word: bool) -> tuple[list[dict[str, An
     return rows, reasons + scan_reasons
 
 
+def production_lines(root: Path, token: str) -> list[dict[str, Any]]:
+    """The word-bounded lines holding *token* in production files, from the
+    same scan a literal search runs. For get_answer, which reads live lines
+    the wiki never rendered (function bodies, string literals)."""
+    rows, _reasons = _scan_listed(root, token, True)
+    return [r for r in rows if _scan_rank(r["path"]) == 0]
+
+
 def scan_literal(
     root: Path, files: list[str], needle: str, word: bool
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -405,7 +414,7 @@ async def _attach(
     spec = _get_exclude_spec(ctx.path)
     async with get_session(ctx.session_factory) as session:
         repository = await _get_repo(session)
-        root = Path(repository.local_path or ctx.path)
+        root = Path(served_root(repository, ctx.path))
         nodes = []
         if candidates:
             found = await _exact_symbols(session, repository.id, query, candidates)
@@ -460,6 +469,28 @@ async def _attach(
     response["complete"] = not reasons
     if reasons:
         response["reasons"] = reasons
+    if response["lines"]:
+        _reconcile_symbol_miss(response, literal_scan=not sets)
+
+
+def _reconcile_symbol_miss(response: dict, *, literal_scan: bool) -> None:
+    """Keep the symbol stage's miss advice from contradicting the lines found.
+
+    ``grep_hint`` and the no-exact-symbol ``note`` were written before any
+    line was read, and tell the reader to recheck spelling or grep. With
+    lines in hand both are wrong; ``exact_match: false`` still says no symbol
+    has the name, so the note stays only to label fuzzy results.
+    """
+    response.pop("grep_hint", None)
+    if not literal_scan or response.get("exact_match") is not False:
+        return
+    if response.get("results"):
+        response["note"] = (
+            "No indexed symbol has this exact name: the results are other "
+            "symbols, and `lines` are where the text occurs."
+        )
+    else:
+        response.pop("note", None)
 
 
 def _lines_after_budget(result: dict[str, Any]) -> None:

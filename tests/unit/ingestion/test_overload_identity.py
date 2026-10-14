@@ -30,8 +30,8 @@ from repowise.core.ingestion.models import FileInfo, ParsedFile
 from repowise.core.ingestion.parser import ASTParser
 from repowise.core.ingestion.return_types import signature_parameter_range
 from repowise.core.ingestion.symbol_identity import (
-    _erased_parameter_type,
     base_symbol_id,
+    erased_type,
     id_segment_name,
     overload_sets,
     split_symbol_id,
@@ -256,7 +256,7 @@ class TestJavaOverloads:
     def test_an_erased_parameter_type_never_holds_a_name_separator(
         self, parameter: str, erased: str
     ) -> None:
-        got = _erased_parameter_type(parameter)
+        got = erased_type(parameter)
         assert got == erased
         assert not any(sep in got for sep in (".", "/", "::", "(", ")", "#"))
 
@@ -294,7 +294,7 @@ class TestJavaOverloads:
             "  public S append(String s) { return emit(s); }\n"
             "  public S append(char c) { return emit(String.valueOf(c)); }\n"
             "  S emit(String s) { return this; }\n"
-            "  void use() { append('x'); }\n"
+            "  void use(String v) { append(v); }\n"
             "}\n"
         )
         edges = _edges(tmp_path, {"S.java": ("java", text)})
@@ -302,8 +302,8 @@ class TestJavaOverloads:
         # Each overload's own call is attributed to its own node.
         assert (base + "append#1(String)", base + "emit") in edges
         assert (base + "append#1(char)", base + "emit") in edges
-        # A count cannot choose between them: the set's representative, the
-        # first declared, answers, as the shared node did before.
+        # A count cannot choose between them, nor a literal argument: the set's
+        # representative, the first declared, answers, as the shared node did before.
         assert {c for a, c in edges if a == base + "use"} == {base + "append#1(String)"}
 
     def test_a_record_keeps_its_canonical_constructor_beside_an_overload(self) -> None:
@@ -702,7 +702,8 @@ class TestNarrowingShapes:
 class TestOverloadTies:
     """A tie lands on a member that admits the call.
 
-    Call sites carry no argument types, so same-arity members tie. A tie keeps
+    Call sites carry no argument types beyond a Java literal's, so same-arity
+    members tie unless the literals fit one closest (``TestJavaLiteralArguments``). A tie keeps
     the representative, the first member declared, when it is tied; a tie
     among others takes the first tied member in declaration order. Before, a
     tie always answered with the representative, even when its own arity
@@ -767,6 +768,64 @@ class TestOverloadTies:
         edges = _edges(tmp_path, {"app/F.java": ("java", text)})
         base = "app/F.java::F::"
         assert {c for a, c in edges if a == base + "use"} == {base + "fmt#2(String,Object[])"}
+
+    @pytest.mark.parametrize(
+        ("inherited", "expected"),
+        [
+            ("  public int getField(int i) { return i; }\n", "app/Base.java::Base::getField#1"),
+            ("", None),
+        ],
+        ids=["inherited-overload", "none-admits"],
+    )
+    def test_java_a_callee_that_cannot_take_the_count_yields_to_an_inherited_overload(
+        self, tmp_path: Path, inherited: str, expected: str | None
+    ) -> None:
+        """``getField(i)`` beside an override of only ``getField(int, Chronology)``."""
+        base = (
+            "package app;\npublic abstract class Base {\n"
+            f"{inherited}  protected abstract int getField(int i, Object chrono);\n}}\n"
+        )
+        sub = (
+            "package app;\npublic class Sub extends Base {\n"
+            "  protected int getField(int i, Object chrono) { return i; }\n"
+            "  int use(int i) { return getField(i); }\n}\n"
+        )
+        files = {"app/Base.java": ("java", base), "app/Sub.java": ("java", sub)}
+        parsed = {rel: _parse(rel, lang, text, tmp_path) for rel, (lang, text) in files.items()}
+        resolver = CallResolver(
+            parsed,
+            {rel: set(parsed) - {rel} for rel in parsed},
+            repo_path=str(tmp_path),
+            heritage_parents={"app/Sub.java::Sub": {"app/Base.java::Base"}},
+        )
+        callees = {rc.callee_id for rc in resolver.resolve_file("app/Sub.java", parsed["app/Sub.java"].calls)}
+        assert callees == ({expected} if expected else set())
+
+    def test_java_a_farther_ancestor_overload_takes_what_a_nearer_one_cannot(
+        self, tmp_path: Path
+    ) -> None:
+        """``f(1)``: ``Mid`` declares only ``f(int, int)``, ``Top`` the ``f(int)`` that takes it."""
+        files = {
+            "app/Top.java": "package app;\npublic class Top {\n  public void f(int i) { }\n}\n",
+            "app/Mid.java": "package app;\npublic class Mid extends Top {\n"
+            "  public void f(int a, int b) { }\n}\n",
+            "app/Sub.java": "package app;\npublic class Sub extends Mid {\n"
+            "  public void f(int a, int b) { }\n  void use() { f(1); }\n}\n",
+        }
+        parsed = {rel: _parse(rel, "java", text, tmp_path) for rel, text in files.items()}
+        resolver = CallResolver(
+            parsed,
+            {rel: set(parsed) - {rel} for rel in parsed},
+            repo_path=str(tmp_path),
+            heritage_parents={
+                "app/Sub.java::Sub": {"app/Mid.java::Mid"},
+                "app/Mid.java::Mid": {"app/Top.java::Top"},
+            },
+        )
+        calls = parsed["app/Sub.java"].calls
+        assert {rc.callee_id for rc in resolver.resolve_file("app/Sub.java", calls)} == {
+            "app/Top.java::Top::f"
+        }
 
     def test_csharp_a_tie_among_other_members_takes_the_first_admitting_one(
         self, tmp_path: Path
@@ -855,3 +914,291 @@ class TestOverloadTies:
         # members type the chain only when they agree; the first one's type
         # alone (Tag) is not taken.
         assert (("Out.cs::Out::Use", "Cs.cs::Tag::Label") in edges) is typed
+
+
+class TestJavaLiteralArguments:
+    """Literal arguments break a same-arity tie when they fit one member closest."""
+
+    _ATTR = (
+        "package app;\npublic class Attr {\n"
+        "  public Attr value(String s) { return this; }\n"
+        "  public Attr value(boolean b) { return this; }\n"
+        "  public Attr value(int i) { return this; }\n"
+        "  public Attr value(Object o) { return this; }\n"
+        "  void use(Attr a) {\n    a.value(ARG);\n  }\n}\n"
+    )
+
+    @pytest.mark.parametrize(
+        ("argument", "member"),
+        [
+            ("true", "value#1(boolean)"),
+            ('"x"', "value#1(String)"),
+            ("-1", "value#1(int)"),
+            ("'c'", "value#1(int)"),
+            ("1L", "value#1(Object)"),
+            # Every reference parameter takes null: still a tie, kept on the first.
+            ("null", "value#1(String)"),
+        ],
+    )
+    def test_the_closest_member_takes_the_literal(
+        self, tmp_path: Path, argument: str, member: str
+    ) -> None:
+        text = self._ATTR.replace("ARG", argument)
+        edges = _edges(tmp_path, {"app/Attr.java": ("java", text)})
+        assert edges == {("app/Attr.java::Attr::use", f"app/Attr.java::Attr::{member}")}
+
+    def test_literal_types_are_read_per_argument(self) -> None:
+        text = (
+            "class A {\n  void go(int x) {\n"
+            '    f(true, 2, 3L, 1.5, 1.5f, \'c\', "s", null, -1, x);\n  }\n}\n'
+        )
+        (call,) = _parse("A.java", "java", text).calls
+        assert call.argument_types == (
+            "boolean", "int", "long", "double", "float", "char", "String", "null", "int", None
+        )
+
+    def test_a_unary_operator_promotes_its_literal(self) -> None:
+        text = (
+            "class A {\n  void go() {\n"
+            "    f(-'a', +'a', ~'a', ~1L, !true, -1.5f, !1, -\"s\");\n  }\n}\n"
+        )
+        (call,) = _parse("A.java", "java", text).calls
+        assert call.argument_types == ("int", "int", "int", "long", "boolean", "float", None, None)
+
+    def test_a_tie_that_differs_on_a_non_literal_argument_is_not_broken(
+        self, tmp_path: Path
+    ) -> None:
+        """``value(obj, 1)``: the literal fits ``(String, int)`` better, but ``obj`` decides."""
+        text = (
+            "package app;\npublic class V {\n"
+            "  public V value(Object o, long l) { return this; }\n"
+            "  public V value(String s, int i) { return this; }\n"
+            "  void use(Object obj) {\n    value(obj, 1);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/V.java": ("java", text)})
+        # The tie stays on the first declared member, as before literals were read.
+        assert edges == {("app/V.java::V::use", "app/V.java::V::value#2(Object,long)")}
+
+    def test_a_varargs_array_takes_the_trailing_arguments(self, tmp_path: Path) -> None:
+        """``add(0, node)``: both members take ``node`` as an ``N``, so the literal decides."""
+        text = (
+            "package app;\npublic class N {\n"
+            "  public void add(N... nodes) { }\n"
+            "  public void add(int at, N... nodes) { }\n"
+            "  void use(N node) {\n    add(0, node);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/N.java": ("java", text)})
+        assert edges == {("app/N.java::N::use", "app/N.java::N::add#2")}
+
+    @pytest.mark.parametrize(
+        ("call", "member"),
+        [
+            ("f(1)", "f#1(int[])"),
+            ('f("a", "b")', "f#1(String[])"),
+            ('g("a", 1, 2)', "g#2(String,int[])"),
+        ],
+    )
+    def test_a_literal_through_varargs_is_judged_against_the_element_type(
+        self, tmp_path: Path, call: str, member: str
+    ) -> None:
+        text = (
+            "package app;\npublic class V {\n"
+            "  public void f(String... xs) { }\n  public void f(int... xs) { }\n"
+            "  public void g(String s, String... xs) { }\n  public void g(String s, int... xs) { }\n"
+            f"  void use() {{\n    {call};\n  }}\n}}\n"
+        )
+        edges = _edges(tmp_path, {"app/V.java": ("java", text)})
+        assert edges == {("app/V.java::V::use", f"app/V.java::V::{member}")}
+
+
+class TestJavaNamedArguments:
+    """A named argument's declared type breaks a tie the way a literal's does."""
+
+    _MATH = (
+        "package app;\npublic class M {\n"
+        "  public static int mul(int a, int b) { return a; }\n"
+        "  public static long mul(long a, int b) { return a; }\n"
+        "  public static long mul(long a, long b) { return a; }\n"
+        "BODY}\n"
+    )
+
+    @pytest.mark.parametrize(
+        ("body", "member"),
+        [
+            # A parameter and a local.
+            ("  long use(long total) {\n    int n = 2;\n    return mul(total, n);\n  }\n",
+             "mul#2(long,int)"),
+            # A field, read where the body declares no such name.
+            ("  private long base;\n  long use(int n) {\n    return mul(base, n);\n  }\n",
+             "mul#2(long,int)"),
+            # A local of a primitive type stands over a field of the same name.
+            ("  private long n;\n  long use(int a) {\n    int n = 1;\n    return mul(a, n);\n  }\n",
+             "mul#2(int,int)"),
+        ],
+        ids=["parameter-and-local", "field", "local-over-field"],
+    )
+    def test_declared_types_choose_the_member(
+        self, tmp_path: Path, body: str, member: str
+    ) -> None:
+        text = self._MATH.replace("BODY", body)
+        edges = _edges(tmp_path, {"app/M.java": ("java", text)})
+        assert edges == {("app/M.java::M::use", f"app/M.java::M::{member}")}
+
+    def test_a_local_the_scan_cannot_type_hides_the_field(self, tmp_path: Path) -> None:
+        """``var n = ...`` shadows the field ``n``: its type is unknown, so the tie stands."""
+        body = "  private long n;\n  long use(int a) {\n    var n = a;\n    return mul(n, a);\n  }\n"
+        edges = _edges(tmp_path, {"app/M.java": ("java", self._MATH.replace("BODY", body))})
+        assert edges == {("app/M.java::M::use", "app/M.java::M::mul#2(int,int)")}
+
+    def test_a_constructor_takes_its_arguments_declared_types(self, tmp_path: Path) -> None:
+        """``new Span(start, end, kind, zone)`` beside ``Span(int, int, int, int)``."""
+        text = (
+            "package app;\npublic class Span {\n"
+            "  public Span(int a, int b, int c, int d) { }\n"
+            "  public Span(long start, long end, Kind kind, Zone zone) { }\n"
+            "  static Span of(long start, long end, Kind kind, Zone zone) {\n"
+            "    return new Span(start, end, kind, zone);\n  }\n}\n"
+            "class Kind { }\nclass Zone { }\n"
+        )
+        edges = _edges(tmp_path, {"app/Span.java": ("java", text)})
+        base = "app/Span.java::Span::"
+        assert (base + "of", base + "Span#4(long,long,Kind,Zone)") in edges
+        assert (base + "of", base + "Span#4(int,int,int,int)") not in edges
+
+    def test_an_array_takes_the_array_member(self, tmp_path: Path) -> None:
+        text = (
+            "package app;\npublic class A {\n"
+            "  public void f(String s) { }\n  public void f(String[] xs) { }\n"
+            "  void use(String[] names) {\n    f(names);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/A.java": ("java", text)})
+        assert edges == {("app/A.java::A::use", "app/A.java::A::f#1(String[])")}
+
+    def test_argument_names_are_read_per_argument(self) -> None:
+        text = 'class A {\n  void go(int x) {\n    f(x, 1, this.y, "s", z);\n  }\n}\n'
+        (call,) = _parse("A.java", "java", text).calls
+        assert call.argument_names == ("x", None, None, None, "z")
+        assert call.argument_types == (None, "int", None, "String", None)
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            "  public void f(Object o) { }\n  public void f(Object[] os) { }\n",
+            "  public void f(Object[] os) { }\n  public void f(Object o) { }\n",
+        ],
+        ids=["object-first", "array-first"],
+    )
+    def test_an_array_reaches_a_covariant_array_before_object(
+        self, tmp_path: Path, members: str
+    ) -> None:
+        text = (
+            f"package app;\npublic class A {{\n{members}"
+            "  void use(String[] names) {\n    f(names);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/A.java": ("java", text)})
+        assert edges == {("app/A.java::A::use", "app/A.java::A::f#1(Object[])")}
+
+    def test_a_named_primitive_never_takes_an_array(self, tmp_path: Path) -> None:
+        text = (
+            "package app;\npublic class A {\n"
+            "  public void f(int[] xs) { }\n  public void f(long x) { }\n"
+            "  void use(int n) {\n    f(n);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/A.java": ("java", text)})
+        assert edges == {("app/A.java::A::use", "app/A.java::A::f#1(long)")}
+
+    def test_a_varargs_parameter_is_its_array_over_a_field(self, tmp_path: Path) -> None:
+        text = (
+            "package app;\npublic class A {\n  private long xs;\n"
+            "  public void f(long x) { }\n  public void f(int[] xs) { }\n"
+            "  void use(int... xs) {\n    f(xs);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/A.java": ("java", text)})
+        assert edges == {("app/A.java::A::use", "app/A.java::A::f#1(int[])")}
+
+    @pytest.mark.parametrize(
+        ("members", "member"),
+        [
+            # Phase one takes Integer as an Object, with no unboxing.
+            ("  void f(int i) { }\n  void f(long l) { }\n  void f(Object o) { }\n",
+             "f#1(Object)"),
+            # Unboxed to int before widened to long.
+            ("  void f(long l) { }\n  void f(int i) { }\n", "f#1(int)"),
+        ],
+        ids=["object", "unboxed"],
+    )
+    def test_a_boxed_argument(self, tmp_path: Path, members: str, member: str) -> None:
+        text = (
+            f"package app;\npublic class A {{\n{members}"
+            "  void use(Integer boxed) {\n    f(boxed);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/A.java": ("java", text)})
+        assert edges == {("app/A.java::A::use", f"app/A.java::A::{member}")}
+
+    @pytest.mark.parametrize(
+        "lambda_", ["n -> mul(n, 2)", "(n) -> mul(n, 2)", "(a, n) -> mul(n, 2)"]
+    )
+    def test_a_lambda_parameter_hides_the_field(self, tmp_path: Path, lambda_: str) -> None:
+        """Read as the ``long`` field, ``n`` would pick ``mul(long, int)``.
+
+        A lambda parameter is a binding the scan reads, so ``n`` stays untyped
+        and the tie stands.
+        """
+        body = (
+            "  private long n;\n"
+            f"  void use(java.util.function.IntConsumer c) {{\n    c = {lambda_};\n  }}\n"
+        )
+        edges = _edges(tmp_path, {"app/M.java": ("java", self._MATH.replace("BODY", body))})
+        assert edges == {("app/M.java::M::use", "app/M.java::M::mul#2(int,int)")}
+
+    def test_an_instanceof_pattern_variable_is_typed(self, tmp_path: Path) -> None:
+        text = (
+            "package app;\npublic class Shape {\n"
+            "  public void f(Object o) { }\n  public void f(Shape s) { }\n"
+            "  void use(Object o, boolean ok) {\n"
+            "    if (o instanceof Shape s && ok) {\n      f(s);\n    }\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/Shape.java": ("java", text)})
+        assert edges == {("app/Shape.java::Shape::use", "app/Shape.java::Shape::f#1(Shape)")}
+
+    @pytest.mark.parametrize(
+        ("loop", "member"),
+        [("for (long t : ts)", "mul#2(long,int)"), ("for (var t : ts)", "mul#2(int,int)")],
+        ids=["typed", "var"],
+    )
+    def test_a_for_each_variable(self, tmp_path: Path, loop: str, member: str) -> None:
+        """A typed loop variable is read; a ``var`` one hides the ``long`` field ``t``."""
+        body = f"  private long t;\n  void use(long[] ts) {{\n    {loop} mul(t, 2);\n  }}\n"
+        edges = _edges(tmp_path, {"app/M.java": ("java", self._MATH.replace("BODY", body))})
+        assert edges == {("app/M.java::M::use", f"app/M.java::M::{member}")}
+
+    def test_a_call_on_an_array_element_keeps_its_edge(self, tmp_path: Path) -> None:
+        """An array is a builtin type now; ``items[0].m()`` names no receiver and still binds."""
+        files = {
+            "app/B.java": ("java", "package app;\npublic class B {\n  public void m() { }\n}\n"),
+            "app/A.java": (
+                "java",
+                "package app;\npublic class A {\n"
+                "  void use(B[] items) {\n    items[0].m();\n  }\n}\n",
+            ),
+        }
+        assert ("app/A.java::A::use", "app/B.java::B::m") in _edges(tmp_path, files)
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            "  void add(Node... ns) { }\n  void add(int at, Node... ns) { }\n",
+            "  void add(int at, Node... ns) { }\n  void add(Node... ns) { }\n",
+        ],
+        ids=["shorter-first", "longer-first"],
+    )
+    def test_an_array_alone_in_the_varargs_position_is_passed_whole(
+        self, tmp_path: Path, members: str
+    ) -> None:
+        """``add(index, nodes)`` with ``Node... nodes`` passes the array, not one ``Node``."""
+        text = (
+            f"package app;\npublic class Node {{\n{members}"
+            "  void use(int index, Node... nodes) {\n    add(index, nodes);\n  }\n}\n"
+        )
+        edges = _edges(tmp_path, {"app/Node.java": ("java", text)})
+        assert edges == {("app/Node.java::Node::use", "app/Node.java::Node::add#2")}

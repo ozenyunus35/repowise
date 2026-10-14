@@ -129,7 +129,7 @@ _ANNOTATION = re.compile(r"@[\w.]+(?:\([^)]*\))?")
 _FUNCTION_DECLARATOR = re.compile(r"\(\s*([*&^]+)\s*[\w$]*\s*\)")
 
 
-def _erased_parameter_type(parameter: str) -> str:
+def erased_type(parameter: str) -> str:
     """``final Map<K, V> m`` -> ``Map``, ``const std::string& s`` -> ``string&``.
 
     Type arguments, qualifiers, modifiers, defaults and the parameter name
@@ -141,7 +141,7 @@ def _erased_parameter_type(parameter: str) -> str:
     text = _ANNOTATION.sub(" ", parameter).partition("=")[0]
     pointer = _FUNCTION_DECLARATOR.search(strip_type_arguments(text))
     if pointer is not None:
-        return _erased_parameter_type(text[: text.find("(")]) + pointer.group(1) + "fn"
+        return erased_type(text[: text.find("(")]) + pointer.group(1) + "fn"
     words = [w for w in _WORD.findall(strip_type_arguments(text)) if w not in _PARAMETER_MODIFIERS]
     if len(words) > 1 and words[-1] not in _BUILTIN_TYPE_WORDS:
         words.pop()
@@ -151,10 +151,14 @@ def _erased_parameter_type(parameter: str) -> str:
     return "_".join(re.split(r"\.|::", w)[-1] for w in words) + marks
 
 
+def erased_parameter_types(symbol: Symbol) -> list[str]:
+    """``["String", "int[]"]``: each parameter's erased type, as an id spells it."""
+    return [erased_type(p) for p in signature_parameters(symbol.signature or "") or []]
+
+
 def _parameter_types(symbol: Symbol) -> str:
     """``(String,int[])``: the erased types that split a same-count overload."""
-    parameters = signature_parameters(symbol.signature or "") or []
-    return "(" + ",".join(_erased_parameter_type(p) for p in parameters) + ")"
+    return "(" + ",".join(erased_parameter_types(symbol)) + ")"
 
 
 # Which discriminator tells colliding members apart, per language. A build

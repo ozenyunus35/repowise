@@ -116,6 +116,22 @@ def test_a_document_reports_secrets_but_not_code_smells(repo):
     assert [f["kind"] for f in _scan(repo).findings] == ["aws_access_key"]
 
 
+def test_a_gitleaks_allowlisted_path_drops_its_secrets_at_head_and_in_history(repo):
+    _write(repo, ".gitleaks.toml", "[allowlist]\npaths = ['''^rules/''']\n")
+    _write(repo, "rules/sample.py", f"AWS = '{KEY}'\nos.system(cmd)\n")
+    _write(repo, "rules/gone.py", f"AWS = '{KEY}'\n")
+    _write(repo, "deploy.py", f"AWS = '{KEY}'\n")
+    _commit(repo, "samples")
+    (repo / "rules" / "gone.py").unlink()
+    _commit(repo, "drop one")
+    scan = _scan(repo)
+    assert sorted((f["file_path"], f["kind"]) for f in scan.findings) == [
+        ("deploy.py", "aws_access_key"),
+        ("rules/sample.py", "os_system"),
+    ]
+    assert scan.suppressed == []
+
+
 # ---------------------------------------------------------------------------
 # Secrets inside the change
 # ---------------------------------------------------------------------------

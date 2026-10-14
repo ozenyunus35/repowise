@@ -155,7 +155,11 @@ async def test_file_page_grounds_before_the_first_model_turn():
     assert [message["role"] for message in sent[-3:]] == ["user", "assistant", "tool"]
     assert sent[-2]["tool_calls"][0]["id"] == grounding["tool_id"]
     assert sent[-1]["tool_call_id"] == grounding["tool_id"]
-    assert json.loads(sent[-1]["content"]) == _CONTEXT_RESULT
+    # The model sees the result stamped with the id show_view takes; the artifact does not.
+    assert json.loads(sent[-1]["content"]) == {
+        **_CONTEXT_RESULT,
+        "artifact_id": grounding["artifact"]["id"],
+    }
     assert "file page" in provider.calls[0]["system_prompt"]
 
     stored = await _stored_messages(app, events[-1]["conversation_id"])
@@ -351,8 +355,15 @@ async def test_a_page_with_findings_gets_chips_that_name_them():
     texts = [entry["text"] for entry in body["suggestions"]]
     assert "Explain the 28 bug fixes in a.py" in texts
     assert all(entry["source"] == "page" for entry in body["suggestions"])
+    from repowise.server.auth import LOCAL_PRINCIPAL
+
     execute.assert_awaited_once_with(
-        "get_risk", {"targets": ["src/a.py"]}, repo_path="/tmp/repo", repo=None
+        "get_risk",
+        {"targets": ["src/a.py"]},
+        repo_path="/tmp/repo",
+        repo=None,
+        principal=LOCAL_PRINCIPAL,
+        repo_id="repo-1",
     )
 
 

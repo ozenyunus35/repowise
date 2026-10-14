@@ -54,6 +54,21 @@ async def test_git_timeout_is_an_error_naming_the_change(monkeypatch):
     assert result == {"error": "git timed out reading change 'a..b'."}
 
 
+@pytest.mark.asyncio
+async def test_git_missing_from_path_is_an_error_naming_git(monkeypatch, tmp_path):
+    """The real scorer with no git on PATH: a named error, not a raw FileNotFoundError."""
+
+    async def _context(_repo):
+        return SimpleNamespace(path=str(tmp_path))
+
+    monkeypatch.setattr(tool, "_resolve_repo_context", _context)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    result = await tool.get_change_risk("HEAD")
+    assert result == {
+        "error": "git was not found on PATH; change risk reads the repository history."
+    }
+
+
 # ---------------------------------------------------------------------------
 # Health comparison and its stored-finding references
 # ---------------------------------------------------------------------------
@@ -154,10 +169,11 @@ async def test_repository_is_none_without_a_factory_or_a_repository_row(factory)
 # ---------------------------------------------------------------------------
 
 
-def test_filter_changed_applies_the_scores_suffixes_and_excludes():
+def test_filter_changed_applies_the_scores_suffixes_includes_and_excludes():
     changed = {"src/a.py": {1}, "src/b.ts": {2}, "docs/c.py": {3}}
     assert tool._filter_changed(changed, (".py",), ("docs/",)) == {"src/a.py": {1}}
     assert tool._filter_changed(changed, (), ()) == changed
+    assert tool._filter_changed(changed, (), ("src/b.ts",), ("src/",)) == {"src/a.py": {1}}
 
 
 @pytest.mark.asyncio
@@ -302,7 +318,7 @@ async def test_branch_scan_falls_back_to_git_only_when_the_index_will_not_open(
 ):
     """Branch overlap needs only git, so an index failure costs the ranking, not the block."""
     scan = SimpleNamespace(overlap="git-only overlap")
-    monkeypatch.setattr(tool, "_scan_from_trunk", lambda _path, _files: scan)
+    monkeypatch.setattr(tool, "_scan_from_trunk", lambda _path, _files, _current: scan)
     _get_repo_raising(monkeypatch, LookupError("no repo"))
     ctx = SimpleNamespace(path="/repo", session_factory=factory)
     assert await tool._scan_overlap(ctx, ["a.py"]) == "git-only overlap"
@@ -744,10 +760,16 @@ def test_the_directive_names_the_scope_and_the_tests_to_extend():
         "1 changed executable line in the working tree is uncovered; "
         "add tests for them (patch_coverage.files)"
     )
-    # Stale coverage leads: its gaps are not real until the tests run again.
-    assert patch_coverage_action(_patch_block(0, 1, hints, freshness="stale")).startswith(
+    # Files changed since the coverage was measured lead: they have no figure yet.
+    stale = {**_patch_block(0, 1, hints, freshness="stale"), "file_counts": {"stale_file": 2}}
+    assert patch_coverage_action(stale) == (
         "Stored coverage predates this change: re-run the tests with coverage, then "
-        "`repowise coverage add`"
+        "`repowise coverage add` (the hook does it automatically) and call again "
+        "(2 changed files not measured until then)"
+    )
+    # A file untouched since the measurement keeps real figures, stale or not.
+    assert patch_coverage_action(_patch_block(0, 1, freshness="stale")).endswith(
+        "is uncovered; add tests for them (patch_coverage.files)"
     )
 
 

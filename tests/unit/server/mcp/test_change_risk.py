@@ -79,14 +79,12 @@ async def test_get_change_risk_honors_riskignore_and_request_filters(tmp_path, m
         "entropy": 0.0,
         "exp": 1,
     }
-    assert diagnostics["risk_authority"]["primary_fields"] == [
-        "risk_percentile",
-        "classification",
-    ]
+    assert diagnostics["risk_authority"]["primary_fields"] == ["risk_percentile"]
     assert result["exclude_patterns"] == ["tests/", "docs/"]
     assert result["risk_percentile"] is None
-    assert result["review_priority"] is None
-    assert result["classification"] is None
+    # The tercile and its label repeat the percentile, so they wait for scales.
+    assert "review_priority" not in result
+    assert "classification" not in result
     assert diagnostics["fallback_band"] in {"low", "moderate", "high"}
     assert diagnostics["baseline_sample_size"] == 0
     # The per-field dictionary is identical on every call, so it is opt-in.
@@ -97,6 +95,8 @@ async def test_get_change_risk_honors_riskignore_and_request_filters(tmp_path, m
     scales = {scale["field"]: scale for scale in expanded["risk_scales"]}
     assert scales["score"]["authoritative"] is False
     assert scales["risk_percentile"]["authoritative"] is True
+    assert scales["classification"]["authoritative"] is False
+    assert expanded["review_priority"] is None
     assert scales["features.la|features.ld"]["unit"] == "lines"
     assert scales["drivers[].contribution"]["unit"] == "logit_points"
     # Live-git responses carry a _meta envelope flagged as index-independent.
@@ -127,7 +127,7 @@ async def test_get_change_risk_labels_the_priority_tercile_as_diff_size(tmp_path
 
     monkeypatch.setattr(module, "_resolve_repo_context", _context)
     monkeypatch.setattr(module, "change_risk_payload", _ranked)
-    result = await module.get_change_risk("HEAD", baseline=0)
+    result = await module.get_change_risk("HEAD", baseline=0, include=["scales"])
 
     assert result["review_priority"] == "high"
     assert result["classification"] == "Above-typical diff size"
@@ -175,6 +175,40 @@ async def test_get_change_risk_empty_diff_warns(tmp_path, monkeypatch) -> None:
     assert "score" not in result
     assert "no counted file changes" in result["warning"].lower()
     assert result["scored_repo"]["root"] == str(repo)
+
+
+@pytest.mark.asyncio
+async def test_get_change_risk_names_the_checkout_and_commit_it_scored(tmp_path, monkeypatch) -> None:
+    """``HEAD`` resolves in the served checkout, so a worktree caller sees whose HEAD it was."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q", "-b", "main"], repo)
+    _commit(repo, {"README.md": "# seed\n"}, "chore: seed")
+    _git(["worktree", "add", "-q", "-b", "feature", str(tmp_path / "wt")], repo)
+    _commit(tmp_path / "wt", {"app.py": "value = 1\n"}, "feat: on the worktree branch")
+    _commit(repo, {"main.py": "value = 2\n"}, "feat: on main")
+
+    def sha(ref: str) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", ref], cwd=repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo))
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    served = await module.get_change_risk("HEAD~1..HEAD", baseline=0)
+    branch = await module.get_change_risk(f"HEAD~1..{sha('feature')}", baseline=0)
+
+    assert served["scored_repo"] == {"root": str(repo), "head": sha("main")[:12]}
+    assert branch["scored_repo"] == {"root": str(repo), "head": sha("feature")[:12]}
+
+    # Uncommitted work is marked, so its head does not read as the scored change.
+    (repo / "main.py").write_text("value = 3\n", encoding="utf-8")
+    dirty = await module.get_change_risk(baseline=0)
+    assert dirty["scored_repo"] == {"root": str(repo), "head": sha("main")[:12], "working_tree": True}
 
 
 @pytest.mark.asyncio
@@ -542,10 +576,12 @@ async def test_get_change_risk_drops_request_echoes_and_empty_fields(tmp_path, m
     assert "working_tree" not in result
     assert "is_fix" not in result
     assert "density" not in result["fix_history"]
-    assert "percentile" in result["fix_history"]
+    # One percentile on the default response: the size rank, not the fix rank.
+    assert "percentile" not in result["fix_history"]
 
     diagnostics = await module.get_change_risk("HEAD", baseline=0, include=["diagnostics"])
     assert "density" in diagnostics["fix_history"]
+    assert "percentile" in diagnostics["fix_history"]
 
 
 @pytest.mark.asyncio
@@ -565,6 +601,35 @@ async def test_get_change_risk_keeps_working_tree_without_a_revspec(tmp_path, mo
     result = await module.get_change_risk(baseline=0)
 
     assert result["working_tree"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_change_risk_untracked_only_tree_is_one_change(tmp_path, monkeypatch) -> None:
+    """Score, manifest and delta read one file set; repowise's own output drops out."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(repo, {"README.md": "# seed\n"}, "chore: seed")
+    (repo / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (repo / ".github").mkdir()
+    from repowise.cli.agent_targets.instructions import DISTILL_MARKER_END, DISTILL_MARKER_START
+
+    (repo / ".github" / "copilot-instructions.md").write_text(
+        f"{DISTILL_MARKER_START}\nx\n{DISTILL_MARKER_END}\n", encoding="utf-8"
+    )
+
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo))
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    result = await module.get_change_risk(baseline=0, include=["diagnostics"])
+
+    assert result["working_tree"] is True
+    assert result["features"]["nf"] == 1
+    assert result["health_delta"]["scope"]["changed"] == 1
+    assert result["exclude_patterns"] == ["/.github/copilot-instructions.md"]
 
 
 @pytest.mark.asyncio

@@ -94,7 +94,7 @@ Every tool returns a JSON object with a `_meta` envelope. Most fields appear onl
 | `omitted` | Refs to content cut for size. Restore with `repowise expand <ref>` or `get_symbol("repowise#<ref>")`. |
 | `response_budget` | The character ceiling that applied and the size delivered. Present when the budget cut something. |
 
-`get_answer` adds a top-level `confidence` (rates the prose) and `retrieval_quality` (rates the evidence). Diagnostics such as `timing_ms` and `contract_version` ride only on `get_overview`; `REPOWISE_MCP_DEBUG_META=1` restores them everywhere. Full envelope: [MCP_RESPONSE_FIELDS.md](../reference/MCP_RESPONSE_FIELDS.md#the-_meta-envelope).
+`get_answer` adds a top-level `confidence`, its one trust signal, graded from the retrieval and from whether the top hit covers what the question asks; `include=["diagnostics"]` adds `retrieval_quality`, the rating of the retrieval alone. Diagnostics such as `timing_ms` and `contract_version` ride only on `get_overview`; `REPOWISE_MCP_DEBUG_META=1` restores them everywhere. Full envelope: [MCP_RESPONSE_FIELDS.md](../reference/MCP_RESPONSE_FIELDS.md#the-_meta-envelope).
 
 ### Reversible truncation: `_meta.omitted`
 
@@ -147,7 +147,7 @@ Answers a how, where or why question in one call: it runs hybrid retrieval over 
 | `repo` | string | default repo | Workspace repo alias. `"all"` is not supported |
 | `include` | list[string] | none | `["evidence"]` returns the full evidence projection with a larger budget |
 
-**Key return fields:** `answer`, `confidence` (`high` / `medium` / `low`, rates the prose), `retrieval_quality` (`high` / `partial` / `weak`, rates the evidence), `citations`, `symbol_bodies` (live bodies of symbols the answer names), `retrieval`, `best_guesses` and `fallback_targets` (on low confidence; a low `best_guesses` row carries `functions`, `lines` and `size_bytes` instead of a page excerpt), `candidate_files` (ranked file paths the citations do not already name: up to 3 at `high`, 5 otherwise), `episodes` (dated facts bearing on the question), `degraded` (synthesis could not run), `_meta.scope_hint` (areas the answer did not touch).
+**Key return fields:** `answer`, `confidence` (`high` / `medium` / `low`), `citations`, `symbol_bodies` (live bodies of symbols the answer names), `retrieval`, `best_guesses` and `fallback_targets` (on low confidence; a low `best_guesses` row carries `functions`, `lines` and `size_bytes` instead of a page excerpt), `candidate_files` (ranked file paths the citations do not already name: up to 3 at `high`, 5 otherwise), `episodes` (dated facts bearing on the question), `degraded` (synthesis could not run), `_meta.scope_hint` (areas the answer did not touch).
 
 A `high` answer can be cited directly. On `low`, read the rows the reply names, then `candidate_files`, before searching again. Without an LLM provider the tool still answers from retrieval, marked `degraded`. When retrieval is also `weak`, the reply serves `best_guesses` and `candidate_files` with one guidance line in `answer`, and no `citations`.
 
@@ -161,12 +161,14 @@ A triage card for files, modules or symbols: summary, symbols with signatures an
 
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|
-| `targets` | list[string] | required | File paths, module paths, or `"path::Symbol"` ids |
+| `targets` | list[string] | required | File paths, module paths, `"path::Symbol"` ids, or `"component:<name>"` |
 | `include` | list[string] | none | Any of `full_doc`, `ownership`, `last_change`, `callers`, `callees`, `references`, `metrics`, `community`, `decisions`, `skeleton`, `health`, `doc_drift`, `symbols` |
 | `compact` | bool | `true` | `false` adds the structure block, imports and docstrings |
 | `repo` | string | default repo | Workspace repo alias. `"all"` is not supported (returns an error) |
 
 **Key return fields:** `targets` keyed by target, each with title, summary, symbols, `hotspot`, `fix_history` (files with counted bug fixes), `episodes`, decision titles, `file_preview` (for files with no symbols), `resolved_to` (a symbol miss falling back to its file); `dropped_targets` and `recovery` when the budget forced targets out; `_meta.complete` for whole files served.
+
+A `component:<name>` target returns the component's declared context (owner, system, criticality, tags) and `facts` rolled up over its files: health, hotspots, bus factor, test reach and dead code, each with a `basis` (`measured`, `inferred` or `unavailable`). Components come from [`.repowise/components.yaml`](../reference/CONFIG.md#repowisecomponentsyaml) or are derived from the index. `include` does not apply to component targets; health and dead code leave out files in gated languages and say how many.
 
 A file's compact symbol list holds its top 15 symbols: types (classes, interfaces, structs, traits, enums, type aliases, impls, modules) first, then functions and methods, then the rest, each group by centrality. `symbols_truncated` gives the total, and `include=["symbols"]` lists them all. When the response budget trims the list further, it keeps symbols by kind and name match, not centrality. A row without `symbol_id` is `path::name`; methods and overload variants carry theirs, so pass a row's id to `get_symbol` when it has one.
 
@@ -261,7 +263,7 @@ Reviews one commit, a `base..head` range, or uncommitted work by comparing the t
 | `revspec` | string | uncommitted work | A commit, `base..head`, or `base...head` (from the merge-base). Pass `HEAD` when the tree is clean |
 | `extensions` | list[string] | all | File suffixes to count, e.g. `[".py", ".ts"]` |
 | `exclude_patterns` | list[string] | none | Gitignore-style paths to omit; combined with a root `.riskignore` |
-| `include_paths` | list[string] or string | all | Gitignore-style paths to keep, as a list or one comma-separated string |
+| `include_paths` | list[string] or string | all | Gitignore-style paths to keep, as a list or one comma-separated string. Like `exclude_patterns`, it scopes the score, the health delta and every per-file block; `impacted_tests` still selects over the whole change |
 | `baseline` | int | `200` | Recent commits sampled for percentile ranking; `0` disables percentiles |
 | `include` | list[string] | none | `findings` (every finding), `diagnostics` (raw score mechanics, plus the delta's analyzer, revisions and limits), `scales` (units) |
 | `finding_id` | string | none | Expand one `health_delta` finding |
@@ -305,7 +307,7 @@ The architecture map: summary, key modules, entry points, layers, code and git h
 
 | Parameter | Type | Default | Meaning |
 |-----------|------|---------|---------|
-| `include` | list[string] | none | Any of `content` (full essay), `outline` (wiki page tree), `tour` (guided tour and reading order), `decisions`, `graph` (community clusters), `ownership` (top owners) |
+| `include` | list[string] | none | Any of `content` (full essay), `outline` (wiki page tree), `tour` (guided tour and reading order), `decisions`, `graph` (community clusters), `ownership` (top owners), `components` (declared and derived components with file counts) |
 | `repo` | string | default repo | Workspace repo alias, or `"all"` for the cross-repo topology |
 
 **Key return fields:** `title`, `content_md` (summary section by default), `key_modules`, `entry_points`, `architecture` (layers in stack order, plus `dependencies`: the ten heaviest package-to-package edges with `from`, `to`, `verb` and `weight`, and `edges_total` when more exist; absent in a single-package repo), `code_health`, `git_health`, `next_actions`, `more` (names the opt-in blocks), and a `workspace` footer in workspace mode.
@@ -524,6 +526,10 @@ Only four tools answer across every repo with `repo="all"`. The rest return an e
 | `get_dependency_path`, `get_execution_flows`, `generate_refactoring_code`, `set_finding_status` | No |
 | `get_conformance` | No `"all"` value; it covers the whole workspace when `repo` is omitted |
 | `get_blast_radius`, `get_architecture`, `list_repos` | No `repo` parameter; they always read the whole workspace |
+
+With `repo` omitted, `get_context`, `get_symbol`, `get_risk` and `get_health` route each path or `path::Name` target to its repo: the default repo when the file exists there, else the one other repo whose checkout has it. Write `<alias>:<target>` (for example `web:src/app.ts::App`) to name the repo outright. A path found in several other repos returns its `candidates`. A path in no repo gets the default repo's usual not-found answer plus a `hint` naming `search_codebase(repo="all")` and the `<alias>:<path>` form; routed results carry `repo`. `get_context` takes a batch spanning repos, while `get_risk` and `get_health` answer one repo per call and name the per-repo calls when a batch spans several.
+
+A `repo="all"` call queries up to 4 repos at a time and gives each 60 seconds (`REPOWISE_WORKSPACE_CONCURRENCY`, `REPOWISE_WORKSPACE_REPO_TIMEOUT_S`). A repo that fails to open, errors or times out is listed in `repos_failed` with its reason while the other repos still answer. A repo whose index is behind its checkout is listed in `repos_stale` with `indexed_commit` and `live_head`, and its rows carry `stale: true`. Both keys appear only when non-empty.
 
 Single-repo tools also gain cross-repo evidence in workspace mode:
 

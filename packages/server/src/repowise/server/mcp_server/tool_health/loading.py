@@ -19,8 +19,11 @@ from repowise.core.analysis.health.churn_complexity import churn_complexity_poin
 from repowise.core.analysis.health.fix_first import FixFirstQueue
 from repowise.core.analysis.health.grading import TARGET_SCORE
 from repowise.core.analysis.health.perf.coverage import PerfCoverage, coverage_for_metrics
-from repowise.core.analysis.health.queue.eligibility import path_verdict
-from repowise.core.analysis.health.ranking import deduction_by_path, sort_metrics_worst_first
+from repowise.core.analysis.health.ranking import (
+    deduction_by_path,
+    scope_reason,
+    sort_metrics_worst_first,
+)
 from repowise.core.analysis.health.refactoring.serving import parse_query as parse_refactoring_query
 from repowise.core.analysis.health.signals import file_signals
 from repowise.core.analysis.health.trends import project_scope
@@ -49,6 +52,7 @@ from repowise.server.mcp_server.tool_health.findings import (
     load_dashboard_findings,
     load_targeted_findings,
     read_accuracy_rows,
+    read_withheld_rows,
 )
 from repowise.server.mcp_server.tool_health.pillars import (
     _performance_blocks,
@@ -108,6 +112,8 @@ class HealthData:
     worst_files_hidden: dict[str, int] = field(default_factory=dict)
     # What a language gate held back, ``{layer: {language: {count, ...}}}``.
     gated: dict[str, dict] = field(default_factory=dict)
+    #: Open findings of a withheld type: never listed, but the score counted them.
+    withheld_rows: list[Any] = field(default_factory=list)
 
 
 async def load_health_data(
@@ -176,12 +182,19 @@ async def load_health_data(
     )
     data.churn_points = await _read_churn_points(session, repository, pop, req)
     data.snapshots = await _read_snapshots(session, repository, pop, req)
+    data.withheld_rows = await read_withheld_rows(session, repository, pop, req)
     data.by_leverage, data.leads = _rank_leverage_and_leads(
-        pop, metric_rows, findings, req, data.test_metric_rows
+        pop, metric_rows, findings, req, data.test_metric_rows, data.withheld_rows
     )
     data.fix_first, data.fix_first_full = await _read_fix_first(session, repository, pop, req)
     if "top_findings" in req.only_set and not pop.nothing_resolved:
-        counts = await unit_counts(session, repository.id, "findings", file_paths=pop.target_paths)
+        counts = await unit_counts(
+            session,
+            repository.id,
+            "findings",
+            file_paths=pop.target_paths,
+            include_unverified=req.include_unverified,
+        )
         data.finding_counts = counts.as_dict()
     data.gated = await _read_gated(session, req, data)
     return data
@@ -214,10 +227,7 @@ def _scope_reasons(metrics: list[HealthFileMetric]) -> dict[str, str | None]:
     Ceiling: recomputed per process (about 0.3 s cold on 5k files, 1.2 s on 18k; 0.02 s
     warm). Upgrade path: persist the verdict per file when the health pass finalizes.
     """
-    return {
-        m.file_path: path_verdict(m.file_path, m.is_test, origin=m.code_origin).reason
-        for m in metrics
-    }
+    return {m.file_path: scope_reason(m) for m in metrics}
 
 
 async def _read_test_paths(
@@ -443,6 +453,7 @@ def _rank_leverage_and_leads(
     findings: FindingSets,
     req: HealthRequest,
     test_metric_rows: list[HealthFileMetric],
+    withheld_rows: list[Any],
 ) -> tuple[list[HealthFileMetric], dict[str, dict[str, Any]]]:
     """Dominant-cause lead per file, and the leverage ranking it is printed beside.
 
@@ -450,7 +461,7 @@ def _rank_leverage_and_leads(
     only the rows of files it prints: identical output at a fraction of the cost.
     """
     if pop.scoped:
-        return [], _leads_by_file(findings.lead_rows)
+        return [], _leads_by_file(findings.lead_rows, withheld_rows)
     # Ranked by NLOC-weighted deficit, not raw score: a big mid-band file
     # moves the average more than a tiny at-risk one.
     by_leverage = sorted(
@@ -461,7 +472,10 @@ def _rank_leverage_and_leads(
     printed = {m.file_path for m in metric_rows[: req.limit]}
     printed |= {m.file_path for m in test_metric_rows[: req.limit]}
     printed |= {m.file_path for m in by_leverage[: req.limit]}
-    return by_leverage, _leads_by_file([r for r in findings.lead_rows if r.file_path in printed])
+    return by_leverage, _leads_by_file(
+        [r for r in findings.lead_rows if r.file_path in printed],
+        [r for r in withheld_rows if r.file_path in printed],
+    )
 
 
 async def _read_fix_first(

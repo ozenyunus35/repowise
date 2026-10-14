@@ -47,6 +47,7 @@ import json
 from pathlib import Path
 
 from repowise.core.agents import identity
+from repowise.core.owned_paths import CURSOR_RULES_PREFIX
 
 from ..types import (
     Capability,
@@ -85,15 +86,8 @@ METHODS = (
 #: Paired with ``marker_block.remove(delete_if_only=...)`` so install then
 #: uninstall round-trips back to "no file" rather than leaving a stub carrying
 #: nothing but our own frontmatter — which would still read as repowise-managed
-#: to anyone who opened it.
-RULES_PREFIX = (
-    "---\n"
-    "alwaysApply: true\n"
-    "---\n"
-    "\n"
-    "<!-- Add your own Cursor rules above or below the Repowise section. "
-    "Repowise only updates the managed section between markers. -->\n"
-)
+#: to anyone who opened it. Defined in core, which strips it from a working-tree score.
+RULES_PREFIX = CURSOR_RULES_PREFIX
 
 
 class RemoteServerEntryError(ValueError):
@@ -536,11 +530,11 @@ class CursorTarget:
         repo = repo_path or Path.cwd()
         return [str(mcp_config_path(repo)), str(rules_path(repo))]
 
-    def doctor(self) -> DoctorReport:
+    def doctor(self, repo_path: Path | None = None) -> DoctorReport:
         """Health of the one user-level surface, the rewrite hook.
 
-        The MCP config and rules file are workspace-local and ``doctor()`` takes
-        no repo path, so they are not judged here.
+        The MCP config and rules file are workspace-local, so they are not
+        judged here.
         """
         from repowise.cli.agent_adapters.cursor import cursor_rewrite_hook_matcher, user_hooks_path
 

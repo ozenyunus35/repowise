@@ -14,8 +14,8 @@ from repowise.core.analysis.health.aggregation import (
     severity_breakdown,
 )
 from repowise.core.analysis.health.defect_accuracy import compute_defect_accuracy
-from repowise.core.analysis.health.grading import band_for
 from repowise.core.analysis.health.grading import distribution as health_distribution
+from repowise.core.analysis.health.grading import headline_band
 from repowise.core.analysis.health.ranking import deduction_by_path
 from repowise.core.analysis.health.scoring import ZERO_IMPACT_DIMENSIONS, hotspot_health
 from repowise.core.persistence import crud
@@ -113,7 +113,9 @@ async def health_overview(
         # asked for; the two differ while a request is in flight.
         "counts": counts,
         "unscored_files": unscored,
-        "band": band_for(float(avg)) if avg is not None else None,
+        # Withheld when too few code files were analysed for the average to
+        # speak for the repo; ``analysed_share`` rides in from the summary.
+        "band": headline_band(avg, summary.get("analysed_share")),
         "gated": gated,
     }
     distribution = health_distribution(metric_dicts)
@@ -161,14 +163,18 @@ async def health_overview(
         # same numbers the lists, MCP and the CLI report, whatever scope or
         # counts this page projects.
         "queue_counts": await all_unit_counts(
-            session, repo_id, shown={"findings": len(top_findings)}
+            session,
+            repo_id,
+            shown={"findings": len(top_findings)},
+            include_unverified=include_unverified,
         ),
         "meta": {
             "last_indexed_at": last_indexed_at,
-            # Prefer state.json's last_sync_commit over a possibly-stale DB row
-            # so the freshness signal self-heals on read (see the /api/repos
-            # overlay). This is the extension's primary indexed-commit source.
-            "head_commit": resolve_indexed_commit(repo.head_commit, repo.local_path),
+            # The /api/repos overlay's indexed commit (state.json and the row
+            # reconciled). This is the extension's primary indexed-commit source.
+            "head_commit": (
+                resolve_indexed_commit(repo.head_commit, repo.local_path) or repo.head_commit
+            ),
             "snapshot_count": snapshot.snapshot_count,
         },
     }

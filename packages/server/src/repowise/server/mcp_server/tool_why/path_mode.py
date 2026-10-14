@@ -27,6 +27,7 @@ from repowise.server.mcp_server._helpers import (
     is_excluded,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._meta import served_root
 from repowise.server.mcp_server._why_evidence import annotate_response_evidence_async
 from repowise.server.mcp_server.tool_why.archaeology import _git_archaeology_fallback
 from repowise.server.mcp_server.tool_why.caps import (
@@ -69,11 +70,20 @@ async def _why_path(query: str, repo: str | None) -> dict:
 
         # Load git metadata for origin story
         git_meta = await _git_metadata_for(session, repository.id, query)
+        matched = _records_naming_path(all_decisions, query)
+        # A typo or a stale path: nothing to excavate, so say so before the
+        # archaeology fallback mines unrelated commits for it.
+        if git_meta is None and not matched and not _maybe_on_disk(ctx.path, query):
+            return {
+                "mode": "path",
+                "path": query,
+                "error": f"Path not found: '{query}' is neither in the checkout "
+                "nor in the indexed git history.",
+            }
 
         # Pre-load all git metadata for cross-file search (used by fallback)
         all_git_meta = await _all_git_metadata(session, repository.id)
 
-        matched = _records_naming_path(all_decisions, query)
         # A record with no acceptance row is a candidate whatever its status.
         # Over every record, since alignment reads records this path did not match.
         currencies = await decision_currencies(session, repository.id, all_decisions)
@@ -133,6 +143,23 @@ async def _why_path(query: str, repo: str | None) -> dict:
         _cap_episodes(result_data, episodes, collector)
         _cap_path_decision_lanes(result_data, collector)
         return _fit_path_response(result_data, ctx.path, collector=collector)
+
+
+def _maybe_on_disk(repo_path: str | Path | None, path: str) -> bool:
+    """False only when the checkout is known and *path* is not in it.
+
+    Resolved and contained, like ``read_repo_file_text``: an absolute path,
+    a ``..`` escape or a symlink out of the checkout is not in it.
+    """
+    if not repo_path:
+        return True
+    root = Path(repo_path).resolve()
+    try:
+        candidate = (root / path).resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return candidate.exists()
 
 
 def _records_naming_path(all_decisions: list, path: str) -> list:
@@ -244,7 +271,7 @@ async def _add_ungoverned_evidence(
         path,
         git_meta,
         all_git_meta,
-        repository,
+        served_root(repository, repo_path),
     )
     # The "why" may live in a code comment.
     rationale = _mine_rationale(
@@ -273,6 +300,7 @@ async def _build_target_context(
         # Load all git metadata for cross-file search
         all_git_meta_list = await _all_git_metadata(session2, repository.id)
 
+        root = served_root(repository, ctx.path)
         target_context: dict[str, Any] = {}
         for t in targets:
             target_context[t] = await _target_card(
@@ -280,7 +308,7 @@ async def _build_target_context(
                 all_decisions,
                 target_git.get(t),
                 all_git_meta_list,
-                repository,
+                root,
                 accepted or set(),
             )
         return target_context
@@ -306,7 +334,7 @@ async def _target_card(
     all_decisions: list,
     git_m: Any | None,
     all_git_meta_list: list,
-    repository: Any,
+    repo_root: str | None,
     accepted_ids: set[str],
 ) -> dict[str, Any]:
     """One target's card: its rules, its candidates, its origin, and archaeology."""
@@ -342,7 +370,7 @@ async def _target_card(
             t,
             git_m,
             all_git_meta_list,
-            repository,
+            repo_root,
         )
     return ctx_entry
 
