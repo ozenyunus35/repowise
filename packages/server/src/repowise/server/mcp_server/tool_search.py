@@ -80,6 +80,7 @@ from repowise.server.mcp_server._query_shape import (
     _symbol_matches_name,
     path_tokens,
 )
+from repowise.server.mcp_server._query_terms import content_terms
 from repowise.server.mcp_server._references import path_identity, symbol_identity
 from repowise.server.mcp_server._retrieval_rank import (
     boost_named_paths,
@@ -1087,6 +1088,11 @@ async def _structured_search(
         _idents = _embedded_identifiers(query, names)
         if _idents:
             symbol_query = " ".join(_idents)
+        else:
+            # No identifier: score on the content words, so stopwords such as
+            # "on" can't match symbols like ``test_basic_auth_on_session``.
+            # A query made only of stopwords keeps the raw text.
+            symbol_query = " ".join(content_terms(query)) or query
 
     # Only the hybrid window collapses symbol rows, so only it over-fetches
     # them; path hits are file pages, already one row per file. Symbol mode
