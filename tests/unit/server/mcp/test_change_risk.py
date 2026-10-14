@@ -446,7 +446,40 @@ async def test_impacted_tests_falls_back_to_the_graph_without_a_map(tmp_path, mo
     # when the weaker tier is allowed to speak.
     assert it["why"] == {"tests/test_round_trips.py": "src/app.py changed (import-graph)"}
     assert "line_coverage" not in it
-    assert it["summary"].startswith("1 test(s) to run for this change")
+    # The only test file there is: a whole-suite selection never reads as targeted.
+    assert it["summary"] == "1 test(s) to run for this change, every test file there is."
+
+
+@pytest.mark.parametrize(
+    ("files", "summary"),
+    [
+        (
+            ("tests/test_a.py",),
+            "2 test(s) to run for this change (1 of 4 test files); the rest can be skipped.",
+        ),
+        (
+            ("tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_d.py"),
+            "2 test(s) to run for this change, every test file there is.",
+        ),
+        # As many files as the suite holds is not the suite: one is not a known test.
+        (
+            ("tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "other/test_x.py"),
+            "2 test(s) to run for this change (3 of 4 test files); the rest can be skipped.",
+        ),
+    ],
+)
+def test_a_selection_summary_says_how_much_of_the_suite_it_is(files, summary) -> None:
+    from repowise.core.analysis.test_selection import Selection
+    from repowise.server.mcp_server._test_selection import _summary
+
+    selection = Selection(
+        run_all=False,
+        reasons=(),
+        tests=("t1", "t2"),
+        test_files=files,
+        known_tests=("tests/test_a.py", "tests/test_b.py", "tests/test_c.py", "tests/test_d.py"),
+    )
+    assert _summary(selection, 2, 0, 10) == summary
 
 
 @pytest.mark.asyncio
@@ -630,6 +663,48 @@ async def test_get_change_risk_untracked_only_tree_is_one_change(tmp_path, monke
     assert result["features"]["nf"] == 1
     assert result["health_delta"]["scope"]["changed"] == 1
     assert result["exclude_patterns"] == ["/.github/copilot-instructions.md"]
+
+
+@pytest.mark.parametrize(("user_text", "selected"), [("# Mine\n", False), ("# Mine, edited\n", True)])
+@pytest.mark.asyncio
+async def test_impacted_tests_skip_a_managed_file_only_repowise_changed(
+    tmp_path, monkeypatch, user_text, selected
+) -> None:
+    """A refreshed managed block leaves test selection; the user's edit beside it does not."""
+    from repowise.cli.agent_targets.instructions import DISTILL_MARKER_END, DISTILL_MARKER_START
+    from repowise.core.analysis import changed_lines
+
+    def block(body: str) -> str:
+        return f"\n{DISTILL_MARKER_START}\n{body}\n{DISTILL_MARKER_END}\n"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(["init", "-q"], repo)
+    _commit(repo, {"src/app.py": "a = 1\n", "AGENTS.md": "# Mine\n" + block("v1")}, "chore: seed")
+    (repo / "src" / "app.py").write_text("a = 1\nb = 2\n", encoding="utf-8")
+    (repo / "AGENTS.md").write_text(user_text + block("v2"), encoding="utf-8")
+
+    seen: dict = {}
+    real = changed_lines.change_set
+
+    def _spy(*args, **kwargs):
+        change = real(*args, **kwargs)
+        seen["files"] = set(change.files)
+        return change
+
+    monkeypatch.setattr(changed_lines, "change_set", _spy)
+    factory = await _factory_with_repo(None)
+    module = importlib.import_module("repowise.server.mcp_server.tool_change_risk")
+
+    async def _context(_: str | None) -> SimpleNamespace:
+        return SimpleNamespace(path=str(repo), session_factory=factory)
+
+    monkeypatch.setattr(module, "_resolve_repo_context", _context)
+    result = await module.get_change_risk(baseline=0)
+
+    assert result["working_tree"] is True
+    assert "src/app.py" in seen["files"]
+    assert ("AGENTS.md" in seen["files"]) is selected
 
 
 @pytest.mark.asyncio

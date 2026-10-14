@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...co_change import CoChangePartner, parse_partners
 from ..models import (
+    Change,
     FixEvent,
     GitCommit,
     GitCommitFile,
@@ -742,8 +743,8 @@ async def get_author_commit_counts(session: AsyncSession, repository_id: str) ->
 async def clear_attribution(session: AsyncSession, repository_id: str) -> None:
     """Delete every AI attribution value derived into the index for a repository.
 
-    Commit labels and the per-file rollups go; git history, trailers and notes
-    in the repository are untouched. ``repowise attribution purge`` and the
+    Commit labels, the per-file rollups and change provenance go; git
+    history, trailers and notes in the repository are untouched. ``repowise attribution purge`` and the
     ``attribution.enabled: false`` sweep below both use this.
     """
     await session.execute(
@@ -769,6 +770,11 @@ async def clear_attribution(session: AsyncSession, repository_id: str) -> None:
             agent_line_count=0,
             agent_line_model_json="{}",
         )
+    )
+    await session.execute(
+        update(Change)
+        .where(Change.repository_id == repository_id)
+        .values(provenance=None, provenance_agent=None, provenance_known=None)
     )
 
 

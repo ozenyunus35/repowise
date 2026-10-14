@@ -72,6 +72,7 @@ _OSS_COMMANDS: tuple[tuple[str, str], ...] = (
     ("decision", "decision_cmd:decision_group"),
     ("coverage", "coverage_cmd:coverage_group"),
     ("components", "components_cmd:components_group"),
+    ("changes", "changes_cmd:changes_group"),
     ("impacted-tests", "impacted_tests_cmd:impacted_tests_command"),
     ("search", "search_cmd:search_command"),
     ("ask", "ask_cmd:ask_command"),

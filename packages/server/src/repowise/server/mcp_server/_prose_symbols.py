@@ -56,11 +56,11 @@ from repowise.server.mcp_server._helpers import (
     _get_repo,
     is_excluded,
 )
-from repowise.server.mcp_server._hit_symbols import _stem
 from repowise.server.mcp_server._page_paths import PAGELESS_FILE
 from repowise.server.mcp_server._query_terms import _MAX_TERMS, STOPWORDS
 from repowise.server.mcp_server._query_terms import content_terms as content_terms
 from repowise.server.mcp_server.tool_search_symbols import (
+    _stem,
     _symbol_kind_for_request_kind,
     _symbol_result,
     _tokens,

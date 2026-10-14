@@ -10,7 +10,9 @@ gains a discriminator:
   narrows to the member whose parameters admit its argument count. Members
   that share a count also carry their erased parameter types,
   ``StringUtil.java::StringUtil::append#1(String)``, so an inserted overload
-  never renames its siblings.
+  never renames its siblings. A Kotlin extension's receiver leads its types,
+  as it leads the JVM signature it compiles to: ``Byte.toHexString()`` is
+  ``Util.kt::toHexString#0(Byte)``, beside ``toHexString#0(Int)``.
 - ``#<tag>(<predicate>)`` on the last segment: one build variant of a symbol
   declared once per configuration, ``lib.rs::f#cfg(not(unix))``. A call may
   mean any variant.
@@ -151,14 +153,115 @@ def erased_type(parameter: str) -> str:
     return "_".join(re.split(r"\.|::", w)[-1] for w in words) + marks
 
 
+# A Kotlin annotation's name, ``@StringRes`` or ``@param:Json``; its arguments
+# are skipped by bracket depth, since they may nest parentheses.
+_KOTLIN_ANNOTATION = re.compile(r"@[\w.:]+\s*")
+_OPENERS, _CLOSERS = "(<[{", ")>]}"
+
+
+def _depth_zero_split(text: str, separator: str) -> list[str]:
+    """*text* split on *separator* outside brackets; the ``>`` of ``->`` closes none."""
+    pieces: list[str] = []
+    depth = start = i = 0
+    while i < len(text):
+        at_arrow = text.startswith("->", i)
+        if depth == 0 and text.startswith(separator, i):
+            pieces.append(text[start:i])
+            i = start = i + len(separator)
+            continue
+        if at_arrow:
+            i += 2
+            continue
+        if text[i] in _OPENERS:
+            depth += 1
+        elif text[i] in _CLOSERS:
+            depth = max(0, depth - 1)
+        i += 1
+    pieces.append(text[start:])
+    return pieces
+
+
+def _strip_kotlin_annotations(text: str) -> str:
+    """*text* without its annotations, nested parentheses in their arguments included."""
+    out: list[str] = []
+    i = 0
+    while (found := _KOTLIN_ANNOTATION.search(text, i)) is not None:
+        out.append(text[i : found.start()])
+        i = found.end()
+        if text.startswith("(", i):
+            arguments = _depth_zero_split(text[i + 1 :], ")")
+            i += len(arguments[0]) + 2
+    out.append(text[i:])
+    return " ".join(out)
+
+
+def _kotlin_function_arity(written: str) -> int | None:
+    """``N`` of the ``FunctionN`` a Kotlin function type compiles to; None for another type.
+
+    ``Int.() -> Unit`` counts its receiver, and ``((Int) -> Unit)?`` its inner type.
+    """
+    arrow = _depth_zero_split(written, "->")
+    if len(arrow) < 2:
+        inner = written.rstrip("?").strip()
+        if inner.startswith("(") and inner.endswith(")"):
+            return _kotlin_function_arity(inner[1:-1].strip())
+        return None
+    left = arrow[0].strip()
+    if not left.endswith(")"):
+        return None
+    opened = _opening_paren(left)
+    params = [p for p in _depth_zero_split(left[opened + 1 : -1], ",") if p.strip()]
+    receiver = left[:opened].rstrip().endswith(".")
+    return len(params) + (1 if receiver else 0)
+
+
+def _opening_paren(text: str) -> int:
+    """The index of the ``(`` matching the ``)`` that ends *text*."""
+    depth = 0
+    for index in range(len(text) - 1, -1, -1):
+        if text[index] == ")":
+            depth += 1
+        elif text[index] == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return 0
+
+
+def kotlin_erased_type(parameter: str) -> str:
+    """``vararg xs: List<Int>`` -> ``List[]``, ``f: (Int) -> Unit`` -> ``Function1``.
+
+    A function type erases to the ``FunctionN`` class it compiles to, its
+    receiver counted, and a nullable mark stays, as ``erased_type`` keeps it.
+    """
+    head, *rest = _depth_zero_split(_strip_kotlin_annotations(parameter), ":")
+    written = _depth_zero_split(":".join(rest), "=")[0].strip()
+    arity = _kotlin_function_arity(written)
+    if arity is not None:
+        erased = f"Function{arity}"
+    else:
+        # ``->`` goes first: type-argument stripping reads its ``>`` as a closer.
+        written = strip_type_arguments(written.replace("->", " "))
+        words = _WORD.findall(written)
+        erased = words[-1].rpartition(".")[2] if words else ""
+        erased += "?" if written.endswith("?") else ""
+    return erased + ("[]" if "vararg" in head.split() else "")
+
+
 def erased_parameter_types(symbol: Symbol) -> list[str]:
     """``["String", "int[]"]``: each parameter's erased type, as an id spells it."""
-    return [erased_type(p) for p in signature_parameters(symbol.signature or "") or []]
+    erase = kotlin_erased_type if symbol.language == "kotlin" else erased_type
+    return [erase(p) for p in signature_parameters(symbol.signature or "") or []]
 
 
 def _parameter_types(symbol: Symbol) -> str:
-    """``(String,int[])``: the erased types that split a same-count overload."""
-    return "(" + ",".join(erased_parameter_types(symbol)) + ")"
+    """``(String,int[])``: the erased types that split a same-count overload.
+
+    A Kotlin extension's receiver comes first, which is what tells
+    ``Byte.toHexString()`` from ``Int.toHexString()``.
+    """
+    receiver = [symbol.written_receiver] if symbol.written_receiver else []
+    return "(" + ",".join(receiver + erased_parameter_types(symbol)) + ")"
 
 
 # Which discriminator tells colliding members apart, per language. A build
@@ -167,6 +270,7 @@ _DISCRIMINATORS: dict[str, Callable[[Symbol], str | None]] = {
     "java": _parameter_count,
     "csharp": _parameter_count,
     "cpp": _parameter_count,
+    "kotlin": _parameter_count,
 }
 
 # Languages where a type may share its name with a sibling of another arity.
@@ -301,6 +405,7 @@ __all__ = [
     "disambiguate_colliding_ids",
     "has_overload_identity",
     "id_segment_name",
+    "kotlin_erased_type",
     "outer_scope",
     "overload_sets",
     "pair_overloads",

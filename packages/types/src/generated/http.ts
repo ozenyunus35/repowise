@@ -367,6 +367,11 @@ export interface CallersCalleesResponse {
   relations?: SymbolRelationGroup[];
 }
 
+export interface ChangeAuthor {
+  name: string;
+  email: string;
+}
+
 /** The Kamei change-shape features the risk model scores. */
 export interface ChangeFeaturesResponse {
   la: number;
@@ -376,6 +381,85 @@ export interface ChangeFeaturesResponse {
   ns: number;
   entropy: number;
   exp: number | null;
+}
+
+export interface ChangeFile {
+  path: string;
+  added: number;
+  deleted: number;
+}
+
+/** Forge facts from a metadata source; ``None`` means unknown. */
+export interface ChangeForgeMetadata {
+  source?: string | null;
+  reviewers?: string[] | null;
+  approvals?: number | null;
+  labels?: string[] | null;
+  linked_issues?: string[] | null;
+}
+
+/** ``pr`` | ``change_id`` | ``merge`` | ``commit``, first that applies. */
+export interface ChangeIdentity {
+  kind: string;
+  value: string;
+}
+
+export interface ChangeListResponse {
+  items: ChangeSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+  attribution: boolean;
+}
+
+/** Three-state AI provenance over the change's commits, with its coverage. */
+export interface ChangeProvenance {
+  label: string;
+  agent_commits: number;
+  human_attested_commits: number;
+  unknown_commits: number;
+  coverage?: number | null;
+}
+
+export interface ChangeRecord {
+  schema_version: number;
+  id: string;
+  identity: ChangeIdentity;
+  shape: string;
+  forge: string;
+  forge_ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  head_sha: string;
+  author: ChangeAuthor;
+  commit_count: number;
+  files_changed: number;
+  lines_added: number;
+  lines_deleted: number;
+  category: string;
+  provenance?: ChangeProvenance | null;
+  commits: string[];
+  files: ChangeFile[];
+  metadata: ChangeForgeMetadata;
+}
+
+export interface ChangeSummary {
+  schema_version: number;
+  id: string;
+  identity: ChangeIdentity;
+  shape: string;
+  forge: string;
+  forge_ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  head_sha: string;
+  author: ChangeAuthor;
+  commit_count: number;
+  files_changed: number;
+  lines_added: number;
+  lines_deleted: number;
+  category: string;
+  provenance?: ChangeProvenance | null;
 }
 
 export interface ChangelogEntryModel {
@@ -437,6 +521,53 @@ export interface ChatRequest {
   context?: ChatPageContext | null;
 }
 
+export interface ChatSessionMessageRequest {
+  message: string;
+  idempotency_key?: string | null;
+  context?: ChatPageContext | null;
+  stream?: boolean;
+  provider?: string | null;
+  model?: string | null;
+}
+
+/** Open a session, or resume the one ``(namespace, external_ref)`` names. */
+export interface ChatSessionOpenRequest {
+  repo_id: string;
+  scope?: "repo" | "workspace";
+  namespace?: string;
+  external_ref?: string | null;
+  title?: string | null;
+  policy?: ChatSessionPolicyRequest | null;
+}
+
+/**
+ * Limits a caller asks for. Each may only narrow the server's default
+ * session policy; a wider value is refused.
+ */
+export interface ChatSessionPolicyRequest {
+  tool_allowlist?: string[] | null;
+  max_tool_loops?: number | null;
+  max_turns?: number | null;
+  max_output_tokens?: number | null;
+  max_turn_tokens?: number | null;
+  max_session_tokens?: number | null;
+  audience?: "engineer" | "business" | null;
+}
+
+export interface ChatSessionResponse {
+  id: string;
+  repository_id: string;
+  title: string;
+  scope: "repo" | "workspace";
+  namespace?: string | null;
+  external_ref?: string | null;
+  created?: boolean;
+  policy?: Record<string, unknown>;
+  turns?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
 /**
  * One composer chip. ``source`` lets a client rank a measured question
  * above the static tier it already ships.
@@ -453,6 +584,39 @@ export interface ChatSuggestion {
  */
 export interface ChatSuggestionsResponse {
   suggestions?: ChatSuggestion[];
+}
+
+export interface ChatToolTraceEntry {
+  name: string;
+  summary: string;
+  ok: boolean;
+  basis: string;
+  origin?: string | null;
+}
+
+export interface ChatTurnResultResponse {
+  conversation_id: string;
+  message_id?: string | null;
+  user_message_id?: string | null;
+  answer: string;
+  stop_reason: "answered" | "loop_cap" | "token_budget" | "turn_budget" | "refused" | "cancelled" | "error";
+  provider: string;
+  model: string;
+  citations?: Record<string, unknown>[];
+  cards?: Record<string, unknown>[];
+  views?: Record<string, unknown>[];
+  tool_trace?: ChatToolTraceEntry[];
+  follow_ups?: ChatSuggestion[];
+  usage?: ChatTurnUsage;
+  error?: string | null;
+  replayed?: boolean;
+}
+
+/** Null token counts mean the provider reported none. */
+export interface ChatTurnUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  model_calls?: number;
 }
 
 /**

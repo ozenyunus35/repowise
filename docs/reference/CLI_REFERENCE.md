@@ -38,7 +38,8 @@ Grouped by what you're trying to do, not alphabetically. `PATH` and flag details
 [`security`](#repowise-security) ·
 [`impacted-tests`](#repowise-impacted-tests-revspec) ·
 [`coverage`](#repowise-coverage) ·
-[`components`](#repowise-components)
+[`components`](#repowise-components) ·
+[`changes`](#repowise-changes)
 
 **Decisions**
 [`decision`](#repowise-decision)
@@ -1592,6 +1593,17 @@ repowise components list [--path PATH] [--format table|json]
 
 ---
 
+### `repowise changes`
+
+Merged changes read back from git at each index and update: one per first-parent commit, identified by the PR or MR number its message names, then a Gerrit `Change-Id`, then the merge or commit sha. A merge lands the commits its branch brought in, and rebase merges read as one change per commit. `show` takes an id (`pr-123`) or any commit sha the change landed, and prints the versioned JSON record or, with `--format in-toto`, an in-toto Statement v1 whose subjects are the commits.
+
+```bash
+repowise changes list [--path PATH] [--category C] [--shape merge|squash|commit] [--grep TEXT] [--limit N] [--offset N] [--format table|json]
+repowise changes show REF [--path PATH] [--format table|json|in-toto]
+```
+
+---
+
 ### `repowise distill <command>`
 
 Run a command and print a compact, reversible rendering of its output. Noise
@@ -2223,11 +2235,11 @@ does not know or list the commands. See [pluggable storage and capability seams]
 Inspect and clear AI attribution for a repository.
 
 ```bash
-repowise attribution status [PATH] [--format json]   # what is on, for which agents, coverage
-repowise attribution purge [PATH] [--yes]            # delete attribution derived into the local index
+repowise attribution status [PATH] [--format json]   # what is on, capture per agent, coverage
+repowise attribution purge [PATH] [--yes]            # delete derived attribution, captured edits and our notes
 ```
 
-`purge` leaves git history, trailers and notes in the repository as they are.
+`purge` deletes the index labels, the `.repowise/attribution/` sidecar and the git-ai notes Repowise wrote locally. Git history, trailers and notes written by anything else stay as they are.
 Settings live in the `attribution:` block of [CONFIG.md](CONFIG.md#the-attribution-block).
 
 ---

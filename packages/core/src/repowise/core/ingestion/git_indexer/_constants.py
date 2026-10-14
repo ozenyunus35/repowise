@@ -321,7 +321,8 @@ HOTSPOT_HALFLIFE_DAYS: float = 180.0
 #: forge bot accounts).
 #: v2: co-change records carry focused_frequency, the shared commits no wider
 #: than the change-entropy sweep cap.
-GIT_HISTORY_VERSION: int = 2
+#: v3: commits carry their category, and changes are rebuilt from history.
+GIT_HISTORY_VERSION: int = 3
 GIT_HISTORY_VERSION_KEY = "git_history_version"
 
 

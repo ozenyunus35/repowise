@@ -16,6 +16,7 @@
     "./c4": "./src/c4.ts",
     "./cache": "./src/cache.ts",
     "./cards": "./src/cards.ts",
+    "./changes": "./src/changes.ts",
     "./chat": "./src/chat.ts",
     "./code-health": "./src/code-health.ts",
     "./costs": "./src/costs.ts",

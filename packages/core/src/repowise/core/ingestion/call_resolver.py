@@ -195,9 +195,11 @@ _BOUND_CHAIN_LANGUAGES = frozenset({"java", "csharp", "typescript", "go"})
 
 def _overload_return_types(
     parsed_files: dict[str, ParsedFile],
-) -> dict[tuple[str, str | None, str, int | None], set[str]]:
-    """``{(path, parent, name, parameter count): normalised return types}``."""
-    found: dict[tuple[str, str | None, str, int | None], set[str]] = defaultdict(set)
+) -> dict[tuple[str, str | None, str | None, str, int | None], set[str]]:
+    """``{(path, parent, extension receiver, name, parameter count): normalised return types}``."""
+    found: dict[tuple[str, str | None, str | None, str, int | None], set[str]] = defaultdict(
+        set
+    )
     for path, parsed in parsed_files.items():
         for symbol in parsed.symbols:
             raw_return = declared_return_type(symbol.signature or "")
@@ -209,6 +211,7 @@ def _overload_return_types(
             key = (
                 path,
                 symbol.parent_name,
+                symbol.extension_receiver,
                 symbol.name,
                 signature_parameter_count(symbol.signature or ""),
             )
@@ -396,6 +399,18 @@ def _java_method_refusing(symbol: Symbol | None, argument_count: int | None) -> 
     if symbol is None or argument_count is None:
         return False
     return symbol.language == "java" and symbol.kind == "method" and not _takes(symbol, argument_count)
+
+
+def _kotlin_function_refusing(symbol: Symbol | None, argument_count: int | None) -> bool:
+    """Whether *symbol* is a Kotlin function whose parameters cannot take *argument_count*.
+
+    Never an ``override``: it inherits defaults its own list does not write.
+    """
+    if symbol is None or argument_count is None or symbol.language != "kotlin":
+        return False
+    if symbol.kind not in _FUNCTION_KINDS or "override" in symbol.modifiers:
+        return False
+    return not _takes(symbol, argument_count)
 
 
 def _takes(symbol: Symbol, argument_count: int) -> bool:
@@ -874,13 +889,14 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         """Record *parsed*'s overload sets; ``{member id: representative}``.
 
         Only parameter-count members are narrowed: a build-variant member
-        (``#cfg(...)``) is not chosen by its arguments.
+        (``#cfg(...)``) is not chosen by its arguments. Kotlin extensions of
+        different receivers are separate sets: the receiver chooses among them.
         """
-        members: dict[str, list[Symbol]] = defaultdict(list)
+        members: dict[tuple[str, str | None], list[Symbol]] = defaultdict(list)
         for sym in parsed.symbols:
             base, payload = split_symbol_id(sym.id)
             if payload is not None and payload[0].isdigit():
-                members[base].append(sym)
+                members[(base, sym.extension_receiver)].append(sym)
         representatives: dict[str, str] = {}
         for overloads in members.values():
             overloads.sort(key=lambda sym: sym.start_line)
@@ -1189,9 +1205,13 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
         calls the one-parameter ``getField`` a superclass declares. With no
         ancestor overload that takes the count, the edge goes: its callee
         cannot be what the call means, and a constructor inherits none. Java
-        only, where arity is binding.
+        only, where arity is binding. Kotlin binds arity too: a function that
+        cannot take the count (``item(key) { }`` against ``item(a, b, onClick)``)
+        names a library one, so the edge goes.
         """
         callee = self._symbols_by_id.get(resolved.callee_id)
+        if _kotlin_function_refusing(callee, call.argument_count):
+            return None
         if not _java_method_refusing(callee, call.argument_count):
             return resolved
         assert callee is not None

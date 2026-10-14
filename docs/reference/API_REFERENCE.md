@@ -504,6 +504,7 @@ one per router area; this table maps an area to the tag to open there.
 | Refactoring plans, opportunities, settings, code generation | `refactoring` | `routers/refactoring.py` |
 | Dead-code findings | `dead-code` | `routers/dead_code.py` |
 | Change risk, hotspots, ownership, commits, co-changes | `git` | `routers/git.py` |
+| Merged changes (Change Records) reconstructed from git | `changes` | `routers/changes.py` |
 | Structural coupling report | `coupling` | `routers/coupling.py` |
 | Blast radius for a change | `blast-radius` | `routers/blast_radius.py` |
 | Architectural decisions, lanes, lineage, policy settings | `decisions` | `routers/decisions.py` |

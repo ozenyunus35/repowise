@@ -1547,6 +1547,14 @@ async def persist_incremental_commits(
     # new capture never needs a re-index to become useful.
     with timed(timings, "persist.commits.offsets"):
         await reconcile_commit_offsets(session, repo_id, indexer)
+    with timed(timings, "persist.commits.changes"):
+        from repowise.core.changes.store import reconcile_categories, refresh_changes
+
+        await refresh_changes(session, repo_id, repo_path, rebuild=False)
+        try:
+            await reconcile_categories(session, repo_id)
+        except Exception as exc:
+            logger.debug("category_reconcile_failed", error=str(exc))
 
     # Refresh the repo-level whole-history totals so age / commit / contributor
     # counts keep growing between full re-indexes (#730). Cheap git calls, and

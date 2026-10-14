@@ -25,7 +25,7 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from ._constants import is_fix_commit
+from ._constants import classify_commit_category, is_fix_commit
 from .identity import author_identity_key
 
 # Commit subjects are a headline (`%s`); cap defensively against a pathological
@@ -132,6 +132,7 @@ def build_commit_rows(parsed_commits: list[dict]) -> list[dict]:
                 "agent_confidence": c.get("agent_confidence"),
                 "agent_model_id": c.get("agent_model_id"),
                 "attribution": c.get("attribution"),
+                "category": classify_commit_category(subject),
             }
         )
     return rows

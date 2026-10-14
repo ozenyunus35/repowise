@@ -1845,6 +1845,8 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     if commit_file_rows:
         await upsert_git_commit_files_bulk(session, repo_id, commit_file_rows)
     await clear_attribution_if_disabled(session, repo_id)
+    if summary is not None:
+        await _rebuild_changes(session, repo_id)
 
     # Per fix-commit x file rows (with their SZZ candidates). The prune keeps a
     # re-index of an already-indexed repo from leaving behind events that have
@@ -1886,6 +1888,20 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
             total_lines_deleted=totals.total_lines_deleted,
             churn_anchor_sha=getattr(totals, "churn_anchor_sha", None),
         )
+
+
+async def _rebuild_changes(session: Any, repo_id: str) -> None:
+    """Change records from the same history, after the commit labels they read."""
+    from repowise.core.changes.store import refresh_changes
+    from repowise.core.persistence.models import Repository
+
+    try:
+        repo = await session.get(Repository, repo_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("changes_repo_lookup_failed", repo_id=repo_id, error=str(exc))
+        return
+    if repo is not None and repo.local_path:
+        await refresh_changes(session, repo_id, repo.local_path, rebuild=True)
 
 
 async def replace_git_history(

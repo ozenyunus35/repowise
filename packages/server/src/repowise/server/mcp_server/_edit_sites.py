@@ -15,6 +15,7 @@ import json
 import os
 import re
 from collections import Counter
+from collections.abc import Iterable
 from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -30,7 +31,7 @@ from repowise.core.test_paths import is_test_related_path
 from repowise.server.mcp_server._budget import OmissionCollector, cap_collection
 from repowise.server.mcp_server._helpers import read_repo_file_text
 from repowise.server.mcp_server._meta import _working_tree_dirty_paths, uncommitted_targets
-from repowise.server.mcp_server._verify import relocate_symbol
+from repowise.server.mcp_server._verify import _MIN_GATE_NAME_LEN, name_at_line, relocate_symbol
 
 MAX_SITES = 200
 MAX_TEXT_CHARS = 160
@@ -74,6 +75,20 @@ _CALL_AFTER = re.compile(r"\s*(?:\?\.)?\(")
 # ``new name`` and a JSX tag.
 _LOCAL_USE_AFTER = re.compile(r"\s*(?:\(|\?\.|\.(?!\.))")
 _LOCAL_USE_BEFORE = re.compile(r"(?:\bnew\s+|</?)$")
+# The call forms of the indexed languages, so a line that only mentions a
+# callee (prose, a field, a type) is not served as its call. Brackets or type
+# arguments after it (``f(``, ``f?.(``, ``f!(``, ``f[``, ``f {``, ``f<T>(``), a
+# reference, decorator or Lisp form before it (``T::f``, ``@f``, ``(f``), or a
+# bracketless command call at the head of an expression (``run "$x"``).
+_CALL_FORM_AFTER = re.compile(r"\s*(?:\?\.|[?!])?\s*[(\[{]|(?:::)?<")
+_CALL_FORM_BEFORE = re.compile(r"(?:::|[@(])$")
+# Ceiling: a bracketless call on a receiver (Ruby ``obj.foo arg``) is not read
+# as a call, so its call line is dropped; widen here if that gap shows up.
+_COMMAND_HEAD = re.compile(
+    r"(?:^|[=;&|,>!`]|\$\(|\b(?:if|then|do|else|elif|while|until|return|exec|perform))\s*$",
+    re.IGNORECASE,
+)
+_COMMAND_ARGS = re.compile(r"\s+[^\s=:;,.)\]}|&<>+*/%-]|\s*[;.]?\s*$")
 
 
 def _bare_name(node: GraphNode) -> str:
@@ -155,58 +170,110 @@ def _renames(
     return aliases, aliases & imported
 
 
+def _calls(text: str, name: str) -> bool:
+    """Whether *text* uses *name* in one of the call forms above."""
+    return any(
+        _CALL_FORM_AFTER.match(text, m.end())
+        or _CALL_FORM_BEFORE.search(text, 0, m.start())
+        or _LOCAL_USE_BEFORE.search(text, 0, m.start())
+        or (_COMMAND_HEAD.search(text, 0, m.start()) and _COMMAND_ARGS.match(text, m.end()))
+        for m in _word(name).finditer(text)
+    )
+
+
 def _call_texts(
-    root: Path, wanted: dict[str, set[tuple[int, str]]]
-) -> dict[tuple[str, int, str], str]:
-    """``(file, line, name) -> text`` for each line that still names *name* or its import alias."""
+    root: Path,
+    wanted: dict[str, set[tuple[int, str]]],
+    defs: dict[str, set[tuple[int, str]]],
+) -> tuple[dict[tuple[str, int, str], str], set[tuple[str, int, str]]]:
+    """``(file, line, name) -> text`` for each line that still calls *name* or its
+    import alias, and the *defs* ``(file, line, name)`` whose live line no longer
+    defines *name*. A file that cannot be read answers neither."""
     out: dict[tuple[str, int, str], str] = {}
-    for rel, asks in wanted.items():
+    moved: set[tuple[str, int, str]] = set()
+    for rel in wanted.keys() | defs.keys():
         lines = _read_lines(root, rel)
         if lines is None:
             continue
+        moved.update(
+            (rel, n, name) for n, name in defs.get(rel, ()) if not name_at_line(lines, name, n)
+        )
         imports: set[int] | None = None
-        for n, name in asks:
+        for n, name in wanted.get(rel, ()):
             if not 0 < n <= len(lines):
                 continue
             text = lines[n - 1]
-            if not _word(name).search(text):
+            if not _calls(text, name):
                 if imports is None:
                     imports = _import_lines(lines)
                 python = Path(rel).suffix in _PYTHON_EXTENSIONS
                 _, local = _renames(lines, name, imports, python)
-                if not any(_word(a).search(text) for a in local):
+                if not any(_calls(text, a) for a in local):
                     continue
             out[(rel, n, name)] = text.strip()[:MAX_TEXT_CHARS]
-    return out
+    return out, moved
 
 
 def _leaf(symbol_id: str) -> str:
     return id_segment_name(symbol_id.split("::")[-1].split(".")[-1])
 
 
+def _row_checks(
+    rows: list[dict[str, Any]], callee_id: str | None
+) -> tuple[dict[int, tuple[str, int, str]], dict[int, tuple[str, int, str]]]:
+    """Per row index, ``(file, call_line, callee)`` and ``(file, line, caller)`` to check live."""
+    asks: dict[int, tuple[str, int, str]] = {}
+    defs: dict[int, tuple[str, int, str]] = {}
+    for i, row in enumerate(rows):
+        if not row.get("file"):
+            continue
+        callee = row.get("via_wrapper") or row.get("target") or callee_id
+        if row.get("call_line") and callee:
+            asks[i] = (row["file"], row["call_line"], _leaf(callee))
+        caller = row.get("symbol_id") or row.get("caller") or ""
+        # A name too short to tell apart on a line is left unchecked, as in get_symbol.
+        name = _leaf(caller) if "::" in caller else ""
+        if row.get("line") and len(name) >= _MIN_GATE_NAME_LEN:
+            defs[i] = (row["file"], row["line"], name)
+    return asks, defs
+
+
+def _by_file(keys: Iterable[tuple[str, int, str]]) -> dict[str, set[tuple[int, str]]]:
+    out: dict[str, set[tuple[int, str]]] = {}
+    for rel, n, name in keys:
+        out.setdefault(rel, set()).add((n, name))
+    return out
+
+
 async def attach_call_text(
     repo_root: str | Path | None, rows: list[dict[str, Any]], callee_id: str | None = None
 ) -> None:
-    """Add ``text``, the live source at ``call_line``, where that line still names the callee.
+    """Add ``text``, the live source at ``call_line``, where that line still calls the callee.
 
     The callee is the row's ``via_wrapper``, else its ``target``, else
-    *callee_id*. A line that no longer names it (the file moved under the
+    *callee_id*. A line that no longer calls it (the file moved under the
     index), or a file that cannot be read, loses ``call_line`` too, so no
-    stale line is served. One read per distinct file, off the event loop.
+    stale line is served. The caller's definition ``line`` is checked the
+    same way: when the live line no longer defines the caller the row loses
+    ``line`` and ``call_line``. One read per distinct file, off the event loop.
     """
-    asks: dict[int, tuple[str, int, str]] = {}
-    for i, row in enumerate(rows):
-        callee = row.get("via_wrapper") or row.get("target") or callee_id
-        if row.get("call_line") and row.get("file") and callee:
-            asks[i] = (row["file"], row["call_line"], _leaf(callee))
-    if not asks:
+    asks, defs = _row_checks(rows, callee_id)
+    if not asks and not defs:
         return
     texts: dict[tuple[str, int, str], str] = {}
+    moved: set[tuple[str, int, str]] = set()
     if repo_root:
-        wanted: dict[str, set[tuple[int, str]]] = {}
-        for rel, n, name in asks.values():
-            wanted.setdefault(rel, set()).add((n, name))
-        texts = await asyncio.to_thread(_call_texts, Path(repo_root).resolve(), wanted)
+        texts, moved = await asyncio.to_thread(
+            _call_texts,
+            Path(repo_root).resolve(),
+            _by_file(asks.values()),
+            _by_file(defs.values()),
+        )
+    for i, key in defs.items():
+        if key in moved:
+            rows[i].pop("line", None)
+            asks.pop(i, None)
+            rows[i].pop("call_line", None)
     for i, key in asks.items():
         if text := texts.get(key):
             rows[i]["text"] = text
