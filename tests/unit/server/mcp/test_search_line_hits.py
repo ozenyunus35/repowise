@@ -703,3 +703,43 @@ def test_token_nowhere_in_the_repo_is_complete_and_empty(scan_repo):
 @pytest.mark.parametrize("needle", ["a\nb", "a\0b", "-e", "café"])
 def test_needles_git_cannot_take_as_one_argument_use_the_python_scan(scan_repo, needle):
     assert _line_hits._files_holding(scan_repo, needle) is None
+
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("@pytest.mark.anyio", ("@pytest.mark.anyio", False)),
+        ("def send(", ("def send(", False)),
+        ('copy_with(path="/echo_headers")', ('copy_with(path="/echo_headers")', False)),
+        ('@GetMapping("/owners/{ownerId}")', ('@GetMapping("/owners/{ownerId}")', False)),
+        ("copy_with", ("copy_with", True)),
+        ('"x y"', ("x y", False)),
+        ("Add (optional) support", None),
+        ("how does foo(x) work", None),
+        ("what is x=1?", None),
+        ("two words", None),
+    ],
+)
+def test_literal_reads_code_punctuation_as_a_substring(query, expected):
+    assert _line_hits._literal(query) == expected
+
+
+@pytest.mark.asyncio
+async def test_punctuated_literals_return_their_lines(tree):
+    (tree / "app" / "svc.py").write_text(
+        "@pytest.mark.anyio\nasync def test_x():\n    pass\n\nclass C:\n    def send(self):\n        pass\n",
+        encoding="utf-8",
+    )
+    git = ["git", "-C", str(tree), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "add", "app/svc.py"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "svc"], check=True)
+
+    deco = await search_codebase("@pytest.mark.anyio")
+    assert [(r["path"], r["line"]) for r in deco["lines"]] == [("app/svc.py", 1)]
+
+    head = await search_codebase("def send(")
+    assert [(r["path"], r["line"]) for r in head["lines"]] == [("app/svc.py", 6)]
+
+    # An identifier inside the literal (``backend_of``) does not turn it into a symbol query.
+    call = await search_codebase("backend_of('m')")
+    assert [(r["path"], r["line"]) for r in call["lines"]] == [("app/widget.py", 6)]

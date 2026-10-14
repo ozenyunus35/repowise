@@ -190,6 +190,7 @@ def find_extractions(
     def_lines, use_lines = _var_lines(analysis.def_use)
     import_reads = _import_reads(analysis)
     declared_first = _declared_before_read(analysis.def_use)
+    valueless = _valueless_lines(analysis.def_use)
     # Built on the first span that clears the cheap gates.
     reads: dict[str, list[tuple[int, frozenset[int]]]] | None = None
     hoisted = _hoisted_bindings(def_lines, use_lines)
@@ -215,6 +216,7 @@ def find_extractions(
     for block, loop in all_blocks(fn_node, lmap.block_kinds, scope_kinds, lmap.loop_kinds):
         stmts = block.named_children
         n = len(stmts)
+        resources = _scoped_resource_indexes(stmts, lmap)
         is_body = block.id == body_container.id
         keeps_tail = tail_stmt_kinds is not None and _tail_is_block_value(
             stmts, tail_stmt_kinds, fn_node, lmap
@@ -251,7 +253,7 @@ def find_extractions(
                 if reads is None:
                     reads = _reads_observing(analysis, def_lines)
                 params, returns = _infer_in_out(
-                    def_lines, use_lines, s, e, declared_first, reads=reads
+                    def_lines, use_lines, s, e, declared_first, reads=reads, valueless=valueless
                 )
                 if len(params) > _MAX_PARAMS or len(returns) > _MAX_RETURNS:
                     continue
@@ -262,6 +264,8 @@ def find_extractions(
                 if _bindings_escape(
                     s, e, returns, decl_lines, def_lines, use_lines, declared_first, outer
                 ):
+                    continue
+                if _disposes_early(resources, i, j, pre.code):
                     continue
                 if pre.nested[j + 1] > pre.nested[i]:
                     continue
@@ -291,6 +295,27 @@ def find_extractions(
                     )
                 )
     return _sorted(out)
+
+
+def _scoped_resource_indexes(stmts: list[Node], lmap: LanguageNodeMap) -> list[int]:
+    """Positions in *stmts* of declarations whose resource the block disposes
+    at its end (``scoped_resource_decl_kinds``)."""
+    if not lmap.scoped_resource_decl_kinds:
+        return []
+    return [
+        k
+        for k, st in enumerate(stmts)
+        if st.type in lmap.scoped_resource_decl_kinds
+        and any(not c.is_named and c.type in lmap.scoped_resource_decl_tokens for c in st.children)
+    ]
+
+
+def _disposes_early(resources: list[int], i: int, j: int, code: list[int]) -> bool:
+    """Whether statements ``i..j`` hold a declaration from *resources* while code
+    after them still runs in the block (*code* is the block's code-line prefix
+    sum). A helper would dispose the resource when it returns, before that code
+    runs, where the original disposes it at the end of the block."""
+    return code[-1] > code[j + 1] and any(i <= k <= j for k in resources)
 
 
 @dataclass(frozen=True)
@@ -642,6 +667,18 @@ def _declared_before_read(def_use: FunctionDefUse) -> dict[str, frozenset[int]]:
     return {var: frozenset(lines) for var, lines in declared.items()}
 
 
+def _valueless_lines(def_use: FunctionDefUse) -> dict[str, frozenset[int]]:
+    """Per variable, the lines whose only definitions of it are declarations
+    that give it no value (``Definition.valueless``): Java's ``List<T> xs;``,
+    TypeScript's ``let x: T;``. A line that also assigns the name
+    (``int x; x = 1;``) is not one: what a read sees from it is the value."""
+    bare: dict[str, set[int]] = defaultdict(set)
+    valued: dict[str, set[int]] = defaultdict(set)
+    for d in def_use.definitions:
+        (bare if d.valueless else valued)[d.var].add(d.line)
+    return {var: frozenset(at - valued[var]) for var, at in bare.items()}
+
+
 def _reads_observing(
     analysis: FunctionAnalysis, def_lines: dict[str, list[int]]
 ) -> dict[str, list[tuple[int, frozenset[int]]]]:
@@ -702,6 +739,7 @@ def _infer_in_out(
     declared_first: dict[str, frozenset[int]],
     *,
     reads: dict[str, list[tuple[int, frozenset[int]]]],
+    valueless: dict[str, frozenset[int]] | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Infer IN (parameters) and OUT (return) variables for span ``[s, e]``.
 
@@ -709,12 +747,18 @@ def _infer_in_out(
     an in-span write, and which has a definition before the span (a parameter or
     an earlier assignment). A write on the same line as that read precedes it
     only where *declared_first* (:func:`_declared_before_read`) says the line
-    declares the name first. OUT: a variable written in the span with a read
-    after it that may observe one of those writes (*reads*,
-    :func:`_reads_observing`). A read before the span that a write in it
-    reaches around a loop is not an OUT: :func:`_loop_carry_free` refuses
-    those spans. Both line lists are sorted (:func:`_var_lines`), so the
-    span tests are bisects.
+    declares the name first. An earlier in-span write covers a later read only
+    on the paths that run it, so a variable is also IN when some in-span read
+    of it may still observe a definition from before the span (*reads*,
+    :func:`_reads_observing`): the write sits under an ``if``, in a loop
+    body, or in an arm. A declaration that gives the name no value
+    (*valueless*, :func:`_valueless_lines`) is not such a definition: the
+    compiler has proved the read assigned where the may-analysis cannot, and
+    a call that passed the name would not compile. OUT: a variable written in
+    the span with a read after it that may observe one of those writes
+    (*reads* again). A read before the span that a write in it reaches around
+    a loop is not an OUT: :func:`_loop_carry_free` refuses those spans. Both
+    line lists are sorted (:func:`_var_lines`), so the span tests are bisects.
     """
     params: list[str] = []
     returns: list[str] = []
@@ -726,8 +770,15 @@ def _infer_in_out(
 
         if u_lo < u_hi and d_lo > 0:
             first_use = ul[u_lo]
-            declared = first_use in declared_first.get(var, ())
-            if not declared and not (d_lo < d_hi and dl[d_lo] < first_use):
+            declaring = declared_first.get(var, ())
+            bare = valueless.get(var, ()) if valueless else ()
+            uncovered = first_use not in declaring and not (d_lo < d_hi and dl[d_lo] < first_use)
+            if uncovered or any(
+                s <= ln <= e
+                and ln not in declaring
+                and any(d < s and d not in bare for d in seen)
+                for ln, seen in reads.get(var, ())
+            ):
                 params.append(var)
 
         if d_lo < d_hi and any(

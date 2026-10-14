@@ -134,19 +134,34 @@ def _build_best_guesses(hits: list[dict]) -> list[dict]:
     Lets the agent pick ONE file to verify on an ambiguous retrieval. ``file``
     goes through ``hit_file_path`` and unresolvable hits are skipped, since a
     spotlight or module page's ``target_path`` is not an openable file.
+
+    One row per file: a symbol page resolves to the same file as its file
+    page, so a later hit for a file already listed is skipped and the slot
+    goes to the next distinct file. This is the same per-file dedupe as
+    ``serialize_candidate_file_facts``, with this list's own cap. The loop
+    deliberately walks past the first ``_GATED_RETURN_HITS`` hits, so a
+    skipped repeat is replaced rather than leaving the list short.
     """
-    return [
-        {
-            "file": hit_file_path(h),
-            "why_relevant": _candidate_justification(h),
-            "score": round(h.get("score", 0.0), 3),
-            # Absent rather than null: most rows carry no penalty.
-            **({"domain_penalty": h["_domain_penalty"]} if h.get("_domain_penalty") else {}),
-            **({"excerpt": h["excerpt"]} if h.get("excerpt") else {}),
-        }
-        for h in hits[:_GATED_RETURN_HITS]
-        if hit_file_path(h)
-    ]
+    guesses: list[dict] = []
+    seen: set[str] = set()
+    for h in hits:
+        path = hit_file_path(h)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        guesses.append(
+            {
+                "file": path,
+                "why_relevant": _candidate_justification(h),
+                "score": round(h.get("score", 0.0), 3),
+                # Absent rather than null: most rows carry no penalty.
+                **({"domain_penalty": h["_domain_penalty"]} if h.get("_domain_penalty") else {}),
+                **({"excerpt": h["excerpt"]} if h.get("excerpt") else {}),
+            }
+        )
+        if len(guesses) >= _GATED_RETURN_HITS:
+            break
+    return guesses
 
 
 def _with_candidates(payload: dict, resolved_pool: list[dict]) -> dict:

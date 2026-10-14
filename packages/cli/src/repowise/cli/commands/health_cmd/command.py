@@ -340,7 +340,7 @@ def health_command(
             suggestions = [s for s in suggestions if s.file_path.startswith(module_filter)]
         # Attaches the same batched validation block the read surfaces emit;
         # code generation remains explicitly requested and never auto-applies.
-        _load_recommendations(repo_path, suggestions, metrics_sorted)
+        _load_recommendations(repo_path, suggestions, metrics_sorted, findings)
         _generate_refactoring_code(repo_path, suggestions, generate_code, fmt=fmt)
         return
 
@@ -350,7 +350,7 @@ def health_command(
             suggestions = [s for s in suggestions if s.file_path == file_filter]
         if module_filter:
             suggestions = [s for s in suggestions if s.file_path.startswith(module_filter)]
-        recommendations = _load_recommendations(repo_path, suggestions, metrics_sorted)
+        recommendations = _load_recommendations(repo_path, suggestions, metrics_sorted, findings)
         _render_refactoring_targets(metrics_sorted, findings, recommendations, fmt=fmt)
         return
 

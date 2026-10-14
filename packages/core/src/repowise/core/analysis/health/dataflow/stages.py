@@ -68,6 +68,7 @@ from .slice import (
     _declaration_escapes,
     _declaration_lines,
     _declared_before_read,
+    _disposes_early,
     _function_lines,
     _hoisted_bindings,
     _identifiers,
@@ -77,8 +78,10 @@ from .slice import (
     _reads_observing,
     _receiver_facts,
     _scan_for,
+    _scoped_resource_indexes,
     _stmt_assigns,
     _unwrap_container,
+    _valueless_lines,
     _var_lines,
 )
 from .span import exiting_guard, is_comment, section_heads
@@ -320,6 +323,7 @@ class _FunctionFacts:
         def_use = analysis.def_use
         self.def_lines, self.use_lines = _var_lines(def_use)
         self.declared_first = _declared_before_read(def_use)
+        self.valueless = _valueless_lines(def_use)
         self.hoisted = _hoisted_bindings(self.def_lines, self.use_lines)
         self.decl_lines = _declaration_lines(def_use)
         self.shared = _closure_state(def_use, self.def_lines, self.use_lines)
@@ -354,6 +358,7 @@ class _Cutter:
         self.max_returns = max_returns
         self.def_lines, self.use_lines = facts.def_lines, facts.use_lines
         self.declared_first = facts.declared_first
+        self.valueless = facts.valueless
         self.hoisted = facts.hoisted
         self.decl_lines = facts.decl_lines
         self.shared = facts.shared
@@ -375,6 +380,7 @@ class _Cutter:
         # helper instead, and a value carried to the next iteration must come
         # back out of the stage that writes it.
         self.escapes = [escapes(st, lmap) for st in code] if loops else [False] * len(code)
+        self.resources = _scoped_resource_indexes(code, lmap)
         self.carried = carried(facts.analysis, loops, facts.def_lines) if loops else frozenset()
 
     def _sum(self, series: list[int], i: int, j: int) -> int:
@@ -432,7 +438,13 @@ class _Cutter:
         if any(s <= ln <= e for v in self.rereads for ln in self.def_lines.get(v, ())):
             return None
         params, returns = _infer_in_out(
-            self.def_lines, self.use_lines, s, e, self.declared_first, reads=self.reads
+            self.def_lines,
+            self.use_lines,
+            s,
+            e,
+            self.declared_first,
+            reads=self.reads,
+            valueless=self.valueless,
         )
         returns = self._own_bindings_dropped(span, s, e, returns)
         if self.carried:
@@ -474,6 +486,8 @@ class _Cutter:
         if self._sum(pre.exits, i, j) or self._sum(pre.nested, i, j):
             return False
         if any(self.escapes[i : j + 1]):
+            return False
+        if _disposes_early(self.resources, i, j, pre.code):
             return False
         return not any((i <= a <= j) != (i <= b <= j) for a, b in self.timer_pairs)
 

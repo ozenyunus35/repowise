@@ -14,7 +14,7 @@ Two readers share it: a wiki page's Public API section, and the per-symbol
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -397,8 +397,32 @@ def export_roots(parsed: Mapping[str, Any], entries: AbstractSet[str] = frozense
     return roots
 
 
+def _sibling_owner(
+    path: str,
+    parent_name: str,
+    out: Mapping[str, str],
+    roots: AbstractSet[str],
+    package_files: Mapping[str, Sequence[str]],
+) -> str | None:
+    """The export root of a type declared in another file of *path*'s package.
+
+    Go splits a type's methods across the package's files; the receiver type
+    is looked up in each sibling file. The method's own file is its root when
+    it is one, else the type's.
+    """
+    for sibling in package_files.get(path, ()):
+        if sibling == path:
+            continue
+        owner = out.get(f"{sibling}::{parent_name}")
+        if owner is not None:
+            return path if path in roots else owner
+    return None
+
+
 def public_symbols(
-    parsed: Mapping[str, Any], entries: AbstractSet[str] = frozenset()
+    parsed: Mapping[str, Any],
+    entries: AbstractSet[str] = frozenset(),
+    package_files: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, str]:
     """``{symbol id: the file that exports it}`` for every symbol consumers can import.
 
@@ -406,27 +430,37 @@ def public_symbols(
     ``__all__`` followed as for :func:`compute_public_api`); a public method
     of an exported class is exported with it. *entries* are the files a
     ``package.json`` ``exports`` map names (:func:`export_roots`).
+    *package_files* maps a Go file to the files of its package, so a method
+    declared apart from its receiver type is exported with that type.
     """
     resolver = _Resolver(parsed)
     out: dict[str, str] = {}
-    for root in export_roots(parsed, entries):
+    roots = export_roots(parsed, entries)
+    for root in roots:
         for _name, sym, declared_in in resolver.exported(root):
             if sym is not None and not parsed[declared_in].file_info.is_test:
                 out.setdefault(sym.id, root)
+    root_set = set(roots)
     for path, pf in parsed.items():
         for sym in pf.symbols:
             owner = out.get(f"{path}::{sym.parent_name}") if sym.parent_name else None
+            if owner is None and sym.parent_name and package_files:
+                owner = _sibling_owner(path, sym.parent_name, out, root_set, package_files)
             if owner is not None and sym.visibility == "public":
                 out.setdefault(sym.id, owner)
     return out
 
 
-def stamp_public_api(graph: Any, parsed: Mapping[str, Any]) -> None:
+def stamp_public_api(
+    graph: Any,
+    parsed: Mapping[str, Any],
+    package_files: Mapping[str, Sequence[str]] | None = None,
+) -> None:
     """Set ``public_api`` on every symbol node: the exporting file, or ``""``."""
     entries = {
         path for path in parsed if graph.nodes.get(path, {}).get("package_export")
     }
-    exported = public_symbols(parsed, entries)
+    exported = public_symbols(parsed, entries, package_files)
     for pf in parsed.values():
         for sym in pf.symbols:
             node = graph.nodes.get(sym.id)

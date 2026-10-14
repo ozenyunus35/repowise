@@ -17,8 +17,6 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal
 
-from .complexity.dispatch import DISPATCH_SHARE
-from .complexity.terminal import TERMINAL_SHARE
 from .rows import detail_map, field
 
 #: Problem-size cut points. Each is a multiple of the detector's own bar: CCN
@@ -172,12 +170,16 @@ def magnitude(shape: Mapping[str, int]) -> int:
 
 def dispatch_shaped(shape: Mapping[str, int]) -> bool:
     """Most of the function's branching is one dispatch on one value."""
+    from .complexity.dispatch import DISPATCH_SHARE
+
     return shape.get("dispatch_pct", 0) >= DISPATCH_SHARE * 100
 
 
 def terminal_shaped(shape: Mapping[str, int]) -> bool:
     """The function is a print or prompt flow: a status report, a checklist,
     a setup wizard, whose branches choose what to show."""
+    from .complexity.terminal import TERMINAL_SHARE
+
     return shape.get("terminal_pct", 0) >= TERMINAL_SHARE * 100
 
 

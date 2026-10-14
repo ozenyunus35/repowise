@@ -1195,6 +1195,51 @@ class TestExactMatchSignal:
         assert seen == ["AuthService"]
 
     @pytest.mark.asyncio
+    async def test_hybrid_without_identifier_scores_symbols_on_content_words(
+        self, setup_mcp, monkeypatch
+    ):
+        # Regression for #3593: with no identifier in the question the scorer
+        # got the raw prose, so "on" matched test_basic_auth_on_session.
+        from repowise.server.mcp_server import search_codebase, tool_search
+
+        seen: list[str] = []
+        real = tool_search.search_symbols_single
+
+        async def spy(ctx, query, limit, **kwargs):
+            seen.append(query)
+            return await real(ctx, query, limit, **kwargs)
+
+        monkeypatch.setattr(tool_search, "search_symbols_single", spy)
+
+        await search_codebase("retry on connection failure", mode="hybrid")
+        assert seen, "symbol scorer was not called"
+        assert "on" not in seen[0].split(), seen
+        assert {"retry", "connection", "failure"} <= set(seen[0].split()), seen
+
+    @pytest.mark.asyncio
+    async def test_hybrid_stopword_does_not_outrank_the_content_match(self, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        await _seed_symbol("test_basic_auth_on_session")
+        await _seed_symbol("RetryTransport")
+
+        result = await search_codebase("retry on connection failure", mode="hybrid", limit=10)
+        names = [r.get("name") for r in result["results"] if r.get("type") == "symbol"]
+        assert "RetryTransport" in names, names
+        if "test_basic_auth_on_session" in names:
+            assert names.index("RetryTransport") < names.index("test_basic_auth_on_session")
+
+    @pytest.mark.asyncio
+    async def test_symbol_mode_still_matches_stopword_identifiers(self, setup_mcp):
+        from repowise.server.mcp_server import search_codebase
+
+        await _seed_symbol("get_on_change")
+
+        result = await search_codebase("get_on_change", mode="symbol")
+        names = [r.get("name") for r in result["results"]]
+        assert "get_on_change" in names, names
+
+    @pytest.mark.asyncio
     async def test_exact_hit_sets_true_and_no_fuzzy_note(self, setup_mcp):
         from repowise.server.mcp_server import search_codebase
 

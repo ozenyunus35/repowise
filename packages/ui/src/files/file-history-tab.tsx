@@ -7,7 +7,13 @@ import { ProportionBar } from "../shared/proportion-bar";
 import { ChangeHistoryCard } from "../git/change-history-card";
 import { StatRibbon, type RibbonStat } from "../stats/stat-ribbon";
 import { summarizeFixHistory } from "../lib/fix-history";
-import { formatAgeDays, formatNumber, formatRelativeTime, truncatePath } from "../lib/format";
+import {
+  formatAgeDays,
+  formatNumber,
+  formatRelativeTime,
+  ordinal,
+  truncatePath,
+} from "../lib/format";
 import type { FileDetailGit } from "@repowise-dev/types/files";
 import { FileSection, Fig } from "./file-section";
 import { FileMark } from "./file-marks";
@@ -71,7 +77,7 @@ export function FileHistoryTab({
     { label: "Bus factor", value: formatNumber(git.bus_factor) },
   ];
   if (git.churn_percentile != null) {
-    stats.push({ label: "Churn", value: `${Math.round(git.churn_percentile)}th pct` });
+    stats.push({ label: "Churn", value: `${ordinal(Math.round(git.churn_percentile))} pct` });
   }
 
   return (

@@ -429,6 +429,45 @@ def _key_unused(hit: PerfHit) -> bool:
     return hit.loop is not None and hit.loop.key_unused
 
 
+def _without_unused_key(facts: LoopFacts | None) -> LoopFacts | None:
+    """Clear ``key_unused``; drop the line when that leaves the default facts.
+
+    ``loop_facts`` returns ``None`` for an all-default ``LoopFacts``. A keyed
+    call whose own facts are that default still has to clear a key-free sibling
+    on the same line, and the line must not keep a default record afterwards.
+    """
+    if facts is None:
+        return None
+    if facts.key_unused:
+        facts = replace(facts, key_unused=False)
+    return None if facts == LoopFacts() else facts
+
+
+def _call_line_facts(
+    prev: LoopFacts | None,
+    facts: LoopFacts | None,
+    *,
+    this_keyed: bool,
+    line_keyed: bool,
+) -> LoopFacts | None:
+    """One ``LoopFacts`` per call line. Key-free only when every call on it is.
+
+    The same-line sink dedupe keeps the hit the loop key reaches. Here that
+    rule applies to helper calls: a keyed call (``_loop_key_feeds``) clears
+    ``key_unused`` whichever call is visited first. When the keyed call's own
+    facts are all default, the clear is applied to the facts already stored
+    for the line.
+    """
+    if this_keyed and facts is not None:
+        return facts
+    if line_keyed:
+        # A keyed call already stored non-default facts with the key in use.
+        if not this_keyed and prev is not None and not prev.key_unused:
+            return prev
+        return _without_unused_key(facts if facts is not None else prev)
+    return facts if facts is not None else prev
+
+
 def _overrides(dialect: BasePerfDialect, hook: str) -> bool:
     return getattr(type(dialect), hook) is not getattr(BasePerfDialectClass, hook)
 
@@ -619,6 +658,10 @@ def _collect_perf_hits(
     ] = {}
     # func_start -> {call_line: facts} for the loop-call targets above.
     call_facts: dict[int, dict[int, LoopFacts]] = {}
+    # func_start -> call lines where some helper call is fed by the loop key.
+    # A keyed call can have all-default facts (``loop_facts`` returns None) and
+    # still has to clear ``key_unused`` written by a key-free call on the line.
+    keyed_lines: dict[int, set[int]] = {}
     # func_start -> {call_line: loop header line} for the same targets.
     call_loop_lines: dict[int, dict[int, int]] = {}
     # ``(first_line, last_line, name)`` of each lambda with no named function
@@ -884,8 +927,29 @@ def _collect_perf_hits(
                             if loop_line:
                                 call_loop_lines.setdefault(next_start, {})[line] = loop_line
                             facts = loop_facts(call_node, sink=False, per_call=True)
-                            if facts is not None:
-                                call_facts.setdefault(next_start, {})[line] = facts
+                            # Same innermost loop ``loop_facts`` just read. A
+                            # keyed call clears ``key_unused`` for the whole
+                            # line, even when its own facts are all default.
+                            loops = _enclosing_loops(
+                                call_node, dialect, loop_kinds, fn_kinds, do_block_loop
+                            )
+                            this_keyed = bool(loops) and _loop_key_feeds(call_node, loops[0])
+                            if this_keyed:
+                                keyed_lines.setdefault(next_start, set()).add(line)
+                            merged = _call_line_facts(
+                                call_facts.get(next_start, {}).get(line),
+                                facts,
+                                this_keyed=this_keyed,
+                                line_keyed=line in keyed_lines.get(next_start, ()),
+                            )
+                            bucket = call_facts.get(next_start)
+                            if merged is None:
+                                if bucket is not None:
+                                    bucket.pop(line, None)
+                            elif bucket is None:
+                                call_facts[next_start] = {line: merged}
+                            else:
+                                bucket[line] = merged
                 if do_lock_io and lock_depth >= 1 and method:
                     # A non-sink call under a held lock: a candidate entry for the
                     # cross-function ``blocking_io_under_lock`` reachability pass.

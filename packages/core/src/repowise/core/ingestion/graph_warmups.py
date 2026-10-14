@@ -492,8 +492,13 @@ def _warmup_go(ctx: ResolverContext) -> None:
     is semantic, not filename-based — ``cmd/task/task.go`` is as much a
     binary entry as ``cmd/release/main.go``, so the traverser's stem
     heuristic alone misses real binaries.
+
+    Also stamps ``package_export`` on every file of each package a consumer
+    outside the repo can import (:func:`exported_go_files`), the way the
+    TypeScript warmup does for a ``package.json``'s published files, for the
+    per-symbol public API flag (``analysis.public_api``).
     """
-    from .resolvers.go_workspace import get_or_build_go_index
+    from .resolvers.go_workspace import exported_go_files, get_or_build_go_index
 
     index = get_or_build_go_index(ctx)
     graph = getattr(ctx, "graph", None)
@@ -501,6 +506,12 @@ def _warmup_go(ctx: ResolverContext) -> None:
     for pkg in index.packages.values():
         for path in pkg.main_files:
             _stamp_entry(graph, parsed, path)
+    if graph is None:
+        return
+    for path in exported_go_files(index):
+        node = graph.nodes.get(path)
+        if node is not None:
+            node["package_export"] = True
 
 
 def _warmup_typescript(ctx: ResolverContext) -> None:

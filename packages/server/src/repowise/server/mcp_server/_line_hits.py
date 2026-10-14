@@ -49,6 +49,7 @@ from repowise.server.mcp_server._helpers import (
 )
 from repowise.server.mcp_server._meta import served_root
 from repowise.server.mcp_server._query_shape import (
+    _NL_QUESTION_TOKENS,
     _canonical_symbol_query,
     _identifier_candidates,
     _qual_norm,
@@ -80,17 +81,33 @@ _KIND_ORDER = {"definition": 0, "import": 1, "call": 2, "reference": 3, "match":
 _MIXED_KIND_ORDER = {"definition": 0, "call": 1, "import": 2, "reference": 3, "match": 3}
 _QUOTED = re.compile(r"""^(["'`])(.+)\1$""")
 _TOKEN = re.compile(r"^[A-Za-z0-9_$][\w$.]*$")
+# Code punctuation: a leading decorator ``@``, an identifier glued to an opening
+# ``(`` or ``{`` (``send(``), or a glued ``=`` (``path="/x"``). Prose such as
+# ``Add (optional) support`` has a space before its parenthesis and matches none.
+_CODE_PUNCT = re.compile(r"^@\w|[\w)\]][({]|\S=\S")
 _DECL_WORDS = r"def|class|function|const|let|var|fn|func|type|interface|struct|enum"
 
 
 def _literal(query: str) -> tuple[str, bool] | None:
-    """``(needle, word_bounded)`` for a single-token query, else ``None``."""
+    """``(needle, word_bounded)`` for a single-token or code-shaped query, else ``None``."""
     q = query.strip()
     if m := _QUOTED.match(q):
         return m.group(2), False
     if len(q) >= 2 and _TOKEN.match(q) and not q.endswith("."):
         return q, True
+    if _is_code_shaped(q):
+        return q, False
     return None
+
+
+def _is_code_shaped(q: str) -> bool:
+    """A one-line, non-question query carrying code punctuation, scanned as-is."""
+    if len(q) < 3 or "\n" in q or q.endswith("?"):
+        return False
+    words = q.split()
+    if words[0].lower().rstrip(",.;:") in _NL_QUESTION_TOKENS:
+        return False
+    return _CODE_PUNCT.search(q) is not None
 
 
 def _definition_re(needle: str, word: bool) -> re.Pattern[str]:
@@ -406,6 +423,10 @@ async def _attach(
         return
     literal = _literal(query)
     candidates = _identifier_candidates(query, mode, names)
+    if literal and not literal[1] and not _QUOTED.match(query.strip()):
+        # Code punctuation names the text itself: an identifier inside it
+        # (``copy_with`` in ``copy_with(path="/x")``) is not the question.
+        candidates = []
     if not candidates and literal and literal[1]:
         candidates = [literal[0]]
     if not candidates and not literal:

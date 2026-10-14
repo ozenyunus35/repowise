@@ -25,6 +25,7 @@ from ..languages.python_modules import dotted_module_for
 from ..models import Import, ParsedFile, Symbol, combine_load_kinds
 from ..resolvers import ResolverContext, resolve_import
 from ..resolvers.go import read_go_module_path, read_go_modules
+from ..resolvers.go_workspace import cached_go_index, go_package_files
 from ..symbol_identity import has_overload_identity
 from ..type_ref_resolution import resolve_type_refs
 from ._edges import EdgesMixin
@@ -602,7 +603,12 @@ class GraphBuilder(MetricsMixin, ResolveMixin, EdgesMixin, SerializeMixin, Rehyd
 
         # Which symbols a package exports, read off the imports just resolved.
         try:
-            stamp_public_api(self._graph, self._parsed_files)
+            go_index = cached_go_index(ctx)
+            stamp_public_api(
+                self._graph,
+                self._parsed_files,
+                go_package_files(go_index) if go_index is not None else None,
+            )
         except Exception as exc:  # a reader bug must not fail the index
             log.warning("public_api_stamp_failed", error=str(exc))
 

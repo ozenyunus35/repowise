@@ -309,3 +309,66 @@ def test_kotlin_public_api_and_visibility(tmp_path: Path) -> None:
     assert flags.get("src/main/kotlin/a/Hidden.kt::HiddenObj", "") == ""
 
 
+_GO_REPO = {
+    "go.mod": "module example.com/lib\n\ngo 1.21\n",
+    "lib/client.go": (
+        "package lib\n\ntype Client struct{}\n\nfunc New() *Client { return &Client{} }\n\n"
+        "func helper() {}\n"
+    ),
+    "lib/send.go": (
+        "package lib\n\nfunc (c *Client) Send() error { return nil }\n\n"
+        "func (c *Client) retry() {}\n"
+    ),
+    "lib/internal/x/x.go": "package x\n\nfunc Hidden() {}\n",
+    "lib/x_test.go": "package lib\n\nfunc TestHelper() {}\n",
+    "cmd/tool/main.go": (
+        'package main\n\nimport "example.com/lib/lib"\n\nfunc Run() { _ = lib.New() }\n\n'
+        "func main() { Run() }\n"
+    ),
+}
+
+
+def _public_flags(graph) -> dict[str, str]:
+    return {
+        node: data["public_api"]
+        for node, data in graph.nodes(data=True)
+        if data.get("node_type") == "symbol" and "public_api" in data
+    }
+
+
+def test_go_exported_identifiers_of_importable_packages_are_public(tmp_path: Path) -> None:
+    flags = _public_flags(build_fixture(tmp_path, _GO_REPO).graph())
+    assert {node: root for node, root in flags.items() if root} == {
+        "lib/client.go::Client": "lib/client.go",
+        "lib/client.go::New": "lib/client.go",
+        # A method declared apart from its receiver type is exported with it.
+        "lib/send.go::Client::Send": "lib/send.go",
+    }
+    # Unexported names, an ``internal`` package, a ``package main``, a test
+    # file's exported func and an unexported method export nothing.
+    for node in (
+        "lib/client.go::helper",
+        "lib/send.go::Client::retry",
+        "lib/internal/x/x.go::Hidden",
+        "cmd/tool/main.go::Run",
+        "cmd/tool/main.go::main",
+        "lib/x_test.go::TestHelper",
+    ):
+        assert flags.get(node, "") == "", node
+
+
+def test_go_without_a_go_mod_exports_nothing(tmp_path: Path) -> None:
+    files = {rel: body for rel, body in _GO_REPO.items() if rel != "go.mod"}
+    flags = _public_flags(build_fixture(tmp_path, files).graph())
+    assert flags
+    assert not {node for node, root in flags.items() if root}
+
+
+def test_go_method_of_an_unexported_type_is_not_public(tmp_path: Path) -> None:
+    files = {
+        "go.mod": "module example.com/lib\n",
+        "lib/a.go": "package lib\n\ntype client struct{}\n",
+        "lib/b.go": "package lib\n\nfunc (c *client) Send() {}\n",
+    }
+    flags = _public_flags(build_fixture(tmp_path, files).graph())
+    assert flags["lib/b.go::client::Send"] == ""

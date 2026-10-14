@@ -284,6 +284,16 @@ def test_changing_an_exported_jvm_symbol_warns_about_outside_callers() -> None:
     )
 
 
+def test_changing_an_exported_go_method_warns_about_outside_callers() -> None:
+    exported = {"lib/send.go": {"lib/send.go::Client::Send": "lib/send.go"}}
+    notes = annotate(
+        plan(file_path="lib/send.go", target_symbol="Client.Send"),
+        AnnotationFacts(exported=exported),
+    )
+    assert kinds(notes) == ["public_api"]
+    assert notes.risks[0].text.endswith("breaks consumers outside the repo.")
+
+
 def test_a_moved_exported_method_carries_one_public_api_risk() -> None:
     exported = {
         "svc/orders.py": {

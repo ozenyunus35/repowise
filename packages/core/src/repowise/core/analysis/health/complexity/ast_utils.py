@@ -468,14 +468,14 @@ def _identifier_chain(node: Node, *, lower: bool = True) -> list[str]:
     document order.
 
     Order is load-bearing: the last entry is the name being called, the rest
-    the receiver path. Argument lists and ``type_arguments`` (TypeScript,
-    Java) are never descended into; C#'s ``type_argument_list`` still is.
+    the receiver path. Value and type argument lists (including C#'s
+    ``type_argument_list``) are never descended into.
     """
     names: list[str] = []
     stack: list[Node] = [node]
     while stack:
         cur = stack.pop()
-        if cur.type in ("argument_list", "arguments", "type_arguments"):
+        if cur.type in ("argument_list", "arguments", "type_arguments", "type_argument_list"):
             continue
         if cur.type.endswith(_IDENTIFIER_SUFFIX) and cur.text is not None:
             text = cur.text.decode("utf-8", "replace")
