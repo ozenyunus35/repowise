@@ -81,6 +81,7 @@ from .type_names import (
     bare_type_name,
     csharp_extension_receiver,
     is_resolvable_type_name,
+    strip_type_arguments,
 )
 
 log = structlog.get_logger(__name__)
@@ -1415,12 +1416,12 @@ class CallResolver(LanguageStrategiesMixin, ReceiverTypingMixin):
     ) -> ResolvedCall | None:
         """The repo class a Kotlin ``typealias`` names, as a call in its file would reach it."""
         _, _, target = (alias.signature or "").partition(" = ")
-        head = target.split("<", 1)[0].rstrip("? ").strip()
+        head = strip_type_arguments(target).rstrip("? ").strip()
+        alias_file = self._symbol_paths_by_id.get(alias.id)
         # A function type, a qualified (possibly external) name or the alias's own
         # name gives no repo class to construct.
-        if not head.isidentifier() or head == alias.name:
+        if alias_file is None or not head.isidentifier() or head == alias.name:
             return None
-        alias_file = alias.id.split("::", 1)[0]
         hit = self._resolve_free_call(alias_file, replace(call, target_name=head), alias.id)
         target_sym = self._symbols_by_id.get(hit.callee_id) if hit is not None else None
         if target_sym is None or target_sym.kind != "class" or target_sym.name == alias.name:
