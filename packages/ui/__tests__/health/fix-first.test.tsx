@@ -184,6 +184,10 @@ describe("Fix first items", () => {
     expect(fixPlanLabel(REFACTOR)).toBe("Open the refactoring plan");
     expect(fixPlanLabel(PERF)).toBe("Open the performance fix");
     expect(fixPlanLabel(FINDING)).toBeNull();
+    expect(fixPlanLabel({ kind: "finding", source: { ...FINDING.source, plan_ids: [] } })).toBeNull();
+    expect(fixPlanLabel({ kind: "finding", source: { ...FINDING.source, plan_ids: ["refac2_big"] } })).toBe(
+      "Open the refactoring plan",
+    );
     renderList();
     openRow(REFACTOR);
     expect(screen.getByRole("link", { name: "Open the refactoring plan" }).getAttribute("href")).toBe(

@@ -267,13 +267,17 @@ risk model is documented in
 
 ## Changes
 
-`/repos/<id>/changes`, `/repos/<id>/changes/<changeId>`
+`/repos/<id>/commits?view=changes`, `/repos/<id>/changes/<changeId>`
 
-**Answers:** what landed, from which commits, touching which files?
+**Answers:** what landed, from which commits, touching which files, and what
+its evidence checklist flags?
 
-Merged pull requests, merge requests and commits, newest first, filtered by
-category. Each detail page lists the commits, files, provenance and metadata of
-one Change Record. See [CHANGES.md](../layers/CHANGES.md).
+The Commits page's "By change" view lists merged pull requests, merge requests
+and commits, newest first, filtered by category or by "Needs attention". Each
+row counts the attention and unknown items of the change's evidence checklist
+once it is built; the detail page builds it on first view and lists the
+commits, files, provenance and metadata of one Change Record. See
+[CHANGES.md](../layers/CHANGES.md).
 
 ## Contributors
 

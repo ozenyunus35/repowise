@@ -216,7 +216,10 @@ def test_backfill_reports_and_status_shows_the_run(
     assert report["covered_after"] == report["covered_before"] + 1
     # The next update re-reads git history once; nothing else in the state moves.
     assert report["history_rewalk_on_next_update"] is True
-    assert json.loads(state.read_text(encoding="utf-8")) == {"last_sync_commit": "abc"}
+    assert json.loads(state.read_text(encoding="utf-8")) == {
+        "git_history_version": "attribution-backfill",
+        "last_sync_commit": "abc",
+    }
 
     status = CliRunner().invoke(attribution_group, ["status", str(repo), "--format", "json"])
     assert json.loads(status.output)["backfill"]["bound"] == 1

@@ -51,6 +51,7 @@ from ..ingestion.git_indexer import (
     GIT_HISTORY_VERSION_KEY,
     git_history_stale,
 )
+from ..ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from ..pipeline.phase_timing import PhaseTimingRecorder
 from .config import WorkspaceConfig
 
@@ -742,7 +743,7 @@ async def _has_persisted_repo_index(repo_path: Path) -> bool:
 async def update_single_repo_index(
     repo_path: Path,
     *,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     progress: Any | None = None,
@@ -895,7 +896,7 @@ async def update_workspace(
     only_aliases: set[str] | None = None,
     run_hooks: bool = True,
     dry_run: bool = False,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     on_repo_start: Callable[[str], None] | None = None,
@@ -1314,6 +1315,34 @@ async def run_cross_repo_hooks(
         _log.warning("Workspace store refresh failed", exc_info=True)
     timings.on_phase_done("workspace_store")
     _log_phase(timings, "workspace_store")
+
+    # Each updated repo snapshotted its components before contracts were
+    # extracted at its new commit; measure them now.
+    for alias in changed_repos:
+        entry = ws_config.get_repo(alias)
+        if entry is not None:
+            await _refresh_contract_facts((workspace_root / entry.path).resolve())
+
+
+async def _refresh_contract_facts(repo_path: Path) -> None:
+    """Best-effort: a failure leaves the run's contracts unavailable."""
+    from ..events.store import refresh_contract_facts
+    from ..persistence import create_engine, create_session_factory, get_session
+    from ..persistence.crud import get_repository_by_path
+    from ..persistence.database import has_db_store, resolve_db_url
+
+    if not has_db_store(repo_path):
+        return
+    engine = create_engine(resolve_db_url(repo_path))
+    try:
+        async with get_session(create_session_factory(engine)) as session:
+            repo = await get_repository_by_path(session, str(repo_path))
+            if repo is not None:
+                await refresh_contract_facts(session, repo.id)
+    except Exception:
+        _log.warning("Contract facts not refreshed for %s", repo_path, exc_info=True)
+    finally:
+        await engine.dispose()
 
 
 async def _run_phases(

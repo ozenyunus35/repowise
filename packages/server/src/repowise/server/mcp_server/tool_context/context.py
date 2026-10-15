@@ -35,6 +35,8 @@ Optional ``include`` parameter widens the response:
   - include=["doc_drift"] → documents that name this file, and their drift
   - include=["symbols"]   → every symbol in a file card, not the ranked top 15
   - include=["changes"]   → recent Change Records touching a file target
+  - include=["suspects"]  → changes merged in the last 14 days ranked against the
+                            targets as a symptom, each with the signals that fired
   - include=["provenance"]→ a file's commits by source (agent, human-attested,
                             unknown) with coverage and the honest agent share
 
@@ -60,7 +62,7 @@ from repowise.core.registry import ToolRecipe
 from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server import _state
 from repowise.server.mcp_server._budget import OmissionCollector
-from repowise.server.mcp_server._changes import change_cards, is_change_target
+from repowise.server.mcp_server._changes import change_cards, is_change_target, suspects_block
 from repowise.server.mcp_server._components import component_cards, is_component_target
 from repowise.server.mcp_server._episodes import enrich_episode_counts as _enrich_episodes
 from repowise.server.mcp_server._helpers import (
@@ -74,6 +76,7 @@ from repowise.server.mcp_server._helpers import (
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
 from repowise.server.mcp_server._meta import completeness_line as _completeness_line
+from repowise.server.mcp_server._packages import is_package_target, package_cards
 from repowise.server.mcp_server._workspace_routing import (
     needs_routing,
     route_targets,
@@ -108,6 +111,7 @@ _INCLUDE_BLOCKS = frozenset(
         "symbols",
         "changes",
         "provenance",
+        "suspects",
     }
 )
 
@@ -151,13 +155,14 @@ async def get_context(
     Include-gated blocks are projections, not omissions.
 
     Args:
-        targets: paths, "path::Symbol" ids, "component:<name>", or
-            "change:<id>" (pr-123 or a commit sha).
+        targets: paths, "path::Symbol" ids, "component:<name>",
+            "change:<id>" (pr-123 or a sha), "package:<name>".
         include: opt-in blocks: full_doc | ownership | last_change | callers
             | callees | references | metrics | community | decisions | skeleton
             | skeleton+ | health | doc_drift (docs naming this file)
-            | symbols (all, not the top 15) | changes | provenance.
-        compact: default True; False adds structure+imports+docstrings.
+            | symbols (all, not the top 15) | changes | provenance
+            | suspects.
+        compact: False adds structure+imports+docstrings.
         repo: usually omitted.
     """
     if repo == "all":
@@ -223,6 +228,9 @@ async def get_context(
         cards |= await _change_cards(
             session, repository, [t for t in targets if is_change_target(t)], collector
         )
+        cards |= await _package_cards(
+            session, repository, [t for t in targets if is_package_target(t)], ctx, collector
+        )
         gathered = await asyncio.gather(
             *[
                 _resolve_one_target(
@@ -256,6 +264,9 @@ async def get_context(
             exclude_spec=exclude_spec,
             collector=collector,
         )
+        suspects = (
+            await suspects_block(session, repository, targets) if "suspects" in include_set else None
+        )
 
     results: list[dict[str, Any]] = []
     for t, r in zip(targets, raw_results, strict=True):
@@ -288,6 +299,8 @@ async def get_context(
             targets=targets,
         ),
     }
+    if suspects is not None:
+        response["suspects"] = suspects
     # A "raw" skeleton is the file's own source served untouched; the
     # signatures and smart modes elide bodies, so they are not whole files.
     whole_files = sum(
@@ -369,6 +382,20 @@ async def _component_cards(
             alias=ctx.alias,
             exclude_spec=exclude_spec,
             ownership=ownership,
+        )
+    except Exception as exc:
+        return {t: exc for t in targets}
+
+
+async def _package_cards(
+    session: Any, repository: Any, targets: list[str], ctx: Any, collector: OmissionCollector
+) -> dict[str, Any]:
+    """Cards for the batch's ``package:`` targets; a failure becomes each one's error."""
+    if not targets:
+        return {}
+    try:
+        return await package_cards(
+            session, repository, targets, repo_root=ctx.path, collector=collector
         )
     except Exception as exc:
         return {t: exc for t in targets}

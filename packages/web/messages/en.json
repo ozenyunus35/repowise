@@ -12,7 +12,11 @@
     "dismiss": "Dismiss",
     "close": "Close",
     "back": "Back",
-    "retry": "Try again"
+    "retry": "Try again",
+    "preview": {
+      "label": "Preview",
+      "ariaLabel": "Preview: {note}"
+    }
   },
   "language": {
     "label": "Language",
@@ -43,6 +47,11 @@
     "updateBanner": "repowise <b>v{latest}</b> is available",
     "updateBannerCurrent": " (you have v{current})",
     "updateBannerCommand": "Run <code>{command}</code> to upgrade.",
+    "updateBannerHighlights": "repowise <b>v{latest}</b> adds {titles}",
+    "newMark": "New",
+    "updatedLabel": "Updated",
+    "updatedNotice": "repowise is now <b>v{version}</b>.",
+    "seeWhatChanged": "See what changed",
     "ask": "Ask",
     "commandPalette": {
       "label": "Command palette",
@@ -92,6 +101,32 @@
     "whatsNewModal": {
       "title": "What's new in repowise",
       "loading": "Loading release notes...",
+      "description": "Release notes for each repowise version: a summary, the numbers, highlights and every change.",
+      "nextRelease": "Next release",
+      "unreleasedNote": "Not released yet. This is what the next release brings so far.",
+      "numbersTitle": "By the numbers",
+      "numbersSince": "{days, plural, =0 {same day as v{since}} one {# day since v{since}} other {# days since v{since}}}",
+      "statPrs": "Pull requests",
+      "statPrsSub": "{count} issues closed",
+      "statContributors": "Contributors",
+      "statContributorsSub": "{count} first-time",
+      "statFiles": "Files changed",
+      "statFilesSub": "+{added} / -{removed} lines",
+      "statFixes": "Fixes",
+      "statFeatures": "{count} features",
+      "statPerf": "{count} performance changes",
+      "statRefactors": "{count} refactors",
+      "statDocs": "{count} documentation changes",
+      "statTests": "Test files",
+      "statTestsSub": "{count} new",
+      "thanks": "Thank you to the {count} contributors who built this release.",
+      "thanksFirst": "Thank you to the {count} contributors who built this release, and welcome to the {first} who made their first contribution.",
+      "highlightsTitle": "Highlights",
+      "open": "Open",
+      "inEachRepo": "Open a repository to see it",
+      "everything": "Everything in this release",
+      "sectionCount": "{count, plural, one {# change} other {# changes}}",
+      "earlier": "Earlier releases",
       "unavailable": "Release notes unavailable. <link>View on GitHub</link>"
     }
   },
@@ -107,7 +142,6 @@
     "refactoring": "Refactoring",
     "files": "Files",
     "commits": "Commits",
-    "changes": "Changes",
     "contributors": "Contributors",
     "decisions": "Decisions",
     "stats": "Stats",
@@ -244,10 +278,13 @@
       "scoreBehaviourDescription": "Two views of the same model: where the cuts fall, and what commit shape lands you above them.",
       "changeRisk": "Change risk",
       "evolutionTitle": "How the work changed shape",
-      "evolutionDescription": "Commit categories over time, read off the subject line. Fixes carry the accent because that is the series this chart exists to show."
+      "evolutionDescription": "Commit categories over time, read off the subject line. Fixes carry the accent because that is the series this chart exists to show.",
+      "viewLabel": "History view",
+      "viewByChange": "By change",
+      "viewByCommit": "By commit",
+      "viewEvents": "Events"
     },
     "changes": {
-      "title": "Changes",
       "description": "Every merged change on the main line, read back from git: pull and merge requests, Gerrit changes and lone commits, with the files each one landed.",
       "emptyTitle": "No changes indexed yet",
       "emptyHint": "Changes are read from git history on the next index or update.",
@@ -279,9 +316,83 @@
       "evidenceUnavailable": "The evidence checklist could not be built for this change.",
       "evidenceBuilding": "The evidence checklist is still being built. Reload the page in a moment.",
       "evidenceGenerated": "Generated {date}",
+      "detailOutcomes": "Outcomes",
+      "outcomesRevertedBy": "Reverted by",
+      "outcomesNoLongerInForce": "no longer in force",
+      "outcomesCause": "Referenced as the cause by a later fix (their words):",
+      "outcomesFileRate": "Files later received fixes: {fixed} of {total} within {days} days",
+      "outcomesWindowOpen": "window still open",
+      "outcomesNone": "No later commit in this history reverts this change or names it as a cause.",
+      "outcomesNote": "Links come only from later commits that name this change. The file rate says where fixes landed, not what caused them.",
       "statusOk": "ok",
       "statusAttention": "attention",
-      "statusUnknown": "unknown"
+      "statusUnknown": "unknown",
+      "byChangeTitle": "Merged changes",
+      "byChangeDescription": "One row per merged change. Open a change for its evidence checklist: owners, reaching tests, contracts, decisions crossed and health delta. The Evidence column counts what that checklist flagged.",
+      "commits": "Commits",
+      "evidence": "Evidence",
+      "evidenceNotBuilt": "Not built",
+      "evidenceNotBuiltHint": "The checklist is built the first time the change is opened.",
+      "evidenceClear": "Nothing flagged",
+      "evidenceAttention": "{count, plural, one {# needs attention} other {# need attention}}",
+      "evidenceUnknown": "{count} unknown",
+      "needsAttention": "Needs attention",
+      "attentionScope": "Only changes with a built checklist are listed.",
+      "attentionEmpty": "No built checklist flags anything for attention.",
+      "filterEmpty": "No change matches this filter.",
+      "checklistsBuilt": "Checklists built for {built} of {changes} changes.",
+      "checklistsBuildHint": "A change's checklist is built when its page is opened, or by `repowise changes show REF` or `repowise changes export`.",
+      "loadErrorTitle": "Could not load changes",
+      "loadErrorBody": "The change list could not be read from the server. Reload the page to try again.",
+      "categories": {
+        "feature": "feature",
+        "fix": "fix",
+        "refactor": "refactor",
+        "docs": "docs",
+        "test": "test",
+        "deps": "deps",
+        "chore": "chore",
+        "other": "other"
+      },
+      "evidenceKinds": {
+        "components_touched": "Components touched",
+        "owners": "Declared owners",
+        "suggested_reviewers": "Suggested reviewers",
+        "reaching_tests": "Tests reaching the change",
+        "contracts": "Contracts touched",
+        "cross_repo_consumers": "Consumers in other repos",
+        "decisions_crossed": "Decisions crossed",
+        "health_delta": "Health delta",
+        "provenance": "AI provenance",
+        "risk_score": "Diff size rank",
+        "outcomes": "Outcomes since merge"
+      },
+      "evidenceBasis": {
+        "measured": "measured",
+        "inferred": "inferred",
+        "declared": "declared",
+        "unresolved": "not known"
+      },
+      "evidenceLine": {
+        "unknown": "Not known: {reason}",
+        "unknownBare": "Not known",
+        "components_touched": "{count, plural, one {# component} other {# components}}: {names}{more, plural, =0 {} other { and # more}}",
+        "suggested_reviewers": "{names}{more, plural, =0 {} other { and # more}}",
+        "owners": "{count, plural, =0 {No declared owner} other {{names}{more, plural, =0 {} other { and # more}}}}{unowned, plural, =0 {} one {; # changed file without one} other {; # changed files without one}}",
+        "reaching_tests": "{files, plural, =0 {No changed source file} one {{reached} of # changed file reached by a test} other {{reached} of # changed files reached by a test}}{absent, plural, =0 {} other {; # with none}}{unknown, plural, =0 {} other {; # not known}}",
+        "contracts": "{touched, plural, =0 {No workspace contract touched} one {# workspace contract touched} other {# workspace contracts touched}}; {breaking, plural, =0 {no breaking signature change} one {# breaking signature change} other {# breaking signature changes}}",
+        "contracts_unchecked": "{touched, plural, =0 {No workspace contract touched} one {# workspace contract touched} other {# workspace contracts touched}}; signatures not compared",
+        "cross_repo_consumers": "{links, plural, =0 {No consumer in another repo} one {# consumer in {names}{more, plural, =0 {} other { and # more}}} other {# consumers in {names}{more, plural, =0 {} other { and # more}}}}",
+        "decisions_crossed": "{accepted, plural, one {# accepted decision} other {# accepted decisions}}, {candidate, plural, one {# candidate} other {# candidates}}",
+        "decisions_none": "No decision crossed",
+        "health_delta": "Findings: {introduced} introduced, {worsened} worsened, {resolved} resolved",
+        "health_delta_partial": "Findings: {introduced} introduced, {worsened} worsened, {resolved} resolved (partial comparison)",
+        "provenance": "provenance: {label}, known for {known} of {commits, plural, one {# commit} other {# commits}}",
+        "provenance_named": "provenance: {label}, known for {known} of {commits, plural, one {# commit} other {# commits}} ({names})",
+        "risk_score": "Larger than {percentile}% of recent commits",
+        "outcomes": "{reverts, plural, one {# revert} other {# reverts}}, {references, plural, one {# cause reference} other {# cause references}}",
+        "outcomes_rate": "{reverts, plural, one {# revert} other {# reverts}}, {references, plural, one {# cause reference} other {# cause references}}; {fixed} of {files, plural, one {# file} other {# files}} fixed within {days} days"
+      }
     },
     "architecture": {
       "tabs": {
@@ -498,6 +609,36 @@
       "breadcrumb": "Code Health",
       "notFoundTitle": "Module not found",
       "notFoundDescription": "The requested module path doesn't exist in this repository's index."
+    },
+    "events": {
+      "title": "Events",
+      "description": "What moved between two index runs in a row: owners, bus factor, hotspots, contracts, decisions, dead code and test reach, per component.",
+      "repository": "Whole repository",
+      "count": "{count, plural, one {# event} other {# events}}, newest first.",
+      "emptyTitle": "No events yet",
+      "baselineOnly": "{runs, plural, =0 {No component snapshot is stored yet.} one {One component snapshot is stored, the baseline.} other {# component snapshots are stored.}} Events are what moved between two index runs in a row, so they start after the next `repowise update` on a new commit.",
+      "nothingMoved": "Nothing crossed a threshold across {runs} stored component snapshots.",
+      "noMatch": "No event matches these filters across {runs} stored component snapshots.",
+      "loadErrorTitle": "Could not load events",
+      "loadErrorBody": "The event list could not be read from the server. Reload the page to try again.",
+      "kinds": {
+        "ownership_shift": "Declared owner changed",
+        "owner_inactive": "Main owners stopped changing it",
+        "bus_factor_drop": "Bus factor fell",
+        "new_hotspot": "Files became hotspots",
+        "contract_added": "Provided contract appeared",
+        "contract_broken": "Contract with consumers disappeared",
+        "decision_stale": "Governing decision went stale",
+        "dead_code_growth": "Dead-code findings grew",
+        "test_reach_drop": "Test reach fell"
+      },
+      "severities": {
+        "critical": "critical",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+        "info": "info"
+      }
     }
   },
   "settings": {
@@ -531,6 +672,47 @@
       "keyRemoved": "API key removed",
       "keyRemoveFailed": "Couldn't remove the key",
       "activateFailed": "Couldn't set the active provider"
+    },
+    "providerForm": {
+      "model": "Model",
+      "baseUrl": "Base URL",
+      "baseUrlHint": "Leave empty to use the provider's own endpoint.",
+      "baseUrlInvalid": "Enter a URL that starts with http:// or https://.",
+      "localServer": "Local server",
+      "testConnection": "Test connection",
+      "connected": "Connected. {count, plural, one {# model} other {# models}} listed.",
+      "save": "Save",
+      "useProvider": "Use {name}",
+      "cancel": "Cancel",
+      "regenerateNotice": "Documentation is regenerated with the new model on the next sync. To try a model first, pick it in the chat model menu; that changes one conversation only.",
+      "regenerateNoticeGlobal": "Repositories without their own model regenerate their documentation with this one on their next sync. To try a model first, pick it in the chat model menu.",
+      "unconfirmedUrl": "This repository's .repowise/config.yaml sends requests to {url}, which has not been confirmed on this machine, so your API key is not sent there. Trust it only if you set it or know the host.",
+      "trustUrl": "Trust this URL",
+      "sourceConfig": "Saved in .repowise/config.yaml.",
+      "sourceGlobal": "From the default model in Settings.",
+      "sourceDefault": "The provider's default.",
+      "sourceAutodetect": "Picked because its API key is set.",
+      "sourceEnv": "From the {name} environment variable. Saving here takes precedence.",
+      "saved": "Model settings saved",
+      "savedDescription": "Written to .repowise/config.yaml. The CLI uses it too.",
+      "savedGlobal": "Default model saved",
+      "active": "Active",
+      "noKeyRequired": "No key required",
+      "keySet": "Key set",
+      "noKey": "No key",
+      "use": "Use",
+      "useAria": "Use {name}",
+      "test": "Test",
+      "testAria": "Test {name} connection",
+      "addKey": "Add key",
+      "updateKey": "Update key",
+      "removeKeyAria": "Remove {name} key",
+      "keyAria": "{name} API key",
+      "keyPlaceholder": "Paste your {name} API key",
+      "saveKeyAria": "Save {name} API key",
+      "connectionVerified": "Connection verified",
+      "connectionFailed": "Connection failed",
+      "saveFailed": "Not saved. Your changes are still here; try again."
     },
     "display": {
       "title": "Display",
@@ -566,19 +748,12 @@
       "summarySingleRepo": "Single-repo mode, so workspace-only tools are unavailable here."
     },
     "provider": {
-      "title": "Model defaults",
-      "description": "Used when you trigger init or sync from this dashboard.",
-      "descriptionWithServer": "Used when you trigger init or sync from this dashboard. The server itself is currently configured with {provider}.",
-      "providerLabel": "Provider",
-      "providerAria": "Provider",
-      "modelLabel": "Model",
-      "modelHint": "Leave blank to use the provider's default.",
+      "title": "Default model",
+      "description": "Used by every repository that has no model of its own. Set one repository's model on its Settings page.",
       "embedderLabel": "Embedder",
       "embedderHint": "What semantic search is built from. The mock embedder disables it.",
-      "embedderAria": "Embedder",
-      "embedderOffNote": "Semantic search is off. Pick another embedder above and set <code>REPOWISE_EMBEDDER</code> on the server for real retrieval.",
-      "embedderOnNote": "Set <code>{env}</code> on the server.",
-      "catalogUnavailable": "Could not load the provider list from the server, so only the saved provider is shown."
+      "embedderOffNote": "Semantic search is off. Set <code>REPOWISE_EMBEDDER</code> on the server for real retrieval.",
+      "embedderOnNote": "Set with <code>{env}</code> on the server."
     }
   },
   "repos": {
@@ -769,7 +944,27 @@
     "noProvider": "No chat provider is configured. Add an API key in <link>settings</link> to start asking questions.",
     "noProviderShort": "No chat provider is configured. Add an API key in <link>settings</link>.",
     "unverifiedFigure": "Not found in this turn's tool results",
-    "unverifiedFiguresNote": "Figures with a dotted underline were not found in this turn's tool results."
+    "unverifiedFiguresNote": "Figures with a dotted underline were not found in this turn's tool results.",
+    "emptySuggestions": {
+      "treemap": "Chart code health by package as a treemap",
+      "riskiest": "Which files are riskiest to change, and why?",
+      "weeklyChanges": "Show what kinds of changes we made each week",
+      "coverageGaps": "Where are the biggest test coverage gaps?",
+      "deadCode": "What dead code can be safely removed?",
+      "healthSlide": "Give me a one-slide health summary with charts"
+    },
+    "modelMenu": {
+      "dialog": "Choose conversation model",
+      "provider": "Provider",
+      "search": "Search or type a model id",
+      "useTyped": "Use \"{id}\"",
+      "repoDefault": "repo default",
+      "providerDefault": "default",
+      "loading": "Loading models",
+      "noMatch": "No listed model matches.",
+      "configure": "Configure in Settings",
+      "needsSetup": "More providers need a key first."
+    }
   },
   "codeHealth": {
     "hotspots": {
@@ -838,7 +1033,33 @@
     "cancelled": "Job cancelled",
     "cancelledDescription": "The pipeline was stopped before completion.",
     "cancelFailed": "Couldn't cancel job",
-    "progressCount": "{completed}/{total} pages"
+    "progressCount": "{completed}/{total} pages",
+    "completedWithProblems": "Finished with problems{name}",
+    "pagesFailed": "{count} pages could not be written.",
+    "progress": {
+      "warningTitle": "Finished with problems",
+      "noPagesWritten": "No documentation pages were written.",
+      "somePagesFailed": "{failed} of {total} pages could not be written. Run it again to retry them.",
+      "docsSkipped": "Documentation was not updated.",
+      "retry": "Retry",
+      "startAgain": "Start again",
+      "providerSettings": "Provider settings",
+      "dismiss": "Dismiss"
+    },
+    "issue": {
+      "auth": "API key rejected by {provider}. Update it in Settings.",
+      "rate_limit": "{provider} is rate limiting requests. Wait a few minutes, then run it again.",
+      "model_not_found": "Model {model} was not found at {provider}. Choose another model in Settings.",
+      "not_found": "Model {model} or the base URL path was not found at {provider}. Check both in Settings.",
+      "unreachable": "Could not reach {target}. Is the server running and the base URL correct?",
+      "docs_skipped": "A model provider is configured but could not be loaded, so documentation was not updated. Check it in Settings."
+    },
+    "banner": {
+      "finishedWithProblems": "{action} finished with problems",
+      "pagesFailed": "{count} pages not written",
+      "providerSettings": "Provider settings",
+      "dismiss": "Dismiss"
+    }
   },
   "overview": {
     "ask": {

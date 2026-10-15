@@ -11,6 +11,10 @@ import { CredibilityInfoButton } from "@repowise-dev/ui/commits/credibility-stri
 import { CommitQueue } from "@/components/commits/commit-queue";
 import { CommitDetailSheet } from "@/components/commits/commit-detail-sheet";
 import { CommitDistribution } from "@/components/commits/commit-distribution";
+import { CommitsViewToggle } from "@/components/commits/commits-view-toggle";
+import { ByChangeView, type ByChangeParams } from "@/components/commits/by-change-view";
+import { EventsView } from "@/components/commits/events-view";
+import { parseCommitsView } from "@/lib/changes";
 import {
   getAgentTrend,
   getCommitEvolution,
@@ -46,15 +50,52 @@ async function safeFetch<T>(fn: () => Promise<T>): Promise<T | null> {
  * above the analysis charts rather than below them; the evolution chart keeps
  * the top slot because it is the only one about the repo rather than about the
  * scoring model.
+ *
+ * `?view=changes` swaps all of that for the history grouped by merged change
+ * (`ByChangeView`), `?view=events` for what moved between index runs
+ * (`EventsView`); the commit view stays the default.
  */
 export default async function CommitsPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<ByChangeParams & { view?: string }>;
 }) {
   const { id } = await params;
+  const sp = await searchParams;
+  const view = parseCommitsView(sp.view);
   const base = `/repos/${id}`;
   const t = await getTranslations("views.commits");
+  const toggle = <CommitsViewToggle repoId={id} view={view} />;
+
+  if (view === "changes") {
+    const tc = await getTranslations("views.changes");
+    return (
+      <PageShell
+        icon={<GitCommitHorizontal />}
+        title={t("title")}
+        description={tc("description")}
+        actions={toggle}
+      >
+        <ByChangeView repoId={id} params={sp} />
+      </PageShell>
+    );
+  }
+
+  if (view === "events") {
+    const te = await getTranslations("views.events");
+    return (
+      <PageShell
+        icon={<GitCommitHorizontal />}
+        title={t("title")}
+        description={te("description")}
+        actions={toggle}
+      >
+        <EventsView repoId={id} />
+      </PageShell>
+    );
+  }
 
   // One wave. The scatter plots its own recency sample rather than reusing the
   // queue's first page: the feed is risk-sorted, so reusing it would draw only
@@ -77,6 +118,7 @@ export default async function CommitsPage({
         icon={<GitCommitHorizontal />}
         title={t("title")}
         description={t("emptyDescription")}
+        actions={toggle}
       >
         <EmptyState
           title={t("emptyTitle")}
@@ -92,6 +134,7 @@ export default async function CommitsPage({
       icon={<GitCommitHorizontal />}
       title={t("title")}
       description={t("description")}
+      actions={toggle}
     >
       {stats && <CommitsLede stats={stats} base={base} LinkComponent={Link} />}
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,20 @@ CONFIG_DEPENDENCY_KEYS: dict[str, frozenset[str]] = {
     # update after every init into a full rebuild.
     "state_only": frozenset({"distill", "editor_files", "events", "hooks", "mcp"}),
 }
+
+
+def _dependency_keys() -> dict[str, frozenset[str]]:
+    """:data:`CONFIG_DEPENDENCY_KEYS` plus the per-provider endpoint sections.
+
+    ``openai: {base_url: ...}`` says where requests go, not what a page says,
+    so moving an endpoint (the web UI's base URL field) must not rebuild the
+    index. Imported here, not at module load: this file is on the hook path.
+    """
+    from repowise.core.providers.llm.specs import PROVIDER_SPECS
+
+    keys = dict(CONFIG_DEPENDENCY_KEYS)
+    keys["state_only"] = keys["state_only"] | frozenset(PROVIDER_SPECS)
+    return keys
 
 
 class RepoConfigError(ValueError):
@@ -117,6 +132,8 @@ def save_repo_config(repo_path: Path | str, config: dict[str, Any]) -> None:
 
     import yaml  # type: ignore[import-untyped]
 
+    from repowise.core.fsutils import replace_with_retry
+
     cfg_dir = get_repowise_dir(repo_path)
     cfg_dir.mkdir(parents=True, exist_ok=True)
     target = cfg_dir / CONFIG_FILENAME
@@ -131,11 +148,17 @@ def save_repo_config(repo_path: Path | str, config: dict[str, Any]) -> None:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_name, target)
+        replace_with_retry(tmp_name, target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
+    # Drop the resolver's parsed copy. Looked up, not imported: when the
+    # resolver was never loaded there is no cache, and importing it here would
+    # pull the provider stack into every config write.
+    resolver = sys.modules.get("repowise.core.providers.llm.resolve")
+    if resolver is not None:
+        resolver.forget_cached(target)
 
 
 def config_fingerprint(repo_path: Path | str) -> str:
@@ -185,10 +208,11 @@ def config_dependency_fingerprints(
     """
     if config is None:
         config = load_repo_config(repo_path)
-    known = set().union(*CONFIG_DEPENDENCY_KEYS.values())
+    dependency_keys = _dependency_keys()
+    known = set().union(*dependency_keys.values())
     grouped: dict[str, Any] = {
         name: {key: config[key] for key in sorted(keys) if key in config}
-        for name, keys in CONFIG_DEPENDENCY_KEYS.items()
+        for name, keys in dependency_keys.items()
     }
     grouped["other"] = {key: config[key] for key in sorted(config) if key not in known}
 
@@ -416,8 +440,10 @@ def ensure_manifest_tracked(repo_path: Path | str) -> bool:
 
 
 def _ensure_gitignored(repo_path: Path | str, pattern: str, comment: str) -> None:
-    """Add *pattern* to the repo's ``.gitignore`` if not already listed."""
+    """Add *pattern* to the repo's ``.gitignore`` unless git already ignores it."""
     gitignore = Path(repo_path) / ".gitignore"
+    if _git_ignores(repo_path, pattern):
+        return  # e.g. a ``.repowise/`` rule: a second line would only dirty the file
 
     if gitignore.exists():
         content = gitignore.read_text(encoding="utf-8")
@@ -431,3 +457,28 @@ def _ensure_gitignored(repo_path: Path | str, pattern: str, comment: str) -> Non
         gitignore.write_text(content, encoding="utf-8")
     else:
         gitignore.write_text(f"# {comment}\n{pattern}\n", encoding="utf-8")
+
+
+def _git_ignores(repo_path: Path | str, pattern: str) -> bool:
+    """Whether a ``.gitignore`` inside the repo already covers *pattern*.
+
+    Rules from ``.git/info/exclude`` or a global excludes file do not count:
+    teammates do not share them. ``False`` when git cannot say.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "--no-index", pattern],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    # ``<source>:<line>:<rule><TAB><path>``; a repo .gitignore is reported relative.
+    source = result.stdout.split("\t", 1)[0].rsplit(":", 2)[0]
+    return Path(source).name == ".gitignore" and not Path(source).is_absolute()

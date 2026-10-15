@@ -74,3 +74,11 @@ def test_formats_and_filters(tmp_path):
     assert bad.exit_code != 0
     bad_since = runner.invoke(events_command, ["--path", str(root), "--since", "yesterday"])
     assert bad_since.exit_code != 0
+
+
+def test_no_events_says_whether_runs_could_be_compared(tmp_path):
+    root = _repo(tmp_path)
+    got = CliRunner().invoke(events_command, ["--path", str(root), "--since", "2099-01-01"])
+    assert got.exit_code == 0, got.output
+    # No snapshot is stored, so no events is not a quiet history.
+    assert "No events yet: 0 component snapshot(s) stored" in got.output

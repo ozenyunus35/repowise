@@ -119,6 +119,8 @@ spec: {type: service, lifecycle: production, owner: group:default/money}
 
     text = _invoke(["components", "ownership", "--path", str(repo)])
     assert "catalog_entry_no_code ledger" in text.output
+    # The text form says what the check could see, so no findings never reads as all clear.
+    assert "component(s) have a declared owner" in text.output
 
 
 def test_ownership_reports_a_bad_teams_file_once_without_its_content(repo):

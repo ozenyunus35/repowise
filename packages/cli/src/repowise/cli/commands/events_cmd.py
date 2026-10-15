@@ -37,13 +37,15 @@ def _parse_since(value: str | None) -> datetime | None:
 
 
 async def _read(root: Path, since: datetime | None, kinds: tuple[str, ...], limit: int):
-    from repowise.core.events.store import list_events
+    """``(events, snapshot runs stored)``, or ``None`` without an index."""
+    from repowise.core.events.store import list_events, snapshot_run_count
 
     async with repo_index_session(root) as opened:
         if opened is None:
             return None
         session, repo_id = opened
-        return await list_events(session, repo_id, since=since, kinds=kinds, limit=limit)
+        events = await list_events(session, repo_id, since=since, kinds=kinds, limit=limit)
+        return events, await snapshot_run_count(session, repo_id)
 
 
 @click.command("events")
@@ -63,10 +65,11 @@ def events_command(
         raise click.BadParameter(f"unknown kind(s) {unknown}; known: {sorted(KINDS)}")
     target = resolve_command_target(path=repo, no_workspace_flag=True)
     assert target.repo_path is not None
-    events = run_async(_read(Path(target.repo_path).resolve(), _parse_since(since), kinds, limit))
-    if events is None:
+    read = run_async(_read(Path(target.repo_path).resolve(), _parse_since(since), kinds, limit))
+    if read is None:
         console.print("No index found. Run `repowise init` first.")
         raise SystemExit(1)
+    events, runs = read
     if fmt == "json":
         emit_json({"events": [to_cloudevent(e) for e in events]})
         return
@@ -77,6 +80,12 @@ def events_command(
     from rich.markup import escape
     from rich.table import Table
 
+    if not events:
+        from repowise.core.events.store import empty_events_reason
+
+        # An empty list is only news once two runs could be compared.
+        console.print(empty_events_reason(runs, filtered=bool(since or kinds))[1])
+        return
     table = Table("When", "Kind", "Component", "Severity", "Evidence")
     for e in events:
         evidence = ", ".join(f"{k}={v}" for k, v in e.evidence.items() if k != "basis")

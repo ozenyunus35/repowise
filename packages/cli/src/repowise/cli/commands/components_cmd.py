@@ -223,7 +223,22 @@ def components_ownership(repo: str | None, fmt: str) -> None:
     for name, f in findings:
         console.print(f"[yellow]{f['kind']}[/yellow] {escape(name)}: {escape(f['message'])}")
     if not findings:
-        console.print("[green]No ownership findings.[/green]")
+        console.print("No ownership findings.")
+    # What the check could see, so no findings is not read as all owners active.
+    owned = sum(1 for b in blocks.values() if b.get("files_with_declared_owner"))
+    unmatched = sum(
+        1
+        for b in blocks.values()
+        if (b.get("declared_individuals") or {}).get("unknown")
+        or any(t.get("activity") == "unknown" for t in b.get("declared_teams", ()))
+    )
+    line = f"{owned} of {len(blocks)} component(s) have a declared owner."
+    if data["indexed"] and unmatched:
+        line += (
+            f" In {unmatched}, a declared owner matches no commit author, so that owner's"
+            " activity is unknown, not inactive."
+        )
+    console.print(f"[dim]{line}[/dim]")
     if not data["indexed"]:
         console.print(
             "[dim]No index found: recent activity is unknown, "

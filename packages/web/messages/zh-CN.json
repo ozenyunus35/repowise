@@ -12,7 +12,11 @@
     "dismiss": "忽略",
     "close": "关闭",
     "back": "返回",
-    "retry": "重试"
+    "retry": "重试",
+    "preview": {
+      "label": "预览",
+      "ariaLabel": "预览：{note}"
+    }
   },
   "language": {
     "label": "语言",
@@ -43,6 +47,11 @@
     "updateBanner": "repowise <b>v{latest}</b> 已发布",
     "updateBannerCurrent": "（当前 v{current}）",
     "updateBannerCommand": "运行 <code>{command}</code> 升级。",
+    "updateBannerHighlights": "repowise <b>v{latest}</b> 新增{titles}",
+    "newMark": "新",
+    "updatedLabel": "已更新",
+    "updatedNotice": "repowise 已更新到 <b>v{version}</b>。",
+    "seeWhatChanged": "查看更新内容",
     "ask": "提问",
     "commandPalette": {
       "label": "命令面板",
@@ -92,6 +101,32 @@
     "whatsNewModal": {
       "title": "repowise 更新内容",
       "loading": "正在加载发行说明…",
+      "description": "每个 repowise 版本的发行说明：概要、数据、亮点和全部改动。",
+      "nextRelease": "下一版本",
+      "unreleasedNote": "尚未发布。这是下一版本目前已有的内容。",
+      "numbersTitle": "数据一览",
+      "numbersSince": "{days, plural, =0 {与 v{since} 同日} other {距 v{since} # 天}}",
+      "statPrs": "拉取请求",
+      "statPrsSub": "关闭 {count} 个问题",
+      "statContributors": "贡献者",
+      "statContributorsSub": "{count} 位首次贡献",
+      "statFiles": "改动文件",
+      "statFilesSub": "+{added} / -{removed} 行",
+      "statFixes": "修复",
+      "statFeatures": "{count} 项新功能",
+      "statPerf": "{count} 项性能改进",
+      "statRefactors": "{count} 项重构",
+      "statDocs": "{count} 项文档改动",
+      "statTests": "测试文件",
+      "statTestsSub": "{count} 个新增",
+      "thanks": "感谢参与本次发布的 {count} 位贡献者。",
+      "thanksFirst": "感谢参与本次发布的 {count} 位贡献者，也欢迎 {first} 位首次贡献的朋友。",
+      "highlightsTitle": "亮点",
+      "open": "打开",
+      "inEachRepo": "打开一个仓库即可查看",
+      "everything": "本次发布的全部改动",
+      "sectionCount": "{count, plural, other {# 项改动}}",
+      "earlier": "更早的版本",
       "unavailable": "发行说明暂不可用。<link>在 GitHub 上查看</link>"
     }
   },
@@ -107,7 +142,6 @@
     "refactoring": "重构",
     "files": "文件",
     "commits": "提交",
-    "changes": "变更",
     "contributors": "贡献者",
     "decisions": "决策",
     "stats": "统计",
@@ -244,10 +278,13 @@
       "scoreBehaviourDescription": "同一个模型的两种视角：分档线落在哪里，以及什么样的提交形态能让你高于这些线。",
       "changeRisk": "变更风险",
       "evolutionTitle": "工作形态如何变化",
-      "evolutionDescription": "按提交标题归类出的各类提交随时间的变化。修复类高亮显示，因为这张图存在的意义就是展示这一条序列。"
+      "evolutionDescription": "按提交标题归类出的各类提交随时间的变化。修复类高亮显示，因为这张图存在的意义就是展示这一条序列。",
+      "viewLabel": "历史视图",
+      "viewByChange": "按变更",
+      "viewByCommit": "按提交",
+      "viewEvents": "事件"
     },
     "changes": {
-      "title": "变更",
       "description": "主线上每个已合并的变更，均从 git 历史读取：拉取请求、合并请求、Gerrit 变更和单独提交，以及每个变更带入的文件。",
       "emptyTitle": "尚未索引任何变更",
       "emptyHint": "变更会在下一次索引或更新时从 git 历史读取。",
@@ -279,9 +316,83 @@
       "evidenceUnavailable": "无法为此变更生成证据清单。",
       "evidenceBuilding": "证据清单仍在生成中，请稍后重新加载页面。",
       "evidenceGenerated": "生成于 {date}",
+      "detailOutcomes": "后续结果",
+      "outcomesRevertedBy": "被以下提交回滚",
+      "outcomesNoLongerInForce": "已不再生效",
+      "outcomesCause": "后续修复将其称为原因（原话）：",
+      "outcomesFileRate": "之后收到修复的文件：{days} 天内 {total} 个中有 {fixed} 个",
+      "outcomesWindowOpen": "窗口尚未结束",
+      "outcomesNone": "在此历史中，没有后续提交回滚此变更或将其称为原因。",
+      "outcomesNote": "链接只来自明确提到此变更的后续提交。文件比率说明修复落在哪里，而不是由什么引起。",
       "statusOk": "正常",
       "statusAttention": "需关注",
-      "statusUnknown": "未知"
+      "statusUnknown": "未知",
+      "byChangeTitle": "已合并的变更",
+      "byChangeDescription": "每个已合并的变更一行。打开一个变更即可查看其证据清单：负责人、可达测试、契约、涉及的决策和健康度变化。“证据”列统计该清单标记的项目。",
+      "commits": "提交",
+      "evidence": "证据",
+      "evidenceNotBuilt": "尚未生成",
+      "evidenceNotBuiltHint": "首次打开该变更时会生成证据清单。",
+      "evidenceClear": "无标记项",
+      "evidenceAttention": "{count} 项需关注",
+      "evidenceUnknown": "{count} 项未知",
+      "needsAttention": "需关注",
+      "attentionScope": "仅列出已生成证据清单的变更。",
+      "attentionEmpty": "已生成的证据清单中没有需关注的项目。",
+      "filterEmpty": "没有符合此筛选条件的变更。",
+      "checklistsBuilt": "{changes} 个变更中已有 {built} 个生成证据清单。",
+      "checklistsBuildHint": "打开变更页面，或运行 `repowise changes show REF` 或 `repowise changes export` 时，会生成该变更的证据清单。",
+      "loadErrorTitle": "无法加载变更",
+      "loadErrorBody": "无法从服务器读取变更列表。请重新加载页面重试。",
+      "categories": {
+        "feature": "功能",
+        "fix": "修复",
+        "refactor": "重构",
+        "docs": "文档",
+        "test": "测试",
+        "deps": "依赖",
+        "chore": "杂务",
+        "other": "其他"
+      },
+      "evidenceKinds": {
+        "components_touched": "涉及的组件",
+        "owners": "声明的负责人",
+        "suggested_reviewers": "建议的评审人",
+        "reaching_tests": "覆盖此变更的测试",
+        "contracts": "涉及的契约",
+        "cross_repo_consumers": "其他仓库中的使用方",
+        "decisions_crossed": "涉及的决策",
+        "health_delta": "健康度变化",
+        "provenance": "AI 来源",
+        "risk_score": "差异规模排名",
+        "outcomes": "合并后的结果"
+      },
+      "evidenceBasis": {
+        "measured": "实测",
+        "inferred": "推断",
+        "declared": "声明",
+        "unresolved": "未知"
+      },
+      "evidenceLine": {
+        "unknown": "未知：{reason}",
+        "unknownBare": "未知",
+        "components_touched": "{count} 个组件：{names}{more, plural, =0 {} other {等另外 # 个}}",
+        "suggested_reviewers": "{names}{more, plural, =0 {} other {等另外 # 人}}",
+        "owners": "{count, plural, =0 {无声明的负责人} other {{names}{more, plural, =0 {} other {等另外 # 个}}}}{unowned, plural, =0 {} other {；# 个变更文件无负责人}}",
+        "reaching_tests": "{files, plural, =0 {没有变更的源文件} other {# 个变更文件中有 {reached} 个被测试覆盖}}{absent, plural, =0 {} other {；# 个没有测试}}{unknown, plural, =0 {} other {；# 个未知}}",
+        "contracts": "{touched, plural, =0 {未涉及工作区契约} other {涉及 # 个工作区契约}}；{breaking, plural, =0 {无破坏性签名变更} other {# 个破坏性签名变更}}",
+        "contracts_unchecked": "{touched, plural, =0 {未涉及工作区契约} other {涉及 # 个工作区契约}}；未比较签名",
+        "cross_repo_consumers": "{links, plural, =0 {其他仓库中没有使用方} other {# 个使用方，位于 {names}{more, plural, =0 {} other {等另外 # 个仓库}}}}",
+        "decisions_crossed": "{accepted} 个已接受的决策，{candidate} 个候选决策",
+        "decisions_none": "未涉及决策",
+        "health_delta": "发现：新增 {introduced}，恶化 {worsened}，解决 {resolved}",
+        "health_delta_partial": "发现：新增 {introduced}，恶化 {worsened}，解决 {resolved}（部分比较）",
+        "provenance": "来源：{label}，{commits} 个提交中已知 {known} 个",
+        "provenance_named": "来源：{label}，{commits} 个提交中已知 {known} 个（{names}）",
+        "risk_score": "大于 {percentile}% 的近期提交",
+        "outcomes": "{reverts} 次回滚，{references} 次被引为原因",
+        "outcomes_rate": "{reverts} 次回滚，{references} 次被引为原因；{files} 个文件中有 {fixed} 个在 {days} 天内被修复"
+      }
     },
     "architecture": {
       "tabs": {
@@ -498,6 +609,36 @@
       "breadcrumb": "代码健康度",
       "notFoundTitle": "未找到模块",
       "notFoundDescription": "该仓库的索引中不存在请求的模块路径。"
+    },
+    "events": {
+      "title": "事件",
+      "description": "相邻两次索引之间发生的变化：按组件列出负责人、巴士系数、热点、契约、决策、死代码与测试覆盖。",
+      "repository": "整个仓库",
+      "count": "共 {count} 个事件，按时间从新到旧。",
+      "emptyTitle": "暂无事件",
+      "baselineOnly": "{runs, plural, =0 {尚未存储组件快照。} =1 {已存储 1 个组件快照，作为基线。} other {已存储 # 个组件快照。}}事件是相邻两次索引之间的变化，因此会在下一次针对新提交运行 `repowise update` 之后开始出现。",
+      "nothingMoved": "在已存储的 {runs} 个组件快照中，没有任何指标越过阈值。",
+      "noMatch": "在已存储的 {runs} 个组件快照中，没有符合这些筛选条件的事件。",
+      "loadErrorTitle": "无法加载事件",
+      "loadErrorBody": "无法从服务器读取事件列表。请刷新页面重试。",
+      "kinds": {
+        "ownership_shift": "声明的负责人已变更",
+        "owner_inactive": "主要负责人不再修改它",
+        "bus_factor_drop": "巴士系数下降",
+        "new_hotspot": "文件成为热点",
+        "contract_added": "出现新的提供方契约",
+        "contract_broken": "有使用方的契约消失",
+        "decision_stale": "治理决策已过时",
+        "dead_code_growth": "死代码发现增多",
+        "test_reach_drop": "测试覆盖下降"
+      },
+      "severities": {
+        "critical": "严重",
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "info": "信息"
+      }
     }
   },
   "settings": {
@@ -531,6 +672,47 @@
       "keyRemoved": "API 密钥已移除",
       "keyRemoveFailed": "无法移除密钥",
       "activateFailed": "无法设置当前提供商"
+    },
+    "providerForm": {
+      "model": "模型",
+      "baseUrl": "Base URL",
+      "baseUrlHint": "留空则使用提供商自己的接口地址。",
+      "baseUrlInvalid": "请输入以 http:// 或 https:// 开头的 URL。",
+      "localServer": "本地服务",
+      "testConnection": "测试连接",
+      "connected": "连接成功，列出了 {count} 个模型。",
+      "save": "保存",
+      "useProvider": "使用 {name}",
+      "cancel": "取消",
+      "regenerateNotice": "下次同步时会用新模型重新生成文档。想先试用某个模型，请在对话的模型菜单中选择，那只影响当前对话。",
+      "regenerateNoticeGlobal": "没有单独设置模型的代码仓库会在下次同步时用此模型重新生成文档。想先试用某个模型，请在对话的模型菜单中选择。",
+      "unconfirmedUrl": "此代码仓库的 .repowise/config.yaml 会把请求发送到 {url}，该地址尚未在本机确认，因此不会把你的 API 密钥发送过去。只有在这是你自己设置的地址或你信任该主机时，才信任它。",
+      "trustUrl": "信任此 URL",
+      "sourceConfig": "保存在 .repowise/config.yaml 中。",
+      "sourceGlobal": "来自设置中的默认模型。",
+      "sourceDefault": "提供商的默认值。",
+      "sourceAutodetect": "因为已设置其 API 密钥而自动选用。",
+      "sourceEnv": "来自环境变量 {name}。在这里保存后将优先使用保存的值。",
+      "saved": "模型设置已保存",
+      "savedDescription": "已写入 .repowise/config.yaml，CLI 也会使用它。",
+      "savedGlobal": "默认模型已保存",
+      "active": "当前使用",
+      "noKeyRequired": "无需密钥",
+      "keySet": "已设置密钥",
+      "noKey": "未设置密钥",
+      "use": "使用",
+      "useAria": "使用 {name}",
+      "test": "测试",
+      "testAria": "测试 {name} 连接",
+      "addKey": "添加密钥",
+      "updateKey": "更新密钥",
+      "removeKeyAria": "移除 {name} 密钥",
+      "keyAria": "{name} API 密钥",
+      "keyPlaceholder": "粘贴你的 {name} API 密钥",
+      "saveKeyAria": "保存 {name} API 密钥",
+      "connectionVerified": "连接已验证",
+      "connectionFailed": "连接失败",
+      "saveFailed": "未保存。你的修改仍保留在这里，请重试。"
     },
     "display": {
       "title": "显示",
@@ -566,19 +748,12 @@
       "summarySingleRepo": "当前为单仓库模式，因此仅限工作区的工具在此不可用。"
     },
     "provider": {
-      "title": "模型默认值",
-      "description": "从此仪表盘触发 init 或 sync 时使用。",
-      "descriptionWithServer": "从此仪表盘触发 init 或 sync 时使用。服务器自身当前配置为 {provider}。",
-      "providerLabel": "提供商",
-      "providerAria": "提供商",
-      "modelLabel": "模型",
-      "modelHint": "留空则使用提供商的默认值。",
+      "title": "默认模型",
+      "description": "没有单独设置模型的代码仓库都使用它。要为某个代码仓库设置模型，请打开该仓库的设置页面。",
       "embedderLabel": "嵌入模型",
       "embedderHint": "语义搜索基于它构建。mock 嵌入模型会禁用语义搜索。",
-      "embedderAria": "嵌入模型",
-      "embedderOffNote": "语义搜索已关闭。请在上方选择其他嵌入模型，并在服务端设置 <code>REPOWISE_EMBEDDER</code> 以启用真实检索。",
-      "embedderOnNote": "请在服务端设置 <code>{env}</code>。",
-      "catalogUnavailable": "无法从服务器加载提供商列表，因此只显示已保存的提供商。"
+      "embedderOffNote": "语义搜索已关闭。请在服务端设置 <code>REPOWISE_EMBEDDER</code> 以启用真实检索。",
+      "embedderOnNote": "通过服务端的 <code>{env}</code> 设置。"
     }
   },
   "repos": {
@@ -769,7 +944,27 @@
     "noProvider": "尚未配置对话提供商。请先在<link>设置</link>中添加 API 密钥，然后就可以开始提问了。",
     "noProviderShort": "尚未配置对话提供商。请先在<link>设置</link>中添加 API 密钥。",
     "unverifiedFigure": "未在本轮工具结果中找到",
-    "unverifiedFiguresNote": "带点状下划线的数字未在本轮工具结果中找到。"
+    "unverifiedFiguresNote": "带点状下划线的数字未在本轮工具结果中找到。",
+    "emptySuggestions": {
+      "treemap": "用树状图按包展示代码健康度",
+      "riskiest": "哪些文件改动风险最高？为什么？",
+      "weeklyChanges": "展示我们每周做了哪些类型的变更",
+      "coverageGaps": "测试覆盖率最大的缺口在哪里？",
+      "deadCode": "哪些死代码可以安全删除？",
+      "healthSlide": "用图表做一页代码健康摘要"
+    },
+    "modelMenu": {
+      "dialog": "选择对话模型",
+      "provider": "提供商",
+      "search": "搜索或输入模型 ID",
+      "useTyped": "使用“{id}”",
+      "repoDefault": "仓库默认",
+      "providerDefault": "默认",
+      "loading": "正在加载模型",
+      "noMatch": "没有匹配的模型。",
+      "configure": "在设置中配置",
+      "needsSetup": "其他提供商需要先添加密钥。"
+    }
   },
   "codeHealth": {
     "hotspots": {
@@ -838,7 +1033,33 @@
     "cancelled": "任务已取消",
     "cancelledDescription": "流水线在完成之前就被停止了。",
     "cancelFailed": "无法取消任务",
-    "progressCount": "{completed}/{total} 个页面"
+    "progressCount": "{completed}/{total} 个页面",
+    "completedWithProblems": "已完成，但存在问题{name}",
+    "pagesFailed": "有 {count} 个页面未能写入。",
+    "progress": {
+      "warningTitle": "已完成，但存在问题",
+      "noPagesWritten": "没有写入任何文档页面。",
+      "somePagesFailed": "{total} 个页面中有 {failed} 个未能写入。再次运行即可重试这些页面。",
+      "docsSkipped": "文档未更新。",
+      "retry": "重试",
+      "startAgain": "重新开始",
+      "providerSettings": "模型提供方设置",
+      "dismiss": "关闭"
+    },
+    "issue": {
+      "auth": "{provider} 拒绝了 API 密钥。请在设置中更新。",
+      "rate_limit": "{provider} 正在限制请求频率。请等待几分钟后再运行。",
+      "model_not_found": "在 {provider} 上找不到模型 {model}。请在设置中选择其他模型。",
+      "not_found": "在 {provider} 上找不到模型 {model} 或基础 URL 路径。请在设置中检查这两项。",
+      "unreachable": "无法连接到 {target}。请确认服务器正在运行且基础 URL 正确。",
+      "docs_skipped": "已配置模型提供方，但无法加载，因此文档未更新。请在设置中检查。"
+    },
+    "banner": {
+      "finishedWithProblems": "{action}已完成，但存在问题",
+      "pagesFailed": "{count} 个页面未写入",
+      "providerSettings": "模型提供方设置",
+      "dismiss": "关闭"
+    }
   },
   "overview": {
     "ask": {
