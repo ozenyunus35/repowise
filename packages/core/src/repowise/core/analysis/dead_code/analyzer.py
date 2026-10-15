@@ -54,7 +54,11 @@ from .constants import (
     never_flag_path,
 )
 from .contract_methods import is_com_method_implementation, is_contract_method
-from .csharp_reachability import build_csharp_named_files, build_csharp_named_types
+from .csharp_reachability import (
+    build_csharp_named_files,
+    build_csharp_named_types,
+    scanned_implementations,
+)
 from .deletion_gate import apply_deletion_gate
 from .dynamic_markers import (
     find_dynamic_edge_files,
@@ -101,6 +105,7 @@ from .risk_factors import (
     path_risk_factors,
     risk_evidence,
 )
+from .swift_reachability import build_swift_named_files
 from .vbnet_modules import vbnet_module_names
 
 #: The unindexed scan below and the repo-wide absence check ask the same
@@ -880,6 +885,10 @@ class DeadCodeAnalyzer:
         # scopes the C# name rescue to the projects that can see a file.
         self._dotnet_index = dotnet_index
         self._csharp_named_files: frozenset[str] | None = None
+        self._swift_named_files: frozenset[str] | None = None
+        # C# classes a plugin host or container finds by type, built on first use.
+        self._csharp_discovered: frozenset[tuple[str, str]] | None = None
+        self._parsed_files = parsed_files or {}
         self.git_meta_map = git_meta_map or {}
         # Source files ingestion could not read (currently: dropped on size).
         # An unread importer is invisible to the graph, so "no importers" stops
@@ -961,6 +970,14 @@ class DeadCodeAnalyzer:
             self._meta_annotations = MetaAnnotations(self._source_map, _is_framework_registered)
         return self._meta_annotations.visible_in(path)
 
+    def _csharp_discovered_classes(self) -> frozenset[tuple[str, str]]:
+        """``(file, class)`` the runtime instantiates by type; see :func:`scanned_implementations`."""
+        if self._csharp_discovered is None:
+            self._csharp_discovered = scanned_implementations(
+                self.graph, self._source_map, self._parsed_files
+            )
+        return self._csharp_discovered
+
     def _reachability_rescues(self, whitelist: AbstractSet[str]) -> ReachabilityRescues:
         """Assemble the rescue state the shared predicate reads."""
         if self._package_files is None:
@@ -971,12 +988,16 @@ class DeadCodeAnalyzer:
                 self._source_map,
                 dotnet_index=self._dotnet_index,
                 repo_root=self._repo_root,
+                discovered=self._csharp_discovered_classes(),
             )
+        if self._swift_named_files is None:
+            self._swift_named_files = build_swift_named_files(self.graph, self._source_map)
         return ReachabilityRescues(
             bundler_alias_targets=frozenset(self._bundler_alias_targets),
             whitelist=frozenset(whitelist),
             package_files=self._package_files,
             csharp_named_files=self._csharp_named_files,
+            swift_named_files=self._swift_named_files,
         )
 
     def analyze(
@@ -1096,6 +1117,7 @@ class DeadCodeAnalyzer:
             _names_by_file(exports),
             dotnet_index=self._dotnet_index,
             repo_root=self._repo_root,
+            discovered=self._csharp_discovered_classes(),
         )
         dropped = {id(f) for f in exports if (f.file_path, f.symbol_name) in named}
         demote_used_in_own_file([f for f in exports if id(f) not in dropped], self._source_map)

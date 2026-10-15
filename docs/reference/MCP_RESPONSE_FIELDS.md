@@ -171,11 +171,13 @@ Per target, under `targets`:
 | `cross_repo` | Workspace mode: `co_changes_with` partners in other repos and contract `consumers` / `providers` |
 | `*_basis` | Beside an empty `callers`, `callees` or `used_by`: the language, how many call edges the index resolved for it, and the share that are guesses. An empty list means no resolved edge, not proof of none |
 
-Opt-in blocks: `full_doc`, `ownership` (primary owner, bus factor, contributor count), `last_change`, `callers`, `callees`, `metrics` (PageRank, betweenness, percentiles), `community`, `skeleton`, `health`, `doc_drift`, `symbols` (every symbol of a file), `changes`, `provenance`.
+Opt-in blocks: `full_doc`, `ownership` (primary owner, bus factor, contributor count), `last_change`, `callers`, `callees`, `metrics` (PageRank, betweenness, percentiles), `community`, `skeleton`, `health`, `doc_drift`, `symbols` (every symbol of a file), `changes`, `provenance`, `suspects`.
 
 **changes.** On a file target, `recent_changes` lists the newest five Change Records whose files include it, each `{id, ref, title, merged_at, category, provenance}`; `ref` is the forge's number (`#123`, `!12`) and is absent for an unnamed change, and `provenance` is `{label, coverage}` (`agent`, `human_attested` or `unknown`; absent when the change was stored without a label or attribution is off). `recent_changes_total` appears when more touched the file. The newest 500 candidate changes are read, and a change stores only its first 1,000 files, so a file past either limit can be missing from the list.
 
 **provenance.** A file's commits by source: `agent_commits`, `human_attested_commits`, `unknown_commits`, `coverage` (known over all commits), `agent_share` (agent over known commits) and a one-line `summary`. Below 30% coverage `agent_share` is null with `suppressed_reason: "coverage_below_floor"`, and the agent and human-attested counts are left out. Unknown is never counted as human. With attribution off the block is `{"unavailable": "attribution_off"}`.
+
+**suspects.** One top-level block, not per target: `window` (`since`, `until`), `candidates` (changes merged in the 14 days before now), `texts_missing` (changes git could not read, ranked on title and files alone), `symptom_files` (the targets mapped onto files tracked at HEAD) and `suspects`, at most five rows of `{id, ref, title, merged_at, category, head_sha, files_changed, rank, signals}`, where `signals` maps each signal that fired (`text`, `graph`, `co-change`, `recency`, `trace`) to its own `rank` and `evidence`. `note` says the order is a reading order, not a cause; no row carries a score or probability.
 
 **Change targets.** A `change:<id>` target (an id such as `pr-123`, or a commit sha the change landed) returns `type: "change"`, `id`, `ref`, `title`, `merged_at`, `category`, `shape` (`merge`, `squash`, `commit`), `head_sha`, `commit_count`, `files_changed`, `lines_added`, `lines_deleted`, `files` (paths, the first 25 with `files_total` and an omission ref past that), `linked_issues` when the messages close any, and `provenance`: `{label, agent_commits, human_attested_commits, unknown_commits, coverage}`, `{"unavailable": "attribution_off"}`, or `{"unavailable": "not_recorded"}` for a change stored while attribution was off. An unknown id returns `error` naming the id forms; a short sha that starts commits in several changes returns `error` with their ids as `candidates`.
 
@@ -382,6 +384,10 @@ Items are ordered by value first, then tier. History markers (churn, ownership, 
 Provisional finding types appear only with `include=["unverified"]`, each marked `verification: "unverified"`. A withheld type never lists but still lowers the score it was counted in, so a file row reports it as `withheld_deduction` and `_meta.withheld` names the type, its count and why it is held back. Targeted mode is never split into production and test.
 
 Health findings, refactoring plans and opportunities, and performance opportunities on Java, C#, C and C++ files are held back pending verification for those languages. They are still stored and a lookup by id still answers; `_meta.gated` counts them per layer and language, and `include=["unverified"]` shows them.
+
+Health findings on files the index stores as vendored or generated are held back the same way, in every language: that code is changed upstream or by its generator. `_meta.gated.health` counts them under `vendored` and `generated` as plain numbers, and `_meta.gated.reasons` gives each reason once when the call lists no finding. Scores, KPIs and the worst-file order still count them.
+
+On test files, history markers (ownership, churn, change entropy, co-change and the other git-derived kinds) are held back too, counted under `test_history`: they describe how a test changes, not a defect in it. Code-shape findings on tests are still listed.
 
 ### Opt-in blocks
 

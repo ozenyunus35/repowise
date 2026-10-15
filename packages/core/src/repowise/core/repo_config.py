@@ -40,7 +40,7 @@ CONFIG_DEPENDENCY_KEYS: dict[str, frozenset[str]] = {
     # Agent-surface preferences. init records `hooks` and `editor_files` after
     # it fingerprints the config, so leaving them in "other" turned the first
     # update after every init into a full rebuild.
-    "state_only": frozenset({"distill", "editor_files", "hooks", "mcp"}),
+    "state_only": frozenset({"distill", "editor_files", "events", "hooks", "mcp"}),
 }
 
 
@@ -338,23 +338,39 @@ def save_repo_env_key(
     elif not found:
         existing_lines.append(f"{env_var}={value}")
 
-    # Ignore rule first, secret second. If the .gitignore write fails (a
-    # read-only checkout, a root-owned file) this raises before the key is on
-    # disk, rather than after. The failure then costs the user a saved key
-    # instead of leaving a committable one behind.
-    if ensure_gitignored and value is not None:
-        _ensure_env_gitignored(repo_path)
+    write_private_file(
+        repo_path,
+        ".env",
+        "\n".join(existing_lines) + "\n",
+        comment="repowise API keys (local)",
+        ignore=ensure_gitignored and value is not None,
+    )
 
-    env_dir.mkdir(parents=True, exist_ok=True)
-    env_file.write_text("\n".join(existing_lines) + "\n", encoding="utf-8")
-    # The file holds API keys; keep it owner-only where the OS honours it
-    # (best-effort: a no-op on Windows).
+
+def write_private_file(
+    repo_path: Path | str, name: str, text: str, *, comment: str, ignore: bool = True
+) -> Path:
+    """Write a secret ``.repowise/<name>``: git-ignored first, owner-only after.
+
+    Some repositories commit ``.repowise/`` for its shared config, so a secret
+    there needs its own ignore rule. Ignore rule first, secret second: if the
+    .gitignore write fails (a read-only checkout, a root-owned file) this
+    raises before the secret is on disk rather than after, which costs the
+    caller a saved secret instead of leaving a committable one behind.
+    """
+    if ignore:
+        _ensure_gitignored(repo_path, f".repowise/{name}", comment)
+    path = get_repowise_dir(repo_path) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    # Owner-only where the OS honours it (best-effort: a no-op on Windows).
     try:
         import os
 
-        os.chmod(env_file, 0o600)
+        os.chmod(path, 0o600)
     except OSError:
         pass
+    return path
 
 
 def ensure_manifest_tracked(repo_path: Path | str) -> bool:
@@ -399,10 +415,11 @@ def ensure_manifest_tracked(repo_path: Path | str) -> bool:
     return True
 
 
-def _ensure_env_gitignored(repo_path: Path | str) -> None:
-    """Add ``.repowise/.env`` to the repo's ``.gitignore`` if not already listed."""
+def _ensure_gitignored(repo_path: Path | str, pattern: str, comment: str) -> None:
+    """Add *pattern* to the repo's ``.gitignore`` unless git already ignores it."""
     gitignore = Path(repo_path) / ".gitignore"
-    pattern = ".repowise/.env"
+    if _git_ignores(repo_path, pattern):
+        return  # e.g. a ``.repowise/`` rule: a second line would only dirty the file
 
     if gitignore.exists():
         content = gitignore.read_text(encoding="utf-8")
@@ -412,10 +429,32 @@ def _ensure_env_gitignored(repo_path: Path | str) -> None:
             return
         if not content.endswith("\n"):
             content += "\n"
-        content += f"\n# repowise API keys (local)\n{pattern}\n"
+        content += f"\n# {comment}\n{pattern}\n"
         gitignore.write_text(content, encoding="utf-8")
     else:
-        gitignore.write_text(
-            f"# repowise API keys (local)\n{pattern}\n",
-            encoding="utf-8",
+        gitignore.write_text(f"# {comment}\n{pattern}\n", encoding="utf-8")
+
+
+def _git_ignores(repo_path: Path | str, pattern: str) -> bool:
+    """Whether a ``.gitignore`` inside the repo already covers *pattern*.
+
+    Rules from ``.git/info/exclude`` or a global excludes file do not count:
+    teammates do not share them. ``False`` when git cannot say.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "--no-index", pattern],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    # ``<source>:<line>:<rule><TAB><path>``; a repo .gitignore is reported relative.
+    source = result.stdout.split("\t", 1)[0].rsplit(":", 2)[0]
+    return Path(source).name == ".gitignore" and not Path(source).is_absolute()

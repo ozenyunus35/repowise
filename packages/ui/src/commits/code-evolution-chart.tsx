@@ -267,7 +267,7 @@ export function CodeEvolutionChart({
       <ResponsiveContainer width="100%" height={260}>
         <AreaChart
           data={chartData}
-          margin={{ top: 4, right: 8, bottom: 0, left: -16 }}
+          margin={{ top: 4, right: 8, bottom: 0, left: 0 }}
         >
           <CartesianGrid
             strokeDasharray="3 3"
@@ -288,6 +288,8 @@ export function CodeEvolutionChart({
             tickLine={false}
             width={36}
             domain={mode === "share" ? [0, 100] : [0, "auto"]}
+            // Per-band rounding can stack to 100.1; keep the axis at 100%.
+            allowDataOverflow={mode === "share"}
             tickFormatter={(v) => (mode === "share" ? `${v}%` : `${v}`)}
           />
           <Tooltip

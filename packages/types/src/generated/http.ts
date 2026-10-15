@@ -367,9 +367,35 @@ export interface CallersCalleesResponse {
   relations?: SymbolRelationGroup[];
 }
 
+/** An entity a card or view points at. Never a URL; the renderer resolves it. */
+export interface CardRef {
+  type: "repo" | "file" | "symbol" | "module" | "component" | "commit" | "change" | "decision";
+  id: string;
+  start_line?: number | null;
+  end_line?: number | null;
+}
+
 export interface ChangeAuthor {
   name: string;
   email: string;
+}
+
+/** The evidence checklist (``repowise.core.changes.evidence``), versioned. */
+export interface ChangeEvidence {
+  schema_version: number;
+  change_id?: string | null;
+  revspec?: string | null;
+  generated_at: string;
+  index_commit?: string | null;
+  items: EvidenceItem[];
+}
+
+/** Status counts of a change's kept checklist; never builds one. */
+export interface ChangeEvidenceSummary {
+  generated_at: string;
+  ok: number;
+  attention: number;
+  unknown: number;
 }
 
 /** The Kamei change-shape features the risk model scores. */
@@ -404,12 +430,33 @@ export interface ChangeIdentity {
   value: string;
 }
 
+export interface ChangeListItem {
+  schema_version: number;
+  id: string;
+  identity: ChangeIdentity;
+  shape: string;
+  forge: string;
+  forge_ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  head_sha: string;
+  author: ChangeAuthor;
+  commit_count: number;
+  files_changed: number;
+  lines_added: number;
+  lines_deleted: number;
+  category: string;
+  provenance?: ChangeProvenance | null;
+  evidence_summary?: ChangeEvidenceSummary | null;
+}
+
 export interface ChangeListResponse {
-  items: ChangeSummary[];
+  items: ChangeListItem[];
   total: number;
   limit: number;
   offset: number;
   attribution: boolean;
+  checklists_built?: ChecklistsBuilt | null;
 }
 
 /** Three-state AI provenance over the change's commits, with its coverage. */
@@ -441,25 +488,8 @@ export interface ChangeRecord {
   commits: string[];
   files: ChangeFile[];
   metadata: ChangeForgeMetadata;
-}
-
-export interface ChangeSummary {
-  schema_version: number;
-  id: string;
-  identity: ChangeIdentity;
-  shape: string;
-  forge: string;
-  forge_ref?: string | null;
-  title: string;
-  merged_at?: string | null;
-  head_sha: string;
-  author: ChangeAuthor;
-  commit_count: number;
-  files_changed: number;
-  lines_added: number;
-  lines_deleted: number;
-  category: string;
-  provenance?: ChangeProvenance | null;
+  evidence?: ChangeEvidence | null;
+  evidence_building?: boolean;
 }
 
 export interface ChangelogEntryModel {
@@ -495,6 +525,29 @@ export interface ChatArtifactEnvelope {
   evidence?: Record<string, unknown>;
   pinned?: boolean;
   created_at?: string | null;
+}
+
+/** A file a tool result cited, and that result's ``artifact_id``. */
+export interface ChatCitation {
+  file_path: string;
+  symbol_name?: string | null;
+  start_line?: number | null;
+  end_line?: number | null;
+  artifact_id?: string | null;
+  ref?: CardRef | null;
+}
+
+/**
+ * A number the answer states. Offsets are UTF-16 units into ``answer``;
+ * a verified figure carries the ``artifact_id`` of the result holding it.
+ */
+export interface ChatFigure {
+  text: string;
+  start: number;
+  end: number;
+  verified: boolean;
+  artifact_id?: string | null;
+  derived?: boolean;
 }
 
 export interface ChatMessageResponse {
@@ -602,9 +655,11 @@ export interface ChatTurnResultResponse {
   stop_reason: "answered" | "loop_cap" | "token_budget" | "turn_budget" | "refused" | "cancelled" | "error";
   provider: string;
   model: string;
-  citations?: Record<string, unknown>[];
+  citations?: ChatCitation[];
   cards?: Record<string, unknown>[];
   views?: Record<string, unknown>[];
+  figures?: ChatFigure[];
+  diagnostics?: Record<string, number>;
   tool_trace?: ChatToolTraceEntry[];
   follow_ups?: ChatSuggestion[];
   usage?: ChatTurnUsage;
@@ -617,6 +672,12 @@ export interface ChatTurnUsage {
   input_tokens?: number | null;
   output_tokens?: number | null;
   model_calls?: number;
+}
+
+/** How many of the changes a list's filters match keep an evidence checklist. */
+export interface ChecklistsBuilt {
+  built: number;
+  changes: number;
 }
 
 /**
@@ -652,6 +713,17 @@ export interface ClaudeMdResponse {
   generated_at: string;
   repo_name: string;
   sections?: string[];
+}
+
+export interface CloudEvent {
+  specversion: string;
+  id: string;
+  source: string;
+  type: string;
+  time: string;
+  datacontenttype: string;
+  subject?: string | null;
+  data: Record<string, unknown>;
 }
 
 /**
@@ -1523,6 +1595,31 @@ export interface EpisodeSummary {
   birth_at: string | null;
   last_seen_at: string | null;
   still_true?: string | null;
+}
+
+export interface EventListResponse {
+  events: CloudEvent[];
+  snapshot_runs?: number;
+  empty_reason?: "baseline_only" | "no_match" | "nothing_moved" | null;
+  empty_note?: string | null;
+}
+
+/** One checklist row: what was found, whether it needs a look, how it is known. */
+export interface EvidenceItem {
+  kind: string;
+  label: string;
+  status: "ok" | "attention" | "unknown";
+  basis: "measured" | "inferred" | "declared" | "unresolved";
+  value?: unknown;
+  details: Record<string, unknown>[];
+  source: string;
+  line?: EvidenceLine | null;
+}
+
+/** An item's value as a message key and its parameters, for a client to word. */
+export interface EvidenceLine {
+  key: string;
+  params: Record<string, unknown>;
 }
 
 /** The top-ranked evidence row, slimmed for list rows. */
@@ -2514,6 +2611,7 @@ export interface OwnerListEntry {
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
   commit_count_90d: number | null;
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   bus_factor_risk_files: number;
 }
@@ -2535,6 +2633,7 @@ export interface OwnerProfileResponse {
   dead_code_files_owned: number;
   dead_code_lines_owned: number;
   commit_count_90d: number | null;
+  commit_count_90d_at_least?: number | null;
   last_commit_at: string | null;
   first_commit_at: string | null;
   bus_factor_risk_files: number;
@@ -2554,6 +2653,63 @@ export interface OwnershipEntry {
   owner_pct: number | null;
   file_count: number;
   is_silo: boolean;
+}
+
+export interface PackageUsageComponent {
+  name: string;
+  files: number;
+  owners: string[];
+}
+
+export interface PackageUsageDeclaration {
+  package_key: string;
+  version?: string | null;
+  declared_in: string;
+  dev?: boolean;
+}
+
+/** One module the file imports and how it was matched to the package. */
+export interface PackageUsageModule {
+  name: string;
+  mapping: "declared" | "inferred";
+}
+
+export interface PackageUsageReachability {
+  state: string;
+  basis: string;
+}
+
+/** Where one package is imported: sites, components, owner teams, reachability. */
+export interface PackageUsageResponse {
+  package: string;
+  ecosystem?: string | null;
+  declared: PackageUsageDeclaration[];
+  summary: PackageUsageSummary;
+  sites: PackageUsageSite[];
+  components: PackageUsageComponent[];
+  method: Record<string, string>;
+  note?: string | null;
+}
+
+/** One file importing the package. */
+export interface PackageUsageSite {
+  path: string;
+  modules: PackageUsageModule[];
+  symbols: string[];
+  mapping: "declared" | "inferred";
+  line?: number | null;
+  statement?: string | null;
+  component?: string | null;
+  owners: string[];
+  owner_counts?: Record<string, number> | null;
+  reachability: PackageUsageReachability;
+}
+
+export interface PackageUsageSummary {
+  files: number;
+  components: number;
+  reachability: Record<string, number>;
+  inferred_files: number;
 }
 
 /** PATCH body for /lookup/notes. ``None`` clears the note. */
@@ -3442,6 +3598,44 @@ export interface SetActiveProviderRequest {
 export interface SetApiKeyRequest {
   api_key: string;
   repo_id?: string | null;
+}
+
+/** One change in reading order; ``signals`` holds each signal that fired. */
+export interface Suspect {
+  id: string;
+  ref?: string | null;
+  title: string;
+  merged_at?: string | null;
+  category: string;
+  head_sha: string;
+  files_changed: number;
+  provenance?: string | null;
+  rank: number;
+  signals: Record<string, SuspectSignal>;
+}
+
+export interface SuspectSignal {
+  rank: number;
+  evidence: string[];
+}
+
+/** A symptom and the window to rank the changes merged in. */
+export interface SuspectsRequest {
+  symptom?: string;
+  files?: string[];
+  trace?: string;
+  since?: string | null;
+  until?: string | null;
+  limit?: number;
+}
+
+export interface SuspectsResponse {
+  window: Record<string, string>;
+  candidates: number;
+  texts_missing?: number;
+  symptom_files?: string[];
+  suspects: Suspect[];
+  note: string;
 }
 
 /**
