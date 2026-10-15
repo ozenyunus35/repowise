@@ -1125,6 +1125,8 @@ _LANGUAGE_STATEMENT_ENDS = {"python": frozenset("\n"), "dart": frozenset(";")}
 _NEXT_LINE_CONTINUES = {
     language: re.compile(r"[.?:+\-*/%&|=!<>]|(?:as|is)\b") for language in ("kotlin", "swift")
 }
+_SWIFT_OPTIONAL_BINDING_PREFIX = re.compile(r"(?:\b(?:if|guard|while)|,)\s*$")
+_SWIFT_BINDING_ENDS = re.compile(r"[{,]|\belse\b")
 
 
 def _call_end(text: str, index: int) -> int:
@@ -1179,19 +1181,25 @@ def _after_trailing_lambda(text: str, end: int) -> int:
     return end
 
 
-def _call_ends_statement(cleaned: str, opened: int, language: str) -> bool:
+def _call_ends_statement(cleaned: str, opened: int, language: str, start: int = 0) -> bool:
     """Does the call whose ``(`` ends just before *opened* end its statement?"""
     end = _call_end(cleaned, opened)
     if end >= 0 and language == "kotlin":
         end = _after_trailing_lambda(cleaned, end)
-    return _ends_statement(cleaned, end, language)
+    return _ends_statement(cleaned, end, language, start)
 
 
-def _ends_statement(cleaned: str, end: int, language: str) -> bool:
+def _ends_statement(cleaned: str, end: int, language: str, start: int = 0) -> bool:
     """Does the expression ending at *end* end its statement (-1: it never ends)?"""
     if end < 0:
         return False
     rest = cleaned[end:].lstrip(" \t\n" if language == "dart" else " \t")
+    if (
+        language == "swift"
+        and _SWIFT_OPTIONAL_BINDING_PREFIX.search(cleaned[:start])
+        and _SWIFT_BINDING_ENDS.match(rest)
+    ):
+        return True
     if rest and rest[0] not in _LANGUAGE_STATEMENT_ENDS.get(language, _STATEMENT_ENDS):
         return False
     continues = _NEXT_LINE_CONTINUES.get(language)
@@ -1211,7 +1219,7 @@ def scan_call_assignments(text: str, language: str) -> tuple[CallAssignment, ...
     starts = [0, *(newline.end() for newline in _NEWLINE.finditer(cleaned))]
     found: list[CallAssignment] = []
     for match in pattern.finditer(cleaned):
-        if not _call_ends_statement(cleaned, match.end(), language):
+        if not _call_ends_statement(cleaned, match.end(), language, match.start()):
             continue
         found.append(
             CallAssignment(

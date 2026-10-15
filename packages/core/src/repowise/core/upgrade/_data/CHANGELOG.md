@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Charts are in colour again, from one palette.** Every chart and share bar in the web UI draws from the same eight series colours, a commit type keeps one colour on every chart, health and risk charts keep their green, amber and red, heatmaps step through the accent orange, and chat charts sit on the conversation without a card around them.
+- **One provider order everywhere.** The CLI, `repowise serve` chat and jobs, and the MCP server now resolve provider, model and base URL as flag or UI choice, then `.repowise/config.yaml`, then the web UI's global default, then `REPOWISE_PROVIDER` / `REPOWISE_MODEL`, so `config.yaml` now wins over those env vars in the CLI. Choosing a model or base URL for a repo in the web UI writes that repo's `config.yaml`, which makes switching models on a local OpenAI-compatible server such as LM Studio a single edit. A base URL in `config.yaml` now beats `OPENAI_BASE_URL` and the other `*_BASE_URL` variables. The default provider and model saved in the web UI settings now also apply to CLI runs in repos whose `config.yaml` names none. A `config.yaml` base URL receives an API key from outside that repo's `.repowise/.env` only when it is a local address or was confirmed in Settings or with `repowise init`.
+
 ## [0.56.0] - 2026-10-12
 
 repowise 0.56 hands agents the exact thing they need to act on. Search returns matching source lines and finds every file in the repository, `get_context` lists every edit site of a symbol verified against live files, caller rows carry the calling line, and `repowise update --working-tree` brings uncommitted work into the index in seconds. `repowise impacted-tests` selects a targeted subset on far more changes, with `--prioritize` and `--explain`.

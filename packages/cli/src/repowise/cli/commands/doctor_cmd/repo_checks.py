@@ -184,7 +184,7 @@ def _provider_checks(repo_path: _DoctorPath) -> list[DoctorCheck]:
 
     from repowise.cli.helpers import validate_provider_config
 
-    config_warnings = validate_provider_config()
+    config_warnings = validate_provider_config(repo_path=repo_path)
     config_ok = not config_warnings
     config_detail = "No misconfigured provider keys" if config_ok else "; ".join(config_warnings)
     checks.append(_check("Provider config", config_ok, config_detail))
@@ -276,6 +276,19 @@ def _attribution_notes_check(repo_path: _DoctorPath) -> DoctorCheck | None:
     return _check(name, True, f"fetch refspec and notes.rewriteRef set; {push}")
 
 
+def _events_config_check(repo_path: _DoctorPath) -> DoctorCheck | None:
+    """The ``events:`` block, when it has values that fell back to defaults."""
+    try:
+        from repowise.core.events.store import load_event_settings
+
+        errors = load_event_settings(repo_path).errors
+    except Exception as exc:
+        return _check("Events config", True, f"could not read it ({exc})")
+    if not errors:
+        return None
+    return _check("Events config", False, "; ".join(errors) + " (defaults used)")
+
+
 def _run_repo_checks(
     repo_path: _DoctorPath, repair: bool, *, fmt: str = "table"
 ) -> tuple[bool, list[DoctorCheck]]:
@@ -310,6 +323,9 @@ def _run_repo_checks(
     notes_check = _attribution_notes_check(repo_path)
     if notes_check is not None:
         checks.append(notes_check)
+    events_check = _events_config_check(repo_path)
+    if events_check is not None:
+        checks.append(events_check)
 
     # 3. Database connectable?
     db_path = repowise_dir / "wiki.db"

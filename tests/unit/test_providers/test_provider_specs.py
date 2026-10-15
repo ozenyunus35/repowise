@@ -91,6 +91,8 @@ _ALLOWED: dict[str, frozenset[str]] = {
     "core/src/repowise/core/ingestion/external_systems/classifier.py": frozenset(
         {"anthropic", "openai"}
     ),
+    # SDK module names whose error base classes chat matches.
+    "server/src/repowise/server/chat_errors.py": frozenset({"anthropic", "openai", "ollama"}),
     # Behaviour only the OpenAI adapter has: the custom-gateway row and base-url
     # prompt, and its reasoning budget. Ollama's readiness is a TCP probe.
     "cli/src/repowise/cli/helpers.py": frozenset({"openai"}),
@@ -98,14 +100,13 @@ _ALLOWED: dict[str, frozenset[str]] = {
     "server/src/repowise/server/mcp_server/tool_answer/synthesis.py": frozenset({"openai"}),
     # Embedder surfaces: these literals name embedders, which share spellings.
     "core/src/repowise/core/providers/embedding/registry.py": _EMBEDDERS,
+    "core/src/repowise/core/providers/embedding/resolve.py": _EMBEDDERS,
     "cli/src/repowise/cli/commands/init_cmd/command.py": _EMBEDDERS,
     "cli/src/repowise/cli/commands/reindex_cmd.py": _EMBEDDERS,
     "cli/src/repowise/cli/commands/serve_cmd.py": _EMBEDDERS,
     "cli/src/repowise/cli/commands/update_cmd/deterministic.py": _EMBEDDERS,
     "cli/src/repowise/cli/providers/embedders.py": _EMBEDDERS,
-    "cli/src/repowise/cli/providers/keys.py": _EMBEDDERS,
     "cli/src/repowise/cli/ui/mode_selection.py": _EMBEDDERS,
-    "server/src/repowise/server/app.py": _EMBEDDERS,
     "server/src/repowise/server/mcp_server/_server.py": _EMBEDDERS,
 }
 

@@ -50,7 +50,7 @@ from ...models import (
 from .._shared import _BATCH_SIZE
 from ..graph import get_test_file_paths
 from .plain_rows import plain_rows
-from .shown import shown
+from .shown import gated_counts, shown
 
 
 def _health_finding_row_kwargs(finding: Any, repository_id: str) -> dict:
@@ -497,6 +497,8 @@ async def get_health_findings(
     status: str = "open",
     include_withheld: bool = False,
     include_unverified: bool = False,
+    file_holds: bool = True,
+    hold_history: bool = True,
     limit: int | None = None,
 ) -> list[HealthFinding]:
     """Findings for one repository: production ahead of test files, worth doing
@@ -509,7 +511,10 @@ async def get_health_findings(
     returned. Files of a language the registry gates for health findings are
     left out too, unless ``include_unverified`` (which also opts into every
     provisional type). ``include_withheld`` is for analysis that must see every
-    row.
+    row. ``file_holds=False`` keeps the findings held back by their file
+    (vendored, generated, history on a test) for a reader that sums scores or
+    KPIs, which count them. ``hold_history=False`` keeps history markers on
+    production files for a view that treats history itself.
 
     ``exclude_dimensions`` is how a general queue keeps a dimension out of a
     ranking it does not share units with. It is ignored when ``dimension``
@@ -551,6 +556,8 @@ async def get_health_findings(
                 HealthFinding.file_path,
                 requested=types,
                 include_unverified=include_unverified,
+                file_holds=file_holds,
+                hold_history=hold_history,
             )
         )
     if file_path is not None:
@@ -598,6 +605,35 @@ async def get_health_findings(
     )
     ordered = sorted(kept, key=lambda f: (f.file_path in tests, reasons[f.id] is not None))
     return ordered if limit is None else ordered[:limit]
+
+
+async def gated_health_counts(
+    session: AsyncSession,
+    repository_id: str,
+    *,
+    file_path: str | None = None,
+    include_unverified: bool = False,
+    hold_history: bool = True,
+) -> dict[str, dict]:
+    """``{language or file hold: {count, reason}}`` over the open findings
+    :func:`get_health_findings` leaves out by default, so a list says why it
+    is shorter than the stored scores suggest."""
+    where = [
+        HealthFinding.repository_id == repository_id,
+        HealthFinding.status == "open",
+        HealthFinding.biomarker_type.not_in(excluded_types()),
+    ]
+    if file_path is not None:
+        where.append(HealthFinding.file_path == file_path)
+    return await gated_counts(
+        session,
+        "health",
+        HealthFinding,
+        *where,
+        kind_col=HealthFinding.biomarker_type,
+        include_unverified=include_unverified,
+        hold_history=hold_history,
+    )
 
 
 async def health_finding_priorities(
@@ -777,7 +813,10 @@ async def _open_finding_totals_rows(session: AsyncSession, repository_id: str) -
         .where(
             HealthFinding.repository_id == repository_id,
             HealthFinding.status == "open",
-            shown("health", HealthFinding.biomarker_type, HealthFinding.file_path),
+            # The totals sum what the scores counted, file-held rows included.
+            shown(
+                "health", HealthFinding.biomarker_type, HealthFinding.file_path, file_holds=False
+            ),
         )
         .order_by(HealthFinding.health_impact.desc(), HealthFinding.id)
     )

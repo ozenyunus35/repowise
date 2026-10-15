@@ -137,8 +137,8 @@ describe("route links", () => {
   });
 
   it("still recognises the deep links we keep on purpose", () => {
-    // If `/wiki` stops being a redirect this allowance is dead weight, and the
+    // If one stops being a redirect its allowance is dead weight, and the
     // set should shrink rather than quietly cover a real page.
-    expect(redirectOnlySegments().has("wiki")).toBe(true);
+    for (const seg of DELIBERATE) expect(redirectOnlySegments().has(seg)).toBe(true);
   });
 });

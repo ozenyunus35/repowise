@@ -922,13 +922,14 @@ def save_config(
     (single-repo init, workspace init, ``workspace add``). All three otherwise
     leave an indexed repo their MCP server cannot authenticate against.
     """
-    ensure_repowise_dir(repo_path)
-    config_path = get_repowise_dir(repo_path) / CONFIG_FILENAME
+    from repowise.core.providers.llm.resolve import apply_llm_selection
+    from repowise.core.repo_config import save_repo_config
 
-    # Round-trip: preserve any existing keys (e.g. exclude_patterns set via CLI)
-    existing = load_config(repo_path)
-    existing["provider"] = provider
-    existing["model"] = model
+    ensure_repowise_dir(repo_path)
+
+    # Round-trip: preserve any existing keys (e.g. exclude_patterns set via CLI).
+    # provider/model go through the writer the web UI uses too.
+    existing = apply_llm_selection(load_config(repo_path), provider, model)
     existing["embedder"] = embedder
     if embedding_model:
         existing["embedding_model"] = embedding_model
@@ -944,24 +945,33 @@ def save_config(
     if reasoning is not None:
         existing["reasoning"] = resolve_reasoning(reasoning)
 
-    try:
-        import yaml  # type: ignore[import-untyped]
-
-        config_path.write_text(
-            yaml.dump(existing, default_flow_style=False, sort_keys=False),
-            encoding="utf-8",
-        )
-    except ImportError:
-        # Fallback: write simple key-value format (lists not supported)
-        lines = [f"provider: {provider}", f"model: {model}", f"embedder: {embedder}"]
-        if embedding_model:
-            lines.append(f"embedding_model: {embedding_model}")
-        if reasoning is not None:
-            lines.append(f"reasoning: {resolve_reasoning(reasoning)}")
-        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    save_repo_config(repo_path, existing)
+    _trust_configured_base_url(repo_path, existing, provider)
 
     if save_key:
         _persist_provider_key(repo_path, provider)
+
+
+def _trust_configured_base_url(repo_path: Path, config: dict[str, Any], provider: str) -> None:
+    """Record ``<provider>.base_url`` as confirmed: this init run chose to use it.
+
+    A config.yaml base URL only receives a key from outside the repo's own
+    ``.env`` once the user confirmed it on this machine; running ``init``
+    with it in place is that confirmation. An invalid URL is left unconfirmed,
+    and resolution reports it.
+    """
+    from repowise.core.providers.llm.resolve import trust_base_url, validate_base_url
+
+    section = config.get(provider)
+    if not isinstance(section, dict):
+        return
+    try:
+        url = validate_base_url(section.get("base_url"))
+    except ValueError:
+        return
+    if url:
+        with contextlib.suppress(OSError):
+            trust_base_url(repo_path, url)
 
 
 def save_config_partial(
@@ -1075,117 +1085,76 @@ def resolve_provider(
     model: str | None,
     repo_path: Path | None = None,
 ) -> Any:
-    """Resolve a provider instance from CLI flags or environment variables.
+    """Resolve a provider instance from CLI flags, the repo config, or env.
 
-    Resolution order:
-      1. Explicit ``--provider`` / ``--model`` flag
-      2. ``REPOWISE_PROVIDER`` / ``REPOWISE_MODEL`` env var
-      3. ``.repowise/config.yaml`` (written by ``repowise init``)
-      4. Auto-detect from API key env vars
+    The order is the shared one in :mod:`repowise.core.providers.llm.resolve`:
+    ``--provider`` / ``--model`` > ``.repowise/config.yaml`` > the global
+    default in ``provider_config.json`` > ``REPOWISE_PROVIDER`` /
+    ``REPOWISE_MODEL`` > auto-detection from API keys.
     """
+    from repowise.core.providers.llm.resolve import resolve_llm
+
+    selection = resolve_llm(repo_path, provider=provider_name, model=model)
+    if selection.provider is None:
+        # Not fatal on every path: `init` catches this and renders a template
+        # wiki instead, so the reason must not be recorded until it ends a
+        # command.
+        raise reasoned_error(_no_provider_message(), reason="no_provider_configured")
+    return _build_provider(selection, _provider_kwargs_or_error(selection, repo_path))
+
+
+def _provider_kwargs_or_error(selection: Any, repo_path: Path | None) -> dict[str, Any]:
+    """Constructor kwargs, warning when a configured provider has no key anywhere."""
+    from repowise.core.providers.llm.resolve import llm_provider_kwargs
+
+    try:
+        kwargs = llm_provider_kwargs(selection, repo_path)
+    except ValueError as exc:
+        # A base URL the repo's config.yaml sets that is malformed, or that
+        # nobody on this machine confirmed for a key from elsewhere.
+        raise reasoned_error(str(exc), reason="provider_setup_failed") from exc
+    if selection.provider_source != "autodetect" and "api_key" not in kwargs:
+        # A configured provider whose key is nowhere still gets built: the
+        # constructor says what it needs. Agent CLIs are checked for install.
+        for warning in validate_provider_config(selection.provider):
+            warn(warning)
+    return kwargs
+
+
+def _build_provider(selection: Any, kwargs: dict[str, Any]) -> Any:
+    """Construct the provider, turning a setup failure into a config error."""
     from repowise.core.providers import get_provider
+
+    try:
+        return get_provider(selection.provider, **kwargs)
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        # Everything this constructor reads is user input: env vars and
+        # .repowise/config.yaml, base_url above all. A typo there is a
+        # configuration error, not a repowise bug, but it used to surface as
+        # a raw traceback that escaped every caller's handler.
+        raise reasoned_error(
+            f"Could not set up the {selection.provider} provider: {exc}. "
+            f"Resolved {selection.describe()}. Check those settings.",
+            reason="provider_setup_failed",
+        ) from exc
+
+
+def _no_provider_message() -> str:
+    """The no-provider error, listing every env var that would configure one."""
     from repowise.core.providers.llm.registry import (
         PROVIDER_AUTODETECT_ORDER,
-        provider_credentials_present,
-        provider_kwargs,
+        provider_required_envs,
     )
 
-    cfg: dict[str, Any] = {}
-    if repo_path is not None:
-        cfg = load_config(repo_path)
-
-    if provider_name is None:
-        # An empty or whitespace-only value means "not set", not "a provider
-        # named ''". CI systems and agent harnesses declare env vars with empty
-        # values routinely (``REPOWISE_PROVIDER: ""`` in a workflow matrix),
-        # and the explicit-provider branch below keys off ``is not None``, so
-        # an empty string reached get_provider() and raised a bare ValueError
-        # traceback instead of falling through to auto-detection.
-        provider_name = (os.environ.get("REPOWISE_PROVIDER") or "").strip() or None
-
-    if provider_name is None and cfg.get("provider"):
-        provider_name = cfg["provider"]
-
-    if model is None:
-        model = (os.environ.get("REPOWISE_MODEL") or "").strip() or None
-
-    # Honor the config model regardless of how the provider was resolved (#416).
-    if model is None and cfg.get("model"):
-        model = cfg["model"]
-
-    def _config_base_url(name: str) -> str | None:
-        """Return a base_url the repo config sets for the provider, if any.
-
-        Env vars are handled by :func:`provider_kwargs` from the shared
-        registry mapping; this covers only the config-file source, which is
-        CLI-specific.
-        """
-        section = cfg.get(name)
-        if isinstance(section, dict):
-            base_url = section.get("base_url")
-            if base_url:
-                return base_url
-        return None
-
-    def _build(name: str) -> Any:
-        """Instantiate ``name`` with env-derived kwargs plus config fallbacks."""
-        kwargs = provider_kwargs(name, model=model, repo_path=repo_path)
-        # Applied to any name, as before: openrouter takes a base_url without
-        # having an env var for one, so gating this on the env map would drop a
-        # config value that used to be honored. (A stray `mock: {base_url: …}`
-        # in config.yaml still reaches a constructor that has no such
-        # parameter and raises TypeError. Longstanding, orthogonal to #1119.)
-        config_base_url = _config_base_url(name)
-        if config_base_url:
-            kwargs.setdefault("base_url", config_base_url)
-        try:
-            return get_provider(name, **kwargs)
-        except click.ClickException:
-            raise
-        except Exception as exc:
-            # Everything this constructor reads is user input: env vars and
-            # .repowise/config.yaml, base_url above all. A typo there is a
-            # configuration error, not a repowise bug, but it used to surface
-            # as a raw traceback that escaped every caller's handler —
-            # OLLAMA_BASE_URL=http://localhost:abc makes httpx raise
-            # InvalidURL, which killed `init` outright.
-            raise reasoned_error(
-                f"Could not set up the {name} provider: {exc}. Check its "
-                "settings in your environment and .repowise/config.yaml.",
-                reason="provider_setup_failed",
-            ) from exc
-
-    if provider_name is not None:
-        # Validate configuration before attempting to create provider
-        warnings = validate_provider_config(provider_name)
-        if warnings:
-            for warning in warnings:
-                warn(warning)
-            # For explicit provider requests, we still try to create it
-            # The provider constructor will fail if the API key is actually required
-
-        return _build(provider_name)
-
-    # Auto-detect from whatever credentials the env carries, in the shared
-    # priority order. The per-provider env-var mapping lives in the registry
-    # beside the provider table, so adding a provider wires it into the CLI and
-    # the MCP server at once instead of into whichever copy got remembered.
-    for candidate in PROVIDER_AUTODETECT_ORDER:
-        if provider_credentials_present(candidate):
-            return _build(candidate)
-
-    # Not fatal on every path: `init` catches this and renders a template wiki
-    # instead, so the reason must not be recorded until it ends a command.
-    raise reasoned_error(
-        "No provider configured. Use --provider, set REPOWISE_PROVIDER, "
-        "or set ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / "
-        "OLLAMA_BASE_URL / GEMINI_API_KEY / GOOGLE_API_KEY / DEEPSEEK_API_KEY / "
-        "KIMI_API_KEY / EDENAI_API_KEY / LITELLM_API_KEY. Use "
-        "REPOWISE_PROVIDER=claude_cli to use an "
-        "authenticated Claude Code subscription, REPOWISE_PROVIDER=codex_cli to use "
-        "an authenticated Codex CLI subscription, or REPOWISE_PROVIDER=opencode "
-        "to use opencode.",
-        reason="no_provider_configured",
+    env_vars = [var for name in PROVIDER_AUTODETECT_ORDER for var in provider_required_envs(name)]
+    return (
+        "No provider configured. Use --provider, set provider in .repowise/config.yaml or "
+        f"REPOWISE_PROVIDER, or set one of {' / '.join(env_vars)}. Use "
+        "REPOWISE_PROVIDER=claude_cli to use an authenticated Claude Code subscription, "
+        "REPOWISE_PROVIDER=codex_cli to use an authenticated Codex CLI subscription, or "
+        "REPOWISE_PROVIDER=opencode to use opencode."
     )
 
 
@@ -1304,11 +1273,14 @@ def resolve_provider_or_prompt(
 # ---------------------------------------------------------------------------
 
 
-def validate_provider_config(provider_name: str | None = None) -> list[str]:
+def validate_provider_config(
+    provider_name: str | None = None, repo_path: Path | None = None
+) -> list[str]:
     """Validate that required API keys/environment variables are set for the provider.
 
     Args:
         provider_name: The provider name to validate. If None, checks all possible providers.
+        repo_path: The repo whose configured provider counts as explicitly requested.
 
     Returns:
         List of warning messages for missing or invalid configuration.
@@ -1362,13 +1334,16 @@ def validate_provider_config(provider_name: str | None = None) -> list[str]:
             warnings.append(f"Provider '{provider_name}' requires {' or '.join(env_vars)}")
     else:
         # Check all providers - warn about any that could be configured but are missing keys
+        from repowise.core.providers.llm.resolve import resolve_llm
+
+        configured = resolve_llm(repo_path, autodetect=False).provider
         for name, env_vars in provider_env_vars.items():
             if any(_is_env_var_set(var) for var in env_vars):
                 continue
             # Only warn if this provider is explicitly requested OR
             # if the env var exists but is invalid (empty)
             env_var_exists = any(_is_env_var_exists(var) for var in env_vars)
-            explicitly_requested = os.environ.get("REPOWISE_PROVIDER") == name
+            explicitly_requested = configured == name
             if explicitly_requested or env_var_exists:
                 warnings.append(f"Provider '{name}' requires {' or '.join(env_vars)}")
 

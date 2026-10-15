@@ -53,9 +53,93 @@ def test_module_pages_assign_each_file_to_the_deepest_module():
     assert resolved.unassigned == ["README.md", "tools/gen.py"]
 
 
-def test_colliding_names_fall_back_to_the_full_path():
-    derived = derive_from_modules([("a/core", None), ("b/core", None)])
-    assert [c.name for c in derived] == ["core", "b-core"]
+def _names(roots):
+    return {c.root: c.name for c in derive_from_modules((r, None) for r in roots)}
+
+
+def test_the_shallowest_root_keeps_a_name_and_the_others_take_a_parent():
+    assert _names(["a/core", "b/core"]) == {"a/core": "core", "b/core": "core-b"}
+    # Layout directories (src, app, ...) do not qualify; the nearest real one does.
+    assert _names(["packages/ui/src/workspace", "packages/web/src/app/workspace"]) == {
+        "packages/ui/src/workspace": "workspace",
+        "packages/web/src/app/workspace": "workspace-web",
+    }
+    # Losers still tied after one parent both go one parent further out.
+    assert _names(["core", "a/x/core", "b/x/core"]) == {
+        "core": "core",
+        "a/x/core": "core-a",
+        "b/x/core": "core-b",
+    }
+
+
+def test_a_declared_component_without_paths_still_annotates_the_derived_one():
+    derived = derive_from_modules([("packages/ui", None), ("packages/cli/ui", None)])
+    files = ["packages/ui/button.ts", "packages/cli/ui/menu.py"]
+    resolved = resolve_components(
+        [Component(name="ui", owner="design", criticality="high")], derived, files
+    )
+    ui = resolved.get("ui")
+    assert (ui.root, ui.owner) == ("packages/ui", "design")
+    assert resolved.files["ui"] == ["packages/ui/button.ts"]
+    assert resolved.files["ui-cli"] == ["packages/cli/ui/menu.py"]
+
+
+def test_route_parameter_and_group_segments_never_name_a_component():
+    assert _names(
+        [
+            "web/app/repos/[id]",
+            "web/app/(marketing)",
+            "web/app/docs/[...slug]",
+            "web/app/shop/[[...filters]]",
+            "api/users/{userId}",
+            "(marketing)",
+        ]
+    ) == {
+        "web/app/repos/[id]": "repos",
+        "web/app/(marketing)": "app",
+        "web/app/docs/[...slug]": "docs",
+        "web/app/shop/[[...filters]]": "shop",
+        "api/users/{userId}": "users",
+        "(marketing)": "marketing",  # a group that is the whole root still names it
+    }
+
+
+def test_template_directories_are_not_route_segments():
+    assert _names(["tpl/{{cookiecutter.name}}"]) == {
+        "tpl/{{cookiecutter.name}}": "cookiecutter-name"
+    }
+
+
+def test_a_route_under_a_parameter_is_qualified_past_it():
+    assert _names(["web/components/settings", "web/app/repos/[id]/settings"]) == {
+        "web/components/settings": "settings",
+        "web/app/repos/[id]/settings": "settings-repos",
+    }
+
+
+def test_no_component_is_dropped_when_every_readable_name_is_taken():
+    # a-b/c and a_b/c lose "c" and slug alike at every level: only the hash tells them apart.
+    assert _names(["c", "a-b/c", "a_b/c"]) == {
+        "c": "c",
+        "a-b/c": "c-1c7275",
+        "a_b/c": "c-9eddec",
+    }
+    # A leaf that slugs to nothing goes straight to the whole path.
+    assert _names(["x/__"]) == {"x/__": "x"}
+
+
+def test_derived_names_depend_only_on_the_set_of_roots():
+    import itertools
+
+    roots = ["a/core", "b/x/core", "c/x/core", "web/app/repos/[id]", "lib/util", "d/util"]
+    names = _names(roots)
+    assert names["b/x/core"] == "core-b" and names["c/x/core"] == "core-c"
+    for order in itertools.permutations(roots):
+        assert _names(order) == names
+    # A deeper same-name root leaves every existing name alone.
+    grown = _names([*roots, "e/f/core"])
+    assert grown["e/f/core"] == "core-f"
+    assert {r: grown[r] for r in roots} == names
 
 
 def test_services_come_from_the_repo_s_own_system_graph_nodes():
@@ -226,7 +310,12 @@ def test_dead_code_that_never_ran_is_unavailable_not_zero():
     assert (ran["dead_code"]["findings"], ran["dead_code"]["basis"]) == (0, "inferred")
 
 
-def test_gated_languages_are_left_out_of_health_and_dead_code():
+def test_gated_languages_are_left_out_of_health_and_dead_code(monkeypatch):
+    # No shipped row is gated: run on the audit's gated table.
+    from repowise.core.analysis import finding_registry
+    from tests.unit.server.mcp.test_language_gates import AUDIT_GATED
+
+    monkeypatch.setattr(finding_registry, "LANGUAGE_GATES", AUDIT_GATED)
     health_rows = {
         "A.java": {"score": 2.0, "nloc": 100},
         "b.py": {"score": 8.0, "nloc": 100},
@@ -243,7 +332,12 @@ def test_gated_languages_are_left_out_of_health_and_dead_code():
     assert dead["method"].endswith("; 1 file(s) in gated languages excluded")
 
 
-def test_only_gated_files_make_health_and_dead_code_unavailable():
+def test_only_gated_files_make_health_and_dead_code_unavailable(monkeypatch):
+    # No shipped row is gated: run on the audit's gated table.
+    from repowise.core.analysis import finding_registry
+    from tests.unit.server.mcp.test_language_gates import AUDIT_GATED
+
+    monkeypatch.setattr(finding_registry, "LANGUAGE_GATES", AUDIT_GATED)
     facts = rollup_component(
         ["A.java", "B.cs"], test_files=set(), git_rows={},
         health_rows={"A.java": {"score": 2.0, "nloc": 10}, "B.cs": {"score": 3.0, "nloc": 10}},
