@@ -744,6 +744,10 @@ _SCHEME_TEMPLATE_VALUE = re.compile(
 _OWN_NAME_VALUE = re.compile(r"[A-Za-z_-]+")
 _CONSTANT_NAME = re.compile(r"[A-Z][A-Z0-9_]*")
 _KEY_NAME_VALUE = re.compile(r"[a-z]+(?:[_-][a-z]+)+|[a-z_]*_[a-z_]*")
+# Uppercase env-var names and sentinels can have short version numbers. Four
+# consecutive digits are credential-shaped, so keep those values reportable.
+_UPPER_KEY_NAME_VALUE = re.compile(r"[A-Z_][A-Z0-9_]*")
+_LONG_DIGIT_RUN = re.compile(r"[0-9]{4,}")
 
 
 def _is_own_name_value(value: str, name: str) -> bool:
@@ -782,7 +786,14 @@ def _is_secret_value(kind: str, val: str, name: str = "") -> bool:
     if kind not in _KEYWORD_KINDS:
         return True
     value = val.strip()
-    if kind == "hardcoded_secret" and _KEY_NAME_VALUE.fullmatch(value):
+    if kind == "hardcoded_secret" and (
+        _KEY_NAME_VALUE.fullmatch(value)
+        or (
+            "_" in value
+            and _UPPER_KEY_NAME_VALUE.fullmatch(value)
+            and not _LONG_DIGIT_RUN.search(value)
+        )
+    ):
         return False
     if _is_own_name_value(value, name):
         return False

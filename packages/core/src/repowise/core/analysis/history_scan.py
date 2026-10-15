@@ -42,9 +42,11 @@ from typing import Any
 
 from repowise.core.analysis.git_cat_file import cat_file_batch
 from repowise.core.analysis.secret_allowlist import secret_path_allowlist
+from repowise.core.analysis.security_gate import _KEY_SHAPE_KINDS, fingerprint_of
 from repowise.core.analysis.security_scan import (
     SECRET_KINDS,
     SecurityScanner,
+    source_lines,
 )
 from repowise.core.ingestion.models import EXTENSION_TO_LANGUAGE
 
@@ -331,9 +333,19 @@ class HistorySecurityScanner:
             for blob_sha, path in blobs.items()
             if not path or self._is_source(path)
         ]
+        commit_positions = {sha: index for index, (sha, _) in enumerate(commits)}
+
+        def introduction_order(item: tuple[str, str]) -> int:
+            commit_sha = blob_introduced_at.get(item[0], "")
+            return commit_positions.get(commit_sha, len(commits))
+
+        # Keep the earliest introduction in Git history order: author dates
+        # can be backdated. Blobs with unknown provenance are processed last.
+        source_items.sort(key=introduction_order)
         contents_map = self._read_blobs_batch(
             repo_path, [blob_sha for blob_sha, _ in source_items]
         )
+        seen: set[str] = set()
 
         for idx, (blob_sha, path) in enumerate(source_items, start=1):
             summary.files_scanned += 1
@@ -362,17 +374,32 @@ class HistorySecurityScanner:
             if commit_sha:
                 commit_at = _parse_author_date(commit_dates.get(commit_sha, ""))
 
-            inserted = await self._scanner.persist(
-                path or "<unknown>",
-                kept,
-                commit_sha=commit_sha,
-                commit_at=commit_at,
-            )
-            summary.findings_inserted += inserted
+            lines = source_lines(content)
             for f in kept:
+                material = ""
+                if f["kind"] in _KEY_SHAPE_KINDS:
+                    material = "\n".join(lines[f["line"] - 1 : f.get("end_line", f["line"])])
+                fingerprint = fingerprint_of(
+                    path or "<unknown>", f["kind"], f.get("snippet", ""), material
+                )
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+
+                # Count actual writes per finding, including on idempotent
+                # re-runs where an existing provenance row inserts nothing.
+                inserted = await self._scanner.persist(
+                    path or "<unknown>",
+                    [f],
+                    commit_sha=commit_sha,
+                    commit_at=commit_at,
+                )
+                if not inserted:
+                    continue
+                summary.findings_inserted += inserted
                 sev = f.get("severity", "unknown")
                 kind = f.get("kind", "unknown")
-                summary.by_severity[sev] = summary.by_severity.get(sev, 0) + 1
-                summary.by_kind[kind] = summary.by_kind.get(kind, 0) + 1
+                summary.by_severity[sev] = summary.by_severity.get(sev, 0) + inserted
+                summary.by_kind[kind] = summary.by_kind.get(kind, 0) + inserted
 
         return summary

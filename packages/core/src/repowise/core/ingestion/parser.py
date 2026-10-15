@@ -157,10 +157,10 @@ QUERIES_DIR = Path(__file__).parent / "queries"
 # it would misfire on the parent lexical_declaration kind mapping.
 _MODULE_ANCHORED_NODE_TYPES = frozenset({"assignment", "variable_declarator"})
 
-# Languages whose source reaches the parser as TypeScript/JavaScript. The two
+# Languages whose source reaches the parser as TypeScript/JavaScript. The
 # SFC tags are here because ``sfc_source`` projects their <script> blocks into
 # a TS buffer at identical offsets, so every TS/JS code path applies verbatim.
-_TS_JS_LANGUAGES = ("typescript", "javascript", "svelte", "vue")
+_TS_JS_LANGUAGES = ("typescript", "javascript", "svelte", "vue", "astro")
 
 # Languages whose query defines the ``@reference.*`` captures. Every other
 # language would only scan the whole match list to find nothing, so the check
@@ -263,7 +263,11 @@ def _dart_call_receiver(name: Node, src: str) -> CallReceiver | None:
     """
     if name.parent.type == "unconditional_assignable_selector":
         head = name.parent.parent
-        receiver: str | None = _node_text(head.prev_named_sibling, src).strip()
+        prev = head.prev_named_sibling
+        if prev is not None and any(c.type == "argument_part" for c in prev.named_children):
+            receiver = None
+        else:
+            receiver = _node_text(prev, src).strip() if prev is not None else None
     else:
         head, receiver = name, None
     return CallReceiver(
