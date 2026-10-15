@@ -172,6 +172,20 @@ public static class ClassicExtensions
         assert set(methods) == {"IsShort"}
         assert methods["IsShort"].signature == "IsShort(this string value) -> bool"
 
+    def test_a_block_that_does_not_parse_is_left_alone(self, parser: ASTParser) -> None:
+        # The grammar cannot read an extension property, so the block is left
+        # as the symbol pass found it.
+        src = b"""\
+public static class StringExtensions
+{
+    extension(string value)
+    {
+        public bool IsEmpty => value.Length == 0;
+    }
+}
+"""
+        assert set(self._methods(parser, src)) == {"extension"}
+
     def test_a_real_constructor_is_kept(self, parser: ASTParser) -> None:
         # Not a static class, so ``extension(...)`` here is a real constructor
         # of a class named ``extension``.

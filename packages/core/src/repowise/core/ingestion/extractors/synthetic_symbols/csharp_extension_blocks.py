@@ -53,7 +53,13 @@ def _extension_blocks(root: Node, src: str) -> Iterator[tuple[Node, str]]:
                     if member.type != "constructor_declaration":
                         continue
                     member_name = member.child_by_field_name("name")
-                    if member_name is not None and node_text(member_name, src) == _EXTENSION:
+                    # A block that does not parse cleanly (extension properties,
+                    # a generic ``extension<T>``) keeps its current handling.
+                    if (
+                        member_name is not None
+                        and node_text(member_name, src) == _EXTENSION
+                        and not member.has_error
+                    ):
                         yield member, holder
         stack.extend(node.children)
 
