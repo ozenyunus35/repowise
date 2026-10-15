@@ -22,6 +22,7 @@ Declared components merge over derived ones:
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -82,25 +83,90 @@ def _derived(roots: Iterable[tuple[str, str | None]], source: str) -> list[Compo
         root = (root or "").replace("\\", "/").strip("/")
         if root and root != ".":
             cleaned.setdefault(root, title)
-    taken: set[str] = set()
-    out: list[Component] = []
-    # Shallow roots first, so a short name goes to the outer directory.
-    for root in sorted(cleaned, key=lambda r: (r.count("/"), r)):
-        name = _slug(root.rsplit("/", 1)[-1])
-        if not name or name.lower() in taken:
-            name = _slug(root)
-        if name.lower() in taken:
-            continue
-        taken.add(name.lower())
-        out.append(
-            Component(
-                name=name,
-                title=cleaned[root],
-                paths=(f"{root}/**",),
-                source=source,
-                root=root,
-            )
+    names = _assign_names(list(cleaned))
+    return [
+        Component(
+            name=names[root],
+            title=cleaned[root],
+            paths=(f"{root}/**",),
+            source=source,
+            root=root,
         )
+        for root in sorted(cleaned, key=lambda r: (r.count("/"), r))
+    ]
+
+
+def _assign_names(roots: list[str]) -> dict[str, str]:
+    """A unique name per root.
+
+    The bare name goes to the shallowest root that wants it (ties by path), so
+    a name a catalog may already use to annotate a derived component stays put.
+    The roots that lose it move through their other candidates together: when
+    two or more want the same name, all of them take their next one, so the
+    qualified names depend only on the set of roots, never on input order. The
+    last candidate (a hash of the root) is unique, so no root is dropped.
+    """
+    cands = {r: _names(r) for r in roots}
+    names: dict[str, str] = {}
+    for r in sorted(roots, key=lambda r: (r.count("/"), r)):
+        if cands[r][0].lower() not in {n.lower() for n in names.values()}:
+            names[r] = cands[r][0]
+    taken = {n.lower() for n in names.values()}
+    level = {r: min(1, len(cands[r]) - 1) for r in roots if r not in names}
+    while level:
+        for r in level:
+            while level[r] < len(cands[r]) - 1 and cands[r][level[r]].lower() in taken:
+                level[r] += 1
+        wanting: dict[str, list[str]] = {}
+        for r in level:
+            wanting.setdefault(cands[r][level[r]].lower(), []).append(r)
+        moved = False
+        for group in wanting.values():
+            if len(group) < 2:
+                continue
+            for r in group:
+                if level[r] < len(cands[r]) - 1:
+                    level[r] += 1
+                    moved = True
+        if not moved:  # no clash left (two equal 6-hex hashes are not worth a loop)
+            break
+    names.update({r: cands[r][i] for r, i in level.items()})
+    return names
+
+
+#: A framework route segment that names a parameter or a group, not a place:
+#: ``[id]``, ``[...slug]``, ``[[...opt]]``, ``(group)``, ``{id}``, ``:id``, ``$id``.
+#: Braces and prefixes take a bare identifier only, so a template directory
+#: such as ``{{cookiecutter.name}}`` is not a route.
+_ROUTE_SEGMENT = re.compile(r"^(\[.*\]|\(.*\)|\{[\w.-]+\}|[:$][\w-]+)$")
+#: Layout directories too generic to tell two same-named components apart.
+_LAYOUT_SEGMENTS = frozenset({"src", "lib", "app", "apps", "packages", "pkg", "internal", "source"})
+
+
+def _names(root: str) -> list[str]:
+    """Candidate names for *root*, best first.
+
+    The last segment that is not a route parameter or group, then that name
+    qualified by one ancestor, nearest first and skipping layout directories
+    (``packages/web/src/app/workspace`` becomes ``workspace-web``), then the
+    whole path, then the name with a hash of the root. A root made only of
+    route segments is named from them. A layout leaf such as ``src`` keeps its
+    name: its parent usually names the parent's own component.
+    """
+    parts = root.split("/")
+    places = [p for p in parts if not _ROUTE_SEGMENT.match(p)] or parts
+    leaf = _slug(places[-1])
+    qualified = (
+        [_slug(f"{leaf}-{p}") for p in reversed(places[:-1]) if p.lower() not in _LAYOUT_SEGMENTS]
+        if leaf
+        else []
+    )
+    digest = hashlib.sha1(root.encode("utf-8")).hexdigest()[:6]
+    hashed = f"{(leaf or _slug(root))[:56].strip('-')}-{digest}".lstrip("-")
+    out: list[str] = []
+    for name in (leaf, *qualified, _slug(root), hashed):
+        if name and name.lower() not in {n.lower() for n in out}:
+            out.append(name)
     return out
 
 

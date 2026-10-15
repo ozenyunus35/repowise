@@ -11,7 +11,8 @@ events as SSE, and an in-process caller uses the class directly.
 The tools a model is shown, and the only ones it can run, are the backend's
 catalog for the principal narrowed by the policy's allowlist and safety
 ceiling, plus the chat-only ``show_view`` tool, which builds tables and
-charts from this turn's results (:mod:`repowise.server.chat_views`).
+charts from the conversation's tool results (:mod:`repowise.server.chat_views`), and
+the chat-only ``find_suspects`` (:mod:`repowise.server.chat_suspects`).
 Everything outside the loop goes through the seams in
 :mod:`repowise.server.chat_seams`.
 """
@@ -25,7 +26,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-from repowise.core.providers.llm.base import ChatProvider, ProviderError
+from pydantic import ValidationError
+
+from repowise.core.providers.llm.base import ChatProvider
 from repowise.server.auth import Principal
 from repowise.server.chat_artifacts import create_artifact_envelope
 from repowise.server.chat_context import (
@@ -34,6 +37,8 @@ from repowise.server.chat_context import (
     compose_request,
     is_context_overflow,
 )
+from repowise.server.chat_errors import NO_PROVIDER_MESSAGE, internal_error, provider_failure
+from repowise.server.chat_figures import check_figures
 from repowise.server.chat_grounding import plan_grounding, run_grounding
 from repowise.server.chat_prompt import (
     _build_system_prompt,
@@ -43,6 +48,7 @@ from repowise.server.chat_prompt import (
     stored_messages_to_llm_format,
     tool_result_message,
 )
+from repowise.server.chat_references import ArtifactIndex
 from repowise.server.chat_seams import (
     ConversationStore,
     NoTurnHooks,
@@ -60,8 +66,20 @@ from repowise.server.chat_seams import (
 from repowise.server.chat_store import SqlConversationStore
 from repowise.server.chat_suggestions import conversation_title, follow_up_suggestions, tool_names
 from repowise.server.chat_summaries import _build_tool_summary
-from repowise.server.chat_tools import ChatToolContract, LocalToolBackend, tool_schemas
+from repowise.server.chat_suspects import (
+    SCOPE_TOOL,
+    SUSPECTS_TOOL,
+    find_suspects_schema,
+    run_find_suspects,
+)
+from repowise.server.chat_tools import (
+    ChatToolContract,
+    LocalToolBackend,
+    make_json_serializable,
+    tool_schemas,
+)
 from repowise.server.chat_views import SHOW_VIEW_TOOL, TurnViews, show_view_schema
+from repowise.server.schemas.evidence import CardRef
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +139,10 @@ class ChatTurnResult:
     citations: list[dict[str, Any]] = field(default_factory=list)
     cards: list[dict[str, Any]] = field(default_factory=list)
     views: list[dict[str, Any]] = field(default_factory=list)
+    #: Each number the answer states, looked up in the turn's tool results;
+    #: a verified one carries the ``artifact_id`` it came from.
+    figures: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics: dict[str, int] = field(default_factory=dict)
     tool_trace: list[ToolTraceEntry] = field(default_factory=list)
     follow_ups: list[dict[str, Any]] = field(default_factory=list)
     usage: TurnUsage = field(default_factory=TurnUsage)
@@ -156,29 +178,63 @@ async def _never_cancelled() -> bool:
 # ---------------------------------------------------------------------------
 
 
+_CITATION_FIELDS = (
+    ("file_path", str),
+    ("symbol_name", str),
+    ("start_line", int),
+    ("end_line", int),
+)
+
+
 def _citations(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Files the turn's tool results cite, first mention first."""
+    """Files the turn's tool results cite, first mention first, each with the
+    ``artifact_id`` of the result that cited it and its entity ``ref``."""
     seen: set[tuple[Any, ...]] = set()
     out: list[dict[str, Any]] = []
     for call in tool_calls:
-        data = (call.get("artifact") or {}).get("data") or {}
+        artifact = call.get("artifact") or {}
+        data = artifact.get("data") or {}
         raw = data.get("citations") if isinstance(data, dict) else None
         for item in raw if isinstance(raw, list) else []:
             if isinstance(item, str):
                 citation = {"file_path": item}
             elif isinstance(item, dict) and isinstance(item.get("file_path"), str):
+                # Only the types the citation contract takes: a tool's "10-20" is not a line.
                 citation = {
                     key: item[key]
-                    for key in ("file_path", "symbol_name", "start_line", "end_line")
-                    if item.get(key) is not None
+                    for key, kind in _CITATION_FIELDS
+                    if isinstance(item.get(key), kind) and not isinstance(item[key], bool)
                 }
             else:
                 continue
             key = tuple(sorted(citation.items()))
-            if key not in seen:
-                seen.add(key)
-                out.append(citation)
+            if key in seen:
+                continue
+            seen.add(key)
+            if isinstance(artifact.get("id"), str):
+                citation["artifact_id"] = artifact["id"]
+            ref = _citation_ref(citation)
+            if ref is not None:
+                citation["ref"] = ref
+            out.append(citation)
     return out
+
+
+def _citation_ref(citation: dict[str, Any]) -> dict[str, Any] | None:
+    """The file or symbol a citation names, as a ``CardRef``; None when it does not validate."""
+    symbol = citation.get("symbol_name")
+    ref: dict[str, Any] = (
+        {"type": "symbol", "id": f"{citation['file_path']}::{symbol}"}
+        if isinstance(symbol, str) and symbol
+        else {"type": "file", "id": citation["file_path"]}
+    )
+    for key in ("start_line", "end_line"):
+        if key in citation:
+            ref[key] = citation[key]
+    try:
+        return CardRef.model_validate(ref).model_dump(exclude_none=True)
+    except ValidationError:
+        return None
 
 
 def _tool_trace(tool_calls: list[dict[str, Any]]) -> list[ToolTraceEntry]:
@@ -220,6 +276,8 @@ def _result_from_content(
         citations=_citations(tool_calls),
         cards=list(content.get("cards") or []),
         views=list(content.get("views") or []),
+        figures=list(content.get("figures") or []),
+        diagnostics=dict(content.get("diagnostics") or {}),
         tool_trace=_tool_trace(tool_calls),
         follow_ups=list(content.get("follow_ups") or []),
         usage=TurnUsage(**usage) if isinstance(usage, dict) else TurnUsage(),
@@ -227,8 +285,26 @@ def _result_from_content(
     )
 
 
-def _closing_events(result: ChatTurnResult) -> list[dict[str, Any]]:
+def _closing_events(result: ChatTurnResult, text_shift: int = 0) -> list[dict[str, Any]]:
+    """``text_shift`` moves figure offsets from the answer onto the streamed
+    text, which also holds what the model wrote before its tool calls."""
     events: list[dict[str, Any]] = []
+    if result.diagnostics:
+        events.append(
+            {
+                "type": "diagnostics",
+                **result.diagnostics,
+                "unverified_figures": [
+                    {
+                        "text": f["text"],
+                        "start": f["start"] + text_shift,
+                        "end": f["end"] + text_shift,
+                    }
+                    for f in result.figures
+                    if not f.get("verified")
+                ],
+            }
+        )
     if result.follow_ups:
         events.append({"type": "suggestions", "suggestions": result.follow_ups})
     done: dict[str, Any] = {
@@ -269,18 +345,29 @@ class _Turn:
         tokens_before: int,
         is_cancelled: IsCancelled,
         shows_views: bool = False,
+        finds_suspects: bool = False,
+        question: str = "",
+        prior_calls: list[dict[str, Any]] | None = None,
+        artifacts: ArtifactIndex | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.catalog = {tool.entry.name: tool for tool in catalog}
         self.shows_views = shows_views
-        self.views = TurnViews()
+        self.finds_suspects = finds_suspects
+        #: Earlier turns' results stay citable by show_view.
+        self.views = TurnViews(artifacts)
         self.policy = policy
         self.base = base
         self.rounds: list[list[dict[str, Any]]] = []
         self.tokens_before = tokens_before
         self.is_cancelled = is_cancelled
         self.text_parts: list[str] = []
+        #: Text streamed this turn in UTF-16 units, the offsets a browser uses.
+        self.streamed_units = 0
+        self.question = question
+        #: Earlier turns' tool calls: a figure restated from them is still a tool's.
+        self.prior_calls = prior_calls or []
         self.provider_content: list[dict[str, Any]] | None = None
         self.tool_calls: list[dict[str, Any]] = []
         self.stop_reason: StopReason = "answered"
@@ -300,20 +387,30 @@ class _Turn:
     async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Run one tool the session admits; also handed to providers that loop internally.
 
-        Each result is stamped with the artifact id ``show_view`` takes.
+        Each result is stamped with the artifact id ``show_view`` takes. A
+        result is JSON-safe from here on, so a backend's datetime never fails
+        the request, the stream or the store: the local backend and
+        ``find_suspects`` already serialize theirs, any other backend's is
+        serialized here, once.
         """
         if name == SHOW_VIEW_TOOL and self.shows_views:
             return self.views.show(arguments)
+        if name == SUSPECTS_TOOL and self.finds_suspects:
+            result = await run_find_suspects(arguments, getattr(self.tools, "repo_alias", None))
+            return self.views.record(name, arguments, result, evidence_basis="inferred")
         tool = self.catalog.get(name)
         if tool is None:
             return {
                 "error": f"Tool is not available in this session: {name}",
                 "error_code": "tool_not_enabled",
             }
+        result = await self.tools.execute(name, arguments)
+        if not isinstance(self.tools, LocalToolBackend):
+            result = make_json_serializable(result)
         return self.views.record(
             name,
             arguments,
-            await self.tools.execute(name, arguments),
+            result,
             artifact_type=tool.entry.artifact_type,
             evidence_basis=tool.entry.evidence_basis,
         )
@@ -405,20 +502,25 @@ class _Turn:
                         emitted = True
                         yield out
                 return
-            except ProviderError as exc:
+            except Exception as exc:
+                # A provider failure is the person's to fix; anything else is a bug.
+                message = provider_failure(exc, self.provider.provider_name)
+                if message is None:
+                    raise
                 overflow = is_context_overflow(exc)
                 if overflow and attempt == 0 and not emitted:
                     logger.warning("chat_context_overflow_retry")
                     pending.clear()
                     continue
                 self.stop_reason = "error"
-                self.error = OVERFLOW_MESSAGE if overflow else str(exc)
+                self.error = OVERFLOW_MESSAGE if overflow else message
                 yield {"type": "error", "message": self.error}
                 return
 
     def _on_provider_event(self, event: Any, pending: list[dict[str, Any]]) -> list[dict]:
         if event.type == "text_delta" and event.text:
             self.text_parts.append(event.text)
+            self.streamed_units += len(event.text.encode("utf-16-le")) // 2
             return [{"type": "text_delta", "text": event.text}]
         if event.type == "usage":
             self.input_tokens = (self.input_tokens or 0) + event.input_tokens
@@ -512,6 +614,39 @@ class _Turn:
         if self.views.parts:
             content["views"] = self.views.parts
         return content
+
+    async def check_figures(self, content: dict[str, Any]) -> None:
+        """Add the numeric check to *content*; CPU-bound, so off the event loop."""
+        check = await asyncio.to_thread(
+            check_figures,
+            content["text"],
+            [
+                *_artifact_sources(self.tool_calls),
+                *((part["source"]["artifact_id"], part) for part in self.views.parts),
+            ],
+            self.question,
+            _artifact_sources(self.prior_calls),
+        )
+        if check.figures:
+            content["figures"] = [figure.to_json() for figure in check.figures]
+        if diagnostics := check.diagnostics():
+            content["diagnostics"] = diagnostics
+
+    @property
+    def answer_shift(self) -> int:
+        """UTF-16 units streamed before the final answer's text."""
+        answer = "".join(self.text_parts)
+        return self.streamed_units - len(answer.encode("utf-16-le")) // 2
+
+
+def _artifact_sources(tool_calls: list[dict[str, Any]]) -> list[tuple[str | None, Any]]:
+    """``(artifact_id, data)`` of each stored tool call that has a result."""
+    sources: list[tuple[str | None, Any]] = []
+    for call in tool_calls:
+        artifact = call.get("artifact") or {}
+        if isinstance(artifact, dict) and "data" in artifact:
+            sources.append((artifact.get("id"), artifact["data"]))
+    return sources
 
 
 def _stored_tool_call(
@@ -682,7 +817,18 @@ class ChatSession:
         outcome: _Outcome,
     ) -> AsyncIterator[dict[str, Any]]:
         if self.provider is None:
-            raise ValueError("this session was opened without a provider")
+            outcome.result = ChatTurnResult(
+                conversation_id=self.id,
+                message_id=None,
+                user_message_id=None,
+                answer="",
+                stop_reason="error",
+                provider="",
+                model="",
+                error=NO_PROVIDER_MESSAGE,
+            )
+            yield {"type": "error", "message": NO_PROVIDER_MESSAGE}
+            return
         async with _turn_lock(self.id):
             try:
                 async for event in self._turn(
@@ -695,7 +841,7 @@ class ChatSession:
                 raise
             except Exception as exc:
                 logger.exception("Chat turn error")
-                text = f"Internal error: {type(exc).__name__}: {exc}"
+                text = internal_error(exc)
                 outcome.result = self._unstored("error", error=text)
                 yield {"type": "error", "message": text}
 
@@ -779,15 +925,26 @@ class ChatSession:
                 self.id, {"text": message}, idempotency_key=idempotency_key
             )
         history = await self.store.messages(self.id)
+        # Indexed once for the turn, so each show_view is a dict lookup.
+        artifacts = ArtifactIndex.from_history(history)
         opening = all(m.id == user_message_id for m in history)
 
         catalog = self.catalog()
         # show_view is chat-only and read-only: never an MCP tool, offered
         # whenever there is a tool whose result it could be built from.
         shows_views = bool(catalog) and self.policy.admits_name(SHOW_VIEW_TOOL, "read_only")
+        # find_suspects is chat-only too: it reads the index in process, so it
+        # needs the local backend and follows get_context's admission.
+        finds_suspects = (
+            isinstance(self.tools, LocalToolBackend)
+            and any(tool.entry.name == SCOPE_TOOL for tool in catalog)
+            and self.policy.admits_name(SUSPECTS_TOOL, "read_only")
+        )
         schemas = tool_schemas(catalog)
         if shows_views:
             schemas.append(show_view_schema([tool.entry.artifact_type for tool in catalog]))
+        if finds_suspects:
+            schemas.append(find_suspects_schema())
         turn = _Turn(
             provider=self.provider,
             tools=self.tools,
@@ -799,12 +956,22 @@ class ChatSession:
             tokens_before=conversation.tokens_used,
             is_cancelled=is_cancelled,
             shows_views=shows_views,
+            finds_suspects=finds_suspects,
+            question=message,
+            prior_calls=[
+                call
+                for stored in history
+                if stored.id != user_message_id
+                for call in stored.content.get("tool_calls") or []
+                if isinstance(call, dict)
+            ],
+            artifacts=artifacts,
         )
         grounded = await turn.ground(context)
         if grounded is not None:
             yield grounded
         system_prompt = _build_system_prompt(
-            self.scope.repo_name, self.scope.repo_path, catalog, context
+            self.scope.repo_name, self.scope.repo_path, catalog, context, shows_views=shows_views
         )
         async for event in turn.run(system_prompt, schemas):
             yield event
@@ -820,6 +987,7 @@ class ChatSession:
             return
 
         content = turn.reply_content()
+        await turn.check_figures(content)
         title = conversation_title(message, tool_names(turn.tool_calls)) if opening else None
         message_id = await self.store.add_reply(
             self.id, content, title=title, usage=turn.usage
@@ -832,7 +1000,7 @@ class ChatSession:
             user_message_id=user_message_id,
             stop_reason=turn.stop_reason,
         )
-        for event in _closing_events(outcome.result):
+        for event in _closing_events(outcome.result, turn.answer_shift):
             yield event
 
 

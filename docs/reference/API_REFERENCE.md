@@ -444,6 +444,14 @@ Six job modes exist (`job_executor.py`, `VALID_JOB_MODES`): `sync`,
 are not addressable by name over HTTP; each is the engine behind the endpoints
 in section 1. The mode is visible in `GET /api/jobs/{id}` under `config.mode`.
 
+A job can complete while its provider failed: each page it could not write
+counts in `failed_pages`, and `config.provider_issue` (`{kind, message}` plus
+optional `provider`, `model`, `target`, or `null`) names a shared cause such as
+a rejected API key (`auth`), a rate limit, an unreachable base URL, a missing
+model or path, or docs skipped because a configured provider would not load
+(`docs_skipped`; a repo with no provider at all is not reported). A job that
+fails on a recognised provider error stores the same hint as its `error_message`.
+
 One job per repository may be `pending` or `running` at a time. A second launch
 is `409`. On startup, the server marks any job left `running` or `pending` by a
 previous process as `failed`, with the message `Server restarted — job
@@ -505,6 +513,7 @@ one per router area; this table maps an area to the tag to open there.
 | Dead-code findings | `dead-code` | `routers/dead_code.py` |
 | Change risk, hotspots, ownership, commits, co-changes | `git` | `routers/git.py` |
 | Merged changes (Change Records) reconstructed from git | `changes` | `routers/changes.py` |
+| Typed events from consecutive index runs (CloudEvents, pull) | `events` | `routers/events.py` |
 | Structural coupling report | `coupling` | `routers/coupling.py` |
 | Blast radius for a change | `blast-radius` | `routers/blast_radius.py` |
 | Architectural decisions, lanes, lineage, policy settings | `decisions` | `routers/decisions.py` |

@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from repowise.core.analysis.finding_registry import split_gated
+from repowise.core.analysis.finding_registry import FILE_HOLDS, HELD_ORIGINS, split_gated
 from repowise.core.analysis.health.perf.coverage import supported_perf_languages
 from repowise.core.analysis.health.suggestions import suggestion_for as _suggestion_for
 from repowise.core.analysis.health.trends import file_trend
@@ -130,16 +130,30 @@ async def list_health_files(
         "offset": offset,
         "limit": limit,
         "files": [
-            _metric_to_dict(
+            _held_row(
+                _metric_to_dict(
+                    m,
+                    leads.get(m.file_path),
+                    perf_findings=perf_counts.get(m.file_path, 0),
+                    perf_analyzed=lang_by_path.get(m.file_path) in perf_langs,
+                    summary=summary,
+                ),
                 m,
-                leads.get(m.file_path),
-                perf_findings=perf_counts.get(m.file_path, 0),
-                perf_analyzed=lang_by_path.get(m.file_path) in perf_langs,
-                summary=summary,
             )
             for m in page
         ],
+        # What the finding reads above left out, by language or file hold.
+        "gated": await crud.gated_health_counts(session, repo_id),
     }
+
+
+def _held_row(row: dict, metric: Any) -> dict:
+    """*row*, saying why its findings are not listed when its file's origin
+    holds every one of them back (its score still counts them)."""
+    origin = getattr(metric, "code_origin", None)
+    if origin in HELD_ORIGINS:
+        row["held_reason"] = FILE_HOLDS[origin]
+    return row
 
 
 @router.get("/api/repos/{repo_id}/health/files/breakdown")
@@ -160,7 +174,11 @@ async def file_score_breakdown(
     # The score counts every finding; a gated one is held back from the list
     # and the breakdown, and ``gated`` says how many.
     findings, gated = split_gated(
-        "health", findings, kind="biomarker_type", include_unverified=include_unverified
+        "health",
+        findings,
+        kind="biomarker_type",
+        include_unverified=include_unverified,
+        files={m.file_path: m for m in metrics},
     )
     # This drawer opens from a row the reader just saw a score on. Reading it
     # under the other counts would answer a click on 8.5 with a 2.0 and list

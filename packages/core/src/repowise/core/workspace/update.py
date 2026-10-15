@@ -51,6 +51,7 @@ from ..ingestion.git_indexer import (
     GIT_HISTORY_VERSION_KEY,
     git_history_stale,
 )
+from ..ingestion.git_indexer._constants import _DEFAULT_COMMIT_LIMIT
 from ..pipeline.phase_timing import PhaseTimingRecorder
 from .config import WorkspaceConfig
 
@@ -742,7 +743,7 @@ async def _has_persisted_repo_index(repo_path: Path) -> bool:
 async def update_single_repo_index(
     repo_path: Path,
     *,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     progress: Any | None = None,
@@ -895,7 +896,7 @@ async def update_workspace(
     only_aliases: set[str] | None = None,
     run_hooks: bool = True,
     dry_run: bool = False,
-    commit_depth: int = 500,
+    commit_depth: int = _DEFAULT_COMMIT_LIMIT,
     exclude_patterns: list[str] | None = None,
     include_working_tree: bool = False,
     on_repo_start: Callable[[str], None] | None = None,
@@ -1279,7 +1280,8 @@ async def run_cross_repo_hooks(
     Detects cross-repo co-changes (files committed by the same author within
     a time window across repos) and package/manifest dependencies. Results are
     persisted to ``.repowise-workspace/cross_repo_edges.json`` and loaded by
-    the MCP server's :class:`CrossRepoEnricher` at startup.
+    the MCP server's :class:`CrossRepoEnricher` at startup. Ends by refreshing
+    the workspace store (:mod:`.store`).
     """
     if len(ws_config.repos) < 2:
         return
@@ -1302,6 +1304,17 @@ async def run_cross_repo_hooks(
         await _run_phases(ws_config, workspace_root, changed_repos, timings, workspace_index)
     finally:
         await workspace_index.close()
+
+    # Last: derived components read the system graph the phases just wrote.
+    from .store import refresh_workspace_store
+
+    timings.on_phase_start("workspace_store", None)
+    try:
+        await refresh_workspace_store(ws_config, workspace_root)
+    except Exception:
+        _log.warning("Workspace store refresh failed", exc_info=True)
+    timings.on_phase_done("workspace_store")
+    _log_phase(timings, "workspace_store")
 
 
 async def _run_phases(
