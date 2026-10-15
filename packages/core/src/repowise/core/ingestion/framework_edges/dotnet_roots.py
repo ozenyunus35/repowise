@@ -103,15 +103,22 @@ def _namespace_of(sym: Any, modules: dict[str, Any]) -> str:
 
 def _attribute_name(decorator: str) -> str:
     """``[System.Foo.CmdletAttribute(...)]`` → ``Cmdlet``."""
-    name = decorator_base(decorator).rsplit(".", 1)[-1]
+    name = bare_type_name(decorator_base(decorator))
     return name.removesuffix("Attribute") or name
 
 
 def _has_benchmark_method(sym: Any, symbols: list[Any]) -> bool:
+    """Whether a method of *sym* carries ``[Benchmark]``.
+
+    ``parent_name`` is the bare class name, so the method must also lie within
+    the class's lines: two same-named classes in different namespaces of one
+    file are told apart.
+    """
     markers = _BENCHMARK_METHOD_ATTRIBUTES[_LANGUAGE]
     return any(
         s.kind == "method"
         and s.parent_name == sym.name
+        and sym.start_line <= s.start_line <= sym.end_line
         and any(_attribute_name(d) in markers for d in s.decorators)
         for s in symbols
     )

@@ -132,3 +132,16 @@ def test_cmdlet_next_to_an_unused_class_keeps_the_file_judged(tmp_path: Path) ->
         "public class DeadSibling { }\n"
     )
     assert _roots(tmp_path, {"A.cs": text}) == set()
+
+
+def test_benchmark_in_a_same_named_class_of_another_namespace_does_not_count(
+    tmp_path: Path,
+) -> None:
+    text = (
+        "using BenchmarkDotNet.Attributes;\n"
+        "namespace A\n{\n    public class Bench\n    {\n"
+        "        [Benchmark]\n        public void Sort() { }\n    }\n}\n"
+        "namespace B\n{\n    public class Bench\n    {\n"
+        "        public void Sort() { }\n    }\n}\n"
+    )
+    assert _roots(tmp_path, {"A.cs": text}) == set()
