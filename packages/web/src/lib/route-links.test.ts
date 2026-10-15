@@ -25,9 +25,10 @@ const ROUTES = join(WEB_SRC, "app/repos/[id]");
 /**
  * Deep links we keep pointing at a redirect on purpose. `/wiki/{pageId}` is a
  * documented permanent entry point, and the repo root is where a repo card is
- * supposed to land.
+ * supposed to land. `/changes/{changeId}` is a change's own page; only the
+ * bare `/changes` list redirects to Commits.
  */
-const DELIBERATE = new Set(["wiki"]);
+const DELIBERATE = new Set(["wiki", "changes"]);
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
@@ -137,8 +138,8 @@ describe("route links", () => {
   });
 
   it("still recognises the deep links we keep on purpose", () => {
-    // If `/wiki` stops being a redirect this allowance is dead weight, and the
+    // If one stops being a redirect its allowance is dead weight, and the
     // set should shrink rather than quietly cover a real page.
-    expect(redirectOnlySegments().has("wiki")).toBe(true);
+    for (const seg of ["wiki", "changes"]) expect(redirectOnlySegments().has(seg)).toBe(true);
   });
 });

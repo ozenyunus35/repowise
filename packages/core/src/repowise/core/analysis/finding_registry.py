@@ -171,6 +171,46 @@ LANGUAGE_GATES: tuple[LanguageGate, ...] = (
 )
 
 
+#: Why a health finding is held back by the file it sits on rather than by its
+#: language: vendored and generated code is not the reader's to change, and a
+#: history marker on a test file describes how the test changes, not a defect
+#: in it. A refactoring plan or opportunity on a test file is held back too:
+#: Fix first never offers one, and no other plan surface does either. Read from
+#: the file's stored ``code_origin`` and ``is_test``, so it holds on every
+#: language, with the same opt-in as a language gate.
+FILE_HOLDS: dict[str, str] = {
+    "vendored": "Held back on vendored files: the code is maintained upstream.",
+    "generated": "Held back on generated files: change what generates them instead.",
+    "test_history": "History markers held back on test files: they describe change, not a defect.",
+    "test": "Plans held back on test files: tests change with the code they cover.",
+}
+
+#: The stored ``code_origin`` values a health finding is never served on.
+HELD_ORIGINS: tuple[str, ...] = ("vendored", "generated")
+
+
+def history_kinds() -> frozenset[str]:
+    """The health markers read from git history alone (the ``test_history`` hold)."""
+    # Deferred: the health package imports this module.
+    from repowise.core.analysis.health.scoring import history_biomarkers
+
+    return history_biomarkers()
+
+
+def file_hold(layer: GateLayer, kind: Any, code_origin: Any, is_test: Any) -> str | None:
+    """The :data:`FILE_HOLDS` key holding back a *layer* row of *kind* on a file
+    with that stored origin and test flag, or ``None``."""
+    if layer == "refactoring":
+        return "test" if is_test is True else None
+    if layer != "health":
+        return None
+    if code_origin in HELD_ORIGINS:
+        return str(code_origin)
+    if is_test is True and kind in history_kinds():
+        return "test_history"
+    return None
+
+
 def gates_on(layer: GateLayer) -> tuple[LanguageGate, ...]:
     """The gates on *layer*, read from :data:`LANGUAGE_GATES` at call time."""
     return tuple(gate for gate in LANGUAGE_GATES if gate.layer == layer)
@@ -223,13 +263,57 @@ def held_back_note(languages: Iterable[str]) -> str:
 def gated_summary(layer: GateLayer, counts: Mapping[str, int]) -> dict[str, dict]:
     """``{language: {count, reason}}`` for each gated language with rows on
     *layer*, so a surface says what it held back. The reason says only that
-    the layer is held back pending verification there."""
+    the layer is held back pending verification there. A :data:`FILE_HOLDS`
+    key in *counts* is reported under that key with its reason."""
     out: dict[str, dict] = {}
     for gate in gates_on(layer):
         count = counts.get(gate.language, 0)
         if count:
             out[gate.language] = {"count": count, "reason": held_back_note([gate.language])}
+    # File holds ride beside the languages under their own keys, with their reason.
+    for key, reason in FILE_HOLDS.items():
+        if counts.get(key):
+            out[key] = {"count": counts[key], "reason": reason}
     return out
+
+
+def row_hold(
+    layer: GateLayer,
+    row: Any,
+    files: Mapping[str, Any] | None,
+    *,
+    kind: str,
+    get: Callable[[Any, str], Any] = getattr,
+) -> str | None:
+    """The :data:`FILE_HOLDS` key on *row*, read off its file's metric row in
+    *files* (``code_origin``, ``is_test``); a path missing from it is not held."""
+    metric = (files or {}).get(get(row, "file_path") or "")
+    if metric is None:
+        return None
+    return file_hold(
+        layer, get(row, kind), getattr(metric, "code_origin", None), getattr(metric, "is_test", None)
+    )
+
+
+def split_held(
+    layer: GateLayer,
+    rows: Iterable[Any],
+    files: Mapping[str, Any] | None,
+    *,
+    kind: str,
+    get: Callable[[Any, str], Any] = getattr,
+) -> tuple[list[Any], dict[str, int]]:
+    """``(rows no file hold keeps back, {hold key: count})`` for rows already in
+    memory whose language gates were applied when they were read."""
+    kept: list[Any] = []
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = row_hold(layer, row, files, kind=kind, get=get)
+        if key is None:
+            kept.append(row)
+        else:
+            counts[key] = counts.get(key, 0) + 1
+    return kept, counts
 
 
 def split_gated(
@@ -239,22 +323,27 @@ def split_gated(
     kind: str,
     get: Callable[[Any, str], Any] = getattr,
     include_unverified: bool = False,
+    files: Mapping[str, Any] | None = None,
 ) -> tuple[list[Any], dict[str, dict]]:
     """``(rows no gate holds back, gated_summary)`` for rows already in memory.
 
     *kind* names the row field holding the finding type; *get* reads a field.
-    ``include_unverified`` keeps every row and reports nothing held back.
+    *files* maps a path to its health metric row so the :data:`FILE_HOLDS`
+    apply too (:func:`row_hold`). ``include_unverified`` keeps every row and
+    reports nothing held back.
     """
     if include_unverified:
         return list(rows), {}
     shown: list[Any] = []
     counts: dict[str, int] = {}
     for row in rows:
-        gate = gate_for(layer, get(row, "file_path") or "", get(row, kind))
-        if gate is None:
+        held = row_hold(layer, row, files, kind=kind, get=get)
+        gate = None if held else gate_for(layer, get(row, "file_path") or "", get(row, kind))
+        key = held or (gate.language if gate is not None else None)
+        if key is None:
             shown.append(row)
         else:
-            counts[gate.language] = counts.get(gate.language, 0) + 1
+            counts[key] = counts.get(key, 0) + 1
     return shown, gated_summary(layer, counts)
 
 
@@ -302,6 +391,8 @@ def withheld_summary(counts: Mapping[str, int], excluded: Iterable[str]) -> dict
 
 
 __all__ = [
+    "FILE_HOLDS",
+    "HELD_ORIGINS",
     "LANGUAGE_GATES",
     "REGISTRY",
     "UNVERIFIED_LABEL",
@@ -310,14 +401,18 @@ __all__ = [
     "GateLayer",
     "LanguageGate",
     "excluded_types",
+    "file_hold",
     "gate_for",
     "gated_extensions",
     "gated_summary",
     "gates_on",
+    "history_kinds",
     "is_served",
     "is_shown",
     "language_of",
+    "row_hold",
     "split_gated",
+    "split_held",
     "status_of",
     "verification_label",
     "withheld_summary",

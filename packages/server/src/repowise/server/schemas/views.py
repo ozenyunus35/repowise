@@ -15,6 +15,7 @@ tests and the TypeScript validator's run.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from itertools import pairwise
 from typing import Annotated, ClassVar, Literal, get_args
@@ -32,7 +33,7 @@ from repowise.server.schemas.evidence import (
 
 VIEW_SCHEMA_VERSION = 1
 
-ChartType = Literal["bar", "stacked_bar", "line", "donut"]
+ChartType = Literal["bar", "stacked_bar", "line", "donut", "scatter"]
 CHART_TYPES: tuple[str, ...] = get_args(ChartType)
 
 ViewCoverageMetric = Literal["attribution", "test_reach"]
@@ -146,6 +147,7 @@ _SERIES_BOUNDS: dict[str, tuple[int, int]] = {
     "line": (1, VIEW_LIMITS["chart_series"]),
     "stacked_bar": (2, VIEW_LIMITS["chart_series"]),
     "donut": (1, 1),
+    "scatter": (1, VIEW_LIMITS["chart_series"]),
 }
 _PARTS_OF_A_WHOLE = frozenset({"stacked_bar", "donut"})
 
@@ -186,6 +188,8 @@ class ChartView(ViewProvenance, ViewPartBase):
         for i, row in enumerate(rows):
             if row[self.x] is None:
                 raise ValueError(f"rows[{i}]: x is null")
+            if kind == "scatter" and not _finite_number(row[self.x]):
+                raise ValueError(f"rows[{i}]: a scatter x is a number")
             for s in self.series:
                 cell = row[s]
                 if cell is None:
@@ -213,6 +217,11 @@ class ChartView(ViewProvenance, ViewPartBase):
             if any(sign * (b - a) < 0 for a, b in pairwise(totals)):
                 raise ValueError(f"rows are not in {self.sort} order of their series total")
         return self
+
+
+def _finite_number(cell: object) -> bool:
+    """A number as the TypeScript ``isFiniteNumber`` sees one: no bools, no NaN or infinity."""
+    return isinstance(cell, (int, float)) and not isinstance(cell, bool) and math.isfinite(cell)
 
 
 def _row_total(row: dict[str, ViewCell], series: list[str]) -> float:

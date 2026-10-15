@@ -352,6 +352,10 @@ def test_changes_by_category_and_week_plot_the_source_counts():
     week = _build(data, "overview", "get_overview", "changes.by_week")
     assert week["chart_type"] == "line"
     assert _series(week, "changes") == [3, 1]
+    # A shorter indexed history names where it starts instead of the full window.
+    data["changes"]["window"]["history_from"] = "2026-03-02T09:00:00+00:00"
+    week = _build(data, "overview", "get_overview", "changes.by_week")
+    assert "since 2026-03-02" in week["summary"] and "90 days" not in week["summary"]
 
 
 def test_changes_provenance_keeps_unknown_as_its_own_band():
@@ -597,3 +601,217 @@ async def test_a_turn_without_show_view_stores_no_views():
     assert "view" not in [event["type"] for event in events]
     stored = await _stored_messages(app, events[-1]["conversation_id"])
     assert "views" not in stored[-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# References and empty charts
+# ---------------------------------------------------------------------------
+
+
+def test_a_chart_whose_series_are_all_zero_is_no_data():
+    empty = {"tiers": {tier: {"count": 0, "findings": []} for tier in ("high", "medium", "low")}}
+    with pytest.raises(ViewError) as err:
+        _build(empty, "dead_code", "get_dead_code", "dead_code.by_tier")
+    assert err.value.code == "no_data"
+
+
+def test_the_stamp_is_the_first_key_and_survives_truncation():
+    from repowise.server.chat_context import bound_tool_messages
+    from repowise.server.chat_prompt import tool_result_message
+
+    stamped = TurnViews().record("get_risk", {}, {"rows": ["x" * 200_000]}, artifact_type="risk")
+    assert next(iter(stamped)) == ARTIFACT_ID_FIELD
+    [bounded] = bound_tool_messages([tool_result_message("t1", "get_risk", stamped)])
+    assert stamped[ARTIFACT_ID_FIELD] in json.loads(bounded["content"])["excerpt"][:100]
+
+
+def test_latest_skips_a_failed_result_and_an_unknown_tool_resolves_to_nothing():
+    turn = TurnViews()
+    good = turn.record("get_risk", {}, RISK, artifact_type="risk")
+    turn.record("get_risk", {}, {"error": "boom"}, artifact_type="risk")
+    assert turn.artifacts.resolve("latest:get_risk").artifact_id == good[ARTIFACT_ID_FIELD]
+    assert turn.artifacts.resolve("latest:get_health") is None
+    assert [ref["artifact_id"] for ref in turn.artifacts.available()] == [good[ARTIFACT_ID_FIELD]]
+
+
+def test_a_legacy_row_is_indexed_under_the_id_its_replay_shows():
+    from repowise.server.chat_prompt import stored_messages_to_llm_format
+    from repowise.server.chat_references import ArtifactIndex
+    from repowise.server.chat_seams import StoredMessage
+
+    legacy = StoredMessage(
+        id="m2",
+        role="assistant",
+        content={"text": "", "tool_calls": [{"id": "t1", "name": "get_risk", "result": RISK}]},
+    )
+    history = [StoredMessage(id="m1", role="user", content={"text": "q"}), legacy]
+    index = ArtifactIndex.from_history(history)
+    replayed = json.loads(stored_messages_to_llm_format(history)[-1]["content"])
+
+    artifact = index.resolve(replayed[ARTIFACT_ID_FIELD])
+    assert artifact is not None and artifact.artifact_type == "risk"
+    assert index.available()[0]["age"] == "1 turn ago"
+    assert build_view(artifact, "risk.hotspots", {}, part_id="v1")["kind"] == "chart"
+
+
+def test_the_prompt_explains_views_only_when_show_view_is_offered():
+    from repowise.server.chat_prompt import _build_system_prompt
+
+    tools = get_tool_catalog(None)
+    assert "latest:<tool_name>" in _build_system_prompt("demo", "/tmp", tools, shows_views=True)
+    assert "show_view" not in _build_system_prompt("demo", "/tmp", tools)
+
+
+def test_a_latest_reference_with_only_a_failed_result_lists_nothing_to_cite():
+    turn = TurnViews()
+    turn.record("get_risk", {}, {"error": "boom"}, artifact_type="risk")
+    result = turn.show({"artifact_id": "latest:get_risk", "view": "risk.hotspots"})
+    assert result["error_code"] == "unknown_artifact"
+    assert result["available"] == []
+
+
+def test_a_latest_receipt_names_the_result_it_picked():
+    turn = TurnViews()
+    stamped = turn.record("get_risk", {}, RISK, artifact_type="risk")
+    receipt = turn.show({"artifact_id": "latest:get_risk", "view": "risk.hotspots"})
+    assert receipt["resolved_artifact_id"] == stamped[ARTIFACT_ID_FIELD]
+    assert receipt["source_tool"] == "get_risk"
+    plain = turn.show({"artifact_id": stamped[ARTIFACT_ID_FIELD], "view": "risk.hotspots"})
+    assert "resolved_artifact_id" not in plain
+
+
+def test_latest_across_turns_picks_a_later_legacy_row():
+    from repowise.server.chat_references import ArtifactIndex
+    from repowise.server.chat_seams import StoredMessage
+
+    first = TurnViews()
+    stamped = first.record("get_risk", {}, RISK, artifact_type="risk")
+    artifact_id, data = first.unstamp(stamped)
+    envelope = create_artifact_envelope(
+        tool_name="get_risk", artifact_type="risk", presentation="risk", data=data, artifact_id=artifact_id
+    )
+    history = [
+        StoredMessage(id="m1", role="user", content={"text": "q"}),
+        StoredMessage(
+            id="m2",
+            role="assistant",
+            content={"tool_calls": [{"id": "t1", "name": "get_risk", "artifact": envelope}]},
+        ),
+        StoredMessage(id="m3", role="user", content={"text": "again"}),
+        StoredMessage(
+            id="m4",
+            role="assistant",
+            content={"tool_calls": [{"id": "t2", "name": "get_risk", "result": RISK}]},
+        ),
+    ]
+    index = ArtifactIndex.from_history(history)
+    latest = index.resolve("latest:get_risk")
+    assert latest is not None and latest.artifact_id != artifact_id
+    assert [ref["age"] for ref in index.available()] == ["1 turn ago", "2 turns ago"]
+    assert index.resolve(artifact_id).artifact_type == "risk"
+
+
+def test_only_a_chart_with_rows_and_string_series_can_be_all_zero():
+    from repowise.server.chat_views import _all_zero
+
+    assert _all_zero({"series": ["n"], "data": {"rows": [{"n": 0}, {"n": None}]}})
+    assert not _all_zero({"series": ["n"], "data": {"rows": []}})
+    assert not _all_zero({"series": [{"key": "n"}], "data": {"rows": [{"n": 0}]}})
+    assert not _all_zero({"series": "n", "data": {"rows": [{"n": 0}]}})
+    assert not _all_zero({"series": ["n"], "data": {"rows": [{"n": 0}, {"n": 2}]}})
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("GET https://g.example/v1?alt=sse&key=AIzaQ&x=1", "GET https://g.example/v1?alt=sse&key=[redacted]&x=1"),
+        ("Authorization: Bearer abcdefgh12345678", "Authorization: Bearer [redacted]"),
+        ("no secret at /repo/a.py:12", "no secret at /repo/a.py:12"),
+    ],
+)
+def test_query_keys_and_bearer_tokens_are_redacted(text, expected):
+    from repowise.core.redaction import redact_secrets
+
+    assert redact_secrets(text) == expected
+
+
+# ---------------------------------------------------------------------------
+# chart: a spec over any list
+# ---------------------------------------------------------------------------
+
+
+def _show_chart(data: dict, **options: Any) -> tuple[TurnViews, dict]:
+    turn = TurnViews()
+    stamped = turn.record("get_health", {}, data, artifact_type="health")
+    return turn, turn.show(
+        {"artifact_id": stamped[ARTIFACT_ID_FIELD], "view": "chart", "options": options}
+    )
+
+
+def test_chart_draws_a_spec_and_its_receipt_names_the_kind_and_why():
+    turn, receipt = _show_chart(DEAD_CODE, rows="tiers.medium.findings", x="file_path", y="lines")
+    assert receipt["chart_type"] == "bar" and receipt["reason"]
+    part = turn.parts[0]
+    assert "receipt" not in part
+    ViewPartList.model_validate(turn.parts)
+    assert part["data"]["rows"] == [{"file_path": {"type": "file", "id": "x.py"}, "lines": 307}]
+    assert part["title"] == "Lines by file path"
+    assert part["as_of"] == "4c1e31fe3a9b"
+
+
+def test_chart_summary_says_when_the_tool_returned_only_part_of_a_list():
+    data = {"files": [{"kind": "py", "n": 1}, {"kind": "ts", "n": 2}], "files_total": 9}
+    _, receipt = _show_chart(data, x="kind", subtitle="Files by language.")
+    assert receipt["chart_type"] == "donut"
+    assert receipt["summary"].startswith("Files by language. 2 rows of files")
+    assert "returned 2 of 9 rows" in receipt["summary"]
+
+
+def test_chart_errors_list_the_fields_without_people():
+    _, result = _show_chart(HEALTH, rows="high_leverage_files", x="max_cnn")
+    assert result["error_code"] == "bad_spec"
+    assert "'max_ccn'" in result["error"]
+    assert result["fields"] == {"file_path": "text", "score": "number", "max_ccn": "number"}
+
+
+@pytest.mark.parametrize(
+    ("options", "code"),
+    [
+        ({"rows": "high_leverage_files", "x": "primary_owner"}, "person_grouping"),
+        (
+            {"rows": "high_leverage_files", "x": "file_path", "filter": [{"field": "primary_owner", "value": "S"}]},
+            "person_grouping",
+        ),
+        ({"rows": "global_hotspots", "x": "file_path", "y": "hotspot_score"}, "risk_score_series"),
+        ({"rows": "global_hotspots", "x": "hotspot_score", "y": "fix_count"}, "risk_score_series"),
+        ({"rows": "changes", "x": "category", "series": "agent_label"}, "attribution_figure"),
+        ({"rows": "nope", "x": "a"}, "bad_path"),
+        ({"x": "a", "colour": "red"}, "view_unavailable"),
+    ],
+)
+def test_chart_keeps_every_view_guard(options, code):
+    data = {
+        **HEALTH,
+        **RISK,
+        "changes": [{"category": "fix", "agent_label": "agent"}],
+    }
+    turn, result = _show_chart(data, **options)
+    assert result["error_code"] == code
+    assert turn.parts == []
+
+
+def test_chart_bool_x_values_are_text_cells():
+    turn, _ = _show_chart({"rows": [{"ok": True}, {"ok": False}, {"ok": True}]}, x="ok")
+    assert [row["ok"] for row in turn.parts[0]["data"]["rows"]] == ["true", "false"]
+
+
+def test_chart_never_splits_series_by_a_risk_score():
+    data = {"rows": [{"file_path": "a", "risk_level": "high", "lines": 1}]}
+    _, result = _show_chart(data, x="file_path", series="risk_level")
+    assert result["error_code"] == "risk_score_series"
+
+
+def test_chart_series_split_is_still_risk_guarded_by_its_measure():
+    data = {"rows": [{"file_path": "a", "tier": "x", "risk_score": 1}]}
+    _, result = _show_chart(data, x="file_path", y="risk_score", series="tier", aggregate="sum")
+    assert result["error_code"] == "risk_score_series"
