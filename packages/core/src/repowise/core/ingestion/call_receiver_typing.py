@@ -141,6 +141,18 @@ def _store_capped(cache: dict[_K, _V], key: _K, value: _V, cap: int) -> None:
     cache[key] = value
 
 
+def _is_its_own_container(type_name: str | None, spelling: str | None, language: str) -> bool:
+    """Whether *type_name*, a name's value type, is just the head of its container.
+
+    Dart types ``List<Repo> repos`` as a ``List`` value as well as a container
+    of ``Repo``; the two agree, so the container still answers. Go types a
+    slice as no value at all, so for it any value type is a conflict.
+    """
+    if language != "dart" or type_name is None or spelling is None:
+        return False
+    return strip_type_arguments(spelling).strip() == type_name
+
+
 class _Scope(NamedTuple):
     """What one symbol's span binds, less the symbol's own name."""
 
@@ -1787,7 +1799,12 @@ class ReceiverTypingMixin:
         the class's package is not found, which costs the edge.
         """
         if not clause.member:
-            return (None if clause.head in types else containers.get(clause.head)), file_path
+            spelling = containers.get(clause.head)
+            if clause.head in types and not _is_its_own_container(
+                types[clause.head], spelling, language
+            ):
+                return None, file_path
+            return spelling, file_path
         head_type = types.get(clause.head)
         class_id = None if head_type is None else self._range_class(file_path, head_type, language)
         if class_id is None:
