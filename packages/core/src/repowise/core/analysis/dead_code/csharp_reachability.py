@@ -509,6 +509,48 @@ def _heritage_names(graph: Any, parsed_files: Mapping[str, Any]) -> dict[tuple[s
     return out
 
 
+def _class_key(data: dict) -> tuple[str, str]:
+    return (data.get("file_path") or "", data.get("name") or "")
+
+
+def _is_concrete_class(data: dict) -> bool:
+    return data.get("kind") in ("class", "record") and not {"abstract", "static"} & set(
+        data.get("modifiers") or ()
+    )
+
+
+def _csharp_types(graph: Any) -> Iterable[dict]:
+    """Every C# type symbol in the graph."""
+    for _node, data in graph.nodes(data=True):
+        if (
+            data.get("node_type") == "symbol"
+            and data.get("language") == "csharp"
+            and data.get("kind") in _TYPE_KINDS
+        ):
+            yield data
+
+
+def _reaches_base(
+    key: tuple[str, str],
+    heritage: Mapping[tuple[str, str], set[str]],
+    by_name: Mapping[str, set[str]],
+    bases: AbstractSet[str],
+) -> bool:
+    """Whether the class *key* inherits from one of *bases*, at any depth.
+
+    The first hop is the class's own declaration; above it the walk is by
+    simple name.
+    """
+    seen = set(heritage.get(key, ()))
+    stack = list(seen)
+    while stack and not seen & bases:
+        for parent in by_name.get(stack.pop(), ()):
+            if parent not in seen:
+                seen.add(parent)
+                stack.append(parent)
+    return bool(seen & bases)
+
+
 def scanned_implementations(
     graph: Any, source_map: Mapping[str, bytes], parsed_files: Mapping[str, Any] | None = None
 ) -> frozenset[tuple[str, str]]:
@@ -521,40 +563,23 @@ def scanned_implementations(
     type parameter (``GetExports<T>`` inside the host's own generic method)
     matches nothing: a wider match only widens a rescue.
     """
-    bases = _scanned_type_names(graph, source_map)
-    classes: list[dict] = []
-    for _node, data in graph.nodes(data=True):
-        if data.get("node_type") != "symbol" or data.get("language") != "csharp":
-            continue
-        kind = data.get("kind")
-        if kind not in _TYPE_KINDS:
-            continue
-        attributes = _attribute_bases(data)
-        if attributes & _INHERITED_EXPORT_ATTRIBUTES:
-            bases.add(data.get("name") or "")
-        if kind in ("class", "record") and not {"abstract", "static"} & set(
-            data.get("modifiers") or ()
-        ):
-            classes.append(data)
-    exported = [d for d in classes if _attribute_bases(d) & _EXPORT_ATTRIBUTES]
-    out = {(d.get("file_path") or "", d.get("name") or "") for d in exported}
+    types = list(_csharp_types(graph))
+    bases = _scanned_type_names(graph, source_map) | {
+        data.get("name") or ""
+        for data in types
+        if _attribute_bases(data) & _INHERITED_EXPORT_ATTRIBUTES
+    }
+    classes = [data for data in types if _is_concrete_class(data)]
+    out = {_class_key(d) for d in classes if _attribute_bases(d) & _EXPORT_ATTRIBUTES}
     if not bases:
         return frozenset(out)
     heritage = _heritage_names(graph, parsed_files or {})
     by_name: dict[str, set[str]] = {}
     for (_path, name), parents in heritage.items():
         by_name.setdefault(name, set()).update(parents)
-    for data in classes:
-        key = (data.get("file_path") or "", data.get("name") or "")
-        seen = set(heritage.get(key, ()))
-        stack = list(seen)
-        while stack and not seen & bases:
-            for parent in by_name.get(stack.pop(), ()):
-                if parent not in seen:
-                    seen.add(parent)
-                    stack.append(parent)
-        if seen & bases:
-            out.add(key)
+    out.update(
+        _class_key(d) for d in classes if _reaches_base(_class_key(d), heritage, by_name, bases)
+    )
     return frozenset(out)
 
 

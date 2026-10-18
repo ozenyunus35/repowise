@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from .governance import GOVERNANCE_BIOMARKERS
 from .models import Severity, primary_finding
 from .ranking import worst_metric
 from .rows import detail_map, field, scored_rows
@@ -24,6 +25,7 @@ from .scoring import (
     biomarker_category,
     biomarker_weight,
     deduction_split,
+    destacked,
     history_cap,
     is_advisory,
     severity_deduction,
@@ -36,6 +38,7 @@ __all__ = [
     "biomarker_breakdown",
     "finding_base_deduction",
     "finding_raw_deduction",
+    "group_rollup",
     "module_label",
     "module_labels",
     "module_rollups",
@@ -135,25 +138,34 @@ def module_rollups(
         if module:
             buckets.setdefault(str(module), []).append(row)
 
-    rows: list[dict[str, Any]] = []
-    for name, group in buckets.items():
-        # Weight floors at 1 per file, so a non-empty group always has weight
-        # and the average never divides by zero.
-        total_weight = sum(max(_nloc(row), 1) for row in group)
-        average = sum(_score(row) * max(_nloc(row), 1) for row in group) / total_weight
-        worst = worst_metric(group, deductions or {})
-        rows.append(
-            {
-                "module": name,
-                "file_count": len(group),
-                "nloc": sum(_nloc(row) for row in group),
-                "average_health": round(average, 2),
-                "worst_performer_path": field(worst, "file_path", None),
-                "worst_performer_score": round(_score(worst), 2),
-            }
-        )
+    rows = [
+        {"module": name, **group_rollup(group, deductions)} for name, group in buckets.items()
+    ]
     rows.sort(key=lambda row: (row["average_health"], row["module"]))
     return rows
+
+
+def group_rollup(
+    group: Sequence[Any], deductions: Mapping[str, float] | None = None
+) -> dict[str, Any]:
+    """One NLOC-weighted rollup over a non-empty group of scored rows.
+
+    The fold :func:`module_rollups` applies per module, shared with any surface
+    that buckets files another way (a directory at any depth) so the average
+    and the worst performer mean the same thing everywhere.
+    """
+    # Weight floors at 1 per file, so a non-empty group always has weight
+    # and the average never divides by zero.
+    total_weight = sum(max(_nloc(row), 1) for row in group)
+    average = sum(_score(row) * max(_nloc(row), 1) for row in group) / total_weight
+    worst = worst_metric(group, deductions or {})
+    return {
+        "file_count": len(group),
+        "nloc": sum(_nloc(row) for row in group),
+        "average_health": round(average, 2),
+        "worst_performer_path": field(worst, "file_path", None),
+        "worst_performer_score": round(_score(worst), 2),
+    }
 
 
 def severity_breakdown(findings: Iterable[Any]) -> dict[str, int]:
@@ -251,6 +263,13 @@ def primary_and_magnitude_by_file(findings: Iterable[Any]) -> dict[str, dict[str
     return {path: primary_and_magnitude(fs) for path, fs in by_file.items()}
 
 
+def _scored_raw(finding: Any) -> float:
+    """:func:`finding_raw_deduction`, or 0 for a governance finding the score pass never saw."""
+    if field(finding, "biomarker_type", None) in GOVERNANCE_BIOMARKERS:
+        return 0.0
+    return finding_raw_deduction(finding)
+
+
 def score_breakdown(findings: Sequence[Any]) -> dict[str, Any]:
     """Reconstruct one file's per-category deductions from its open findings.
 
@@ -258,7 +277,8 @@ def score_breakdown(findings: Sequence[Any]) -> dict[str, Any]:
     already-weighted-and-capped value the scorer produced at index time — so the
     breakdown reproduces the file's score instead of re-deriving it. Only the
     raw (pre-cap) figure is reconstructed, with the same ``base x weight``
-    formula, so a capped category is honest about how much it shed.
+    formula and the same history de-stacking, so a capped category is honest
+    about how much it shed.
 
     Categories are emitted in :data:`CATEGORY_CAPS` order and a category with no
     findings is omitted, not zero-filled.
@@ -280,8 +300,10 @@ def score_breakdown(findings: Sequence[Any]) -> dict[str, Any]:
         entries = per_category.get(category, [])
         if not entries:
             continue
-        cap = history_cap(structure) if category == HISTORY_CATEGORY else static_cap
-        raw_each = [finding_raw_deduction(f) for f in entries]
+        raw_each = [_scored_raw(f) for f in entries]
+        cap = static_cap
+        if category == HISTORY_CATEGORY:
+            cap, raw_each = history_cap(structure), destacked(raw_each)
         applied_each = [float(field(f, "health_impact", 0.0) or 0.0) for f in entries]
         raw_sum = sum(raw_each)
         applied_sum = sum(applied_each)

@@ -58,6 +58,56 @@ _TYPE_USE = re.compile(
 _MEMBER_USE = re.compile(rf"\.\s*({_NAME})|\b({_NAME})\s*\(")
 
 
+def _line_comment_end(text: str, i: int) -> int:
+    """Where a ``//`` comment opened at *i* ends: its newline, kept as code."""
+    end = text.find("\n", i)
+    return len(text) if end < 0 else end
+
+
+def _block_comment_end(text: str, i: int) -> int:
+    """Just past the ``*/`` closing a ``/*`` opened at *i*, nesting counted."""
+    depth, i, n = 1, i + 2, len(text)
+    while i < n and depth:
+        if text.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+        else:
+            i += 1
+    return i
+
+
+def _string_end(text: str, i: int) -> int | None:
+    """Just past a string literal opened at *i*, or None when none opens there.
+
+    A raw string's ``#`` count must close it too, and only a plain string
+    reads ``\\`` as an escape.
+    """
+    n = len(text)
+    hashes = 0
+    while i + hashes < n and text[i + hashes] == "#":
+        hashes += 1
+    quote = i + hashes
+    if quote >= n or text[quote] != '"':
+        return None
+    delim = '"""' if text.startswith('"""', quote) else '"'
+    close = delim + "#" * hashes
+    j = quote + len(delim)
+    while j < n and not text.startswith(close, j):
+        j += 2 if text[j] == "\\" and not hashes else 1
+    return min(n, j + len(close))
+
+
+def _blanked_end(text: str, i: int) -> tuple[int, bool] | None:
+    """``(end, keep_one_space)`` for a comment or string opened at *i*, else None."""
+    if text.startswith("//", i):
+        return _line_comment_end(text, i), False
+    if text.startswith("/*", i):
+        return _block_comment_end(text, i), True
+    end = _string_end(text, i)
+    return None if end is None else (end, True)
+
+
 def strip_comments_and_strings(text: str) -> str:
     """*text* with Swift comments and string literals blanked to spaces.
 
@@ -68,36 +118,14 @@ def strip_comments_and_strings(text: str) -> str:
     out: list[str] = []
     i, n = 0, len(text)
     while i < n:
-        if text.startswith("//", i):
-            end = text.find("\n", i)
-            i = n if end < 0 else end
+        blanked = _blanked_end(text, i)
+        if blanked is None:
+            out.append(text[i])
+            i += 1
             continue
-        if text.startswith("/*", i):
-            depth, i = 1, i + 2
-            while i < n and depth:
-                if text.startswith("/*", i):
-                    depth, i = depth + 1, i + 2
-                elif text.startswith("*/", i):
-                    depth, i = depth - 1, i + 2
-                else:
-                    i += 1
+        i, space = blanked
+        if space:
             out.append(" ")
-            continue
-        hashes = 0
-        while i + hashes < n and text[i + hashes] == "#":
-            hashes += 1
-        quote = i + hashes
-        if quote < n and text[quote] == '"':
-            delim = '"""' if text.startswith('"""', quote) else '"'
-            close = delim + "#" * hashes
-            j = quote + len(delim)
-            while j < n and not text.startswith(close, j):
-                j += 2 if text[j] == "\\" and not hashes else 1
-            i = min(n, j + len(close))
-            out.append(" ")
-            continue
-        out.append(text[i])
-        i += 1
     return "".join(out)
 
 
@@ -142,33 +170,107 @@ class _SwiftFacts:
         self.type_users: dict[str, set[str]] = {}  # name -> files writing it as a type
         self.member_users: dict[str, set[str]] = {}  # name -> files writing it as a member
         for path in files:
-            for data in _top_level(graph, path):
-                if data.get("kind") == _EXTENSION_KIND:
-                    name = data["name"].rsplit(".", 1)[-1]
-                    self.extends.setdefault(path, set()).add(name)
-                    self.own.setdefault(path, set()).add(name)
-            extended = self.extends.get(path, set())
-            for _symbol, data in _defined(graph, path):
-                name = (data.get("name") or "").strip("`")  # ``func `if`()``
-                if not name:
-                    continue
-                self.member_files.setdefault(name, set()).add(path)
-                # Nested types too: ``StatusEditor.EditorStore`` is declared
-                # inside an extension of ``StatusEditor``.
-                if data.get("kind") in _TYPE_KINDS:
-                    self.declares.setdefault(name, set()).add(path)
-                    self.declared.setdefault(path, set()).add(name)
-                    self.own.setdefault(path, set()).add(name)
-                if (data.get("parent_name") or "").rsplit(".", 1)[-1] in extended:
-                    self.members.setdefault(path, set()).add(name)
+            self._read_extensions(graph, path)
+            self._read_declarations(graph, path)
             blob = source_map.get(path)
-            if blob is None:
+            if blob is not None:
+                self._read_uses(path, blob)
+
+    def _read_extensions(self, graph: Any, path: str) -> None:
+        for data in _top_level(graph, path):
+            if data.get("kind") == _EXTENSION_KIND:
+                name = data["name"].rsplit(".", 1)[-1]
+                self.extends.setdefault(path, set()).add(name)
+                self.own.setdefault(path, set()).add(name)
+
+    def _read_declarations(self, graph: Any, path: str) -> None:
+        extended = self.extends.get(path, set())
+        for _symbol, data in _defined(graph, path):
+            name = (data.get("name") or "").strip("`")  # ``func `if`()``
+            if not name:
                 continue
-            text = strip_comments_and_strings(blob.decode("utf-8", "ignore"))
-            for name in _names(_TYPE_USE, text):
-                self.type_users.setdefault(name, set()).add(path)
-            for name in _names(_MEMBER_USE, text):
-                self.member_users.setdefault(name, set()).add(path)
+            self.member_files.setdefault(name, set()).add(path)
+            # Nested types too: ``StatusEditor.EditorStore`` is declared
+            # inside an extension of ``StatusEditor``.
+            if data.get("kind") in _TYPE_KINDS:
+                self.declares.setdefault(name, set()).add(path)
+                self.declared.setdefault(path, set()).add(name)
+                self.own.setdefault(path, set()).add(name)
+            if (data.get("parent_name") or "").rsplit(".", 1)[-1] in extended:
+                self.members.setdefault(path, set()).add(name)
+
+    def _read_uses(self, path: str, blob: bytes) -> None:
+        text = strip_comments_and_strings(blob.decode("utf-8", "ignore"))
+        for name in _names(_TYPE_USE, text):
+            self.type_users.setdefault(name, set()).add(path)
+        for name in _names(_MEMBER_USE, text):
+            self.member_users.setdefault(name, set()).add(path)
+
+
+class _Reach:
+    """The fixpoint: which candidates a live file reaches."""
+
+    def __init__(self, graph: Any, facts: _SwiftFacts, candidates: set[str]) -> None:
+        self.graph = graph
+        self.facts = facts
+        self.candidates = candidates
+        self.reached: set[str] = set()
+
+    def run(self) -> frozenset[str]:
+        changed = True
+        while changed:
+            changed = False
+            for path in sorted(self.candidates - self.reached):
+                if self._used(path) or self._named(path) or self._extends_live(path):
+                    self.reached.add(path)
+                    changed = True
+        return frozenset(self.reached)
+
+    def _live(self, path: str) -> bool:
+        return path not in self.candidates or path in self.reached
+
+    def _used(self, path: str) -> bool:
+        """A use edge from a live file lands on a symbol *path* declares."""
+        for symbol, _data in _defined(self.graph, path):
+            for user, _symbol, use in self.graph.in_edges(symbol, data=True):
+                if use.get("edge_type") not in REACHABILITY_USE_EDGE_TYPES or is_external(user):
+                    continue
+                source = file_path_of(user)
+                if source != path and self._live(source):
+                    return True
+        return False
+
+    def _named(self, path: str) -> bool:
+        """A live file writes a type *path* alone declares, in a type position."""
+        facts = self.facts
+        for name in facts.declared.get(path, ()):
+            if len(facts.declares.get(name, ())) != 1 or name in _SWIFT_COMMON_TYPES:
+                continue
+            for user in facts.type_users.get(name, ()):
+                if user != path and self._live(user) and name not in facts.own.get(user, ()):
+                    return True
+        return False
+
+    def _extends_live(self, path: str) -> bool:
+        """It extends a live in-repo type, or a platform type whose member is used."""
+        for name in self.facts.extends.get(path, ()):
+            owners = self.facts.declares.get(name, set()) - {path}
+            if owners:
+                if any(self._live(owner) for owner in owners):
+                    return True
+            elif self._member_used(path):
+                return True
+        return False
+
+    def _member_used(self, path: str) -> bool:
+        """A live file writes a member of *path*'s extensions no other file declares."""
+        facts = self.facts
+        for member in facts.members.get(path, ()):
+            if facts.member_files.get(member, set()) != {path}:
+                continue
+            if any(u != path and self._live(u) for u in facts.member_users.get(member, ())):
+                return True
+        return False
 
 
 def build_swift_named_files(graph: Any, source_map: Mapping[str, bytes]) -> frozenset[str]:
@@ -190,50 +292,4 @@ def build_swift_named_files(graph: Any, source_map: Mapping[str, bytes]) -> froz
     }
     if not source_map:
         return frozenset(candidates)
-    facts = _SwiftFacts(graph, source_map, files)
-    reached: set[str] = set()
-
-    def live(path: str) -> bool:
-        return path not in candidates or path in reached
-
-    def used_by_live(path: str) -> bool:
-        for symbol, _data in _defined(graph, path):
-            for user, _symbol, use in graph.in_edges(symbol, data=True):
-                if use.get("edge_type") not in REACHABILITY_USE_EDGE_TYPES or is_external(user):
-                    continue
-                source = file_path_of(user)
-                if source != path and live(source):
-                    return True
-        return False
-
-    def named_by_live(path: str) -> bool:
-        for name in facts.declared.get(path, ()):
-            if len(facts.declares.get(name, ())) != 1 or name in _SWIFT_COMMON_TYPES:
-                continue
-            for user in facts.type_users.get(name, ()):
-                if user != path and live(user) and name not in facts.own.get(user, ()):
-                    return True
-        return False
-
-    def extends_live(path: str) -> bool:
-        for name in facts.extends.get(path, ()):
-            owners = facts.declares.get(name, set()) - {path}
-            if owners:
-                if any(live(owner) for owner in owners):
-                    return True
-                continue
-            for member in facts.members.get(path, ()):
-                if facts.member_files.get(member, set()) != {path}:
-                    continue
-                if any(u != path and live(u) for u in facts.member_users.get(member, ())):
-                    return True
-        return False
-
-    changed = True
-    while changed:
-        changed = False
-        for path in sorted(candidates - reached):
-            if used_by_live(path) or named_by_live(path) or extends_live(path):
-                reached.add(path)
-                changed = True
-    return frozenset(reached)
+    return _Reach(graph, _SwiftFacts(graph, source_map, files), candidates).run()

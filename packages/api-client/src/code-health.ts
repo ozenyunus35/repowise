@@ -183,6 +183,9 @@ export async function getHealthMap(
     active: opts.active?.length ? opts.active.join(",") : undefined,
     scope: opts.scope,
     counts: opts.counts,
+    include_held: opts.include_held || undefined,
+    q: opts.q?.trim() || undefined,
+    area: opts.area || undefined,
   });
 }
 

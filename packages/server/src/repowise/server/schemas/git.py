@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from repowise.core.attribution import file_share
 from repowise.core.co_change import parse_partners
+from repowise.server.schemas.history import HealthDeltaSummaryResponse
 from repowise.server.schemas.risk_semantics import RiskAuthority
 
 
@@ -245,6 +246,11 @@ class CommitResponse(BaseModel):
     agent_autonomy_tier: int | None = None
     agent_confidence: str | None = None
     attribution: str | None = None
+    #: What the commit did to health, the row's lead. ``None`` when it was
+    #: never scanned, which is not the same claim as "changed nothing".
+    health_delta: HealthDeltaSummaryResponse | None = None
+    #: Hotspot files (as flagged now) the commit touched.
+    touches_hotspot: int = 0
 
 
 class RiskDriverResponse(BaseModel):
@@ -254,6 +260,13 @@ class RiskDriverResponse(BaseModel):
     value: float | None
     contribution: float
     label: str
+
+
+class MovedFromResponse(BaseModel):
+    """Where a finding's code was before the commit moved it."""
+
+    path: str
+    symbol: str | None = None
 
 
 class CommitHealthFindingResponse(BaseModel):
@@ -274,6 +287,8 @@ class CommitHealthFindingResponse(BaseModel):
     #: merely touched.
     attribution_basis: str
     reason: str
+    #: Set when the commit moved this finding's code here from another file.
+    moved_from: MovedFromResponse | None = None
 
 
 class CommitHealthResponse(BaseModel):
@@ -287,9 +302,16 @@ class CommitHealthResponse(BaseModel):
     #: ``available`` when every changed file was compared, ``partial`` when
     #: some were skipped (unsupported language, binary, unreadable).
     status: str
+    #: An older analyzer wrote it: the direction holds, the counts do not
+    #: compare with current rows.
+    stale: bool = False
     introduced_count: int
     worsened_count: int
     resolved_count: int
+    #: Findings whose metric dropped, at the same place or after a move.
+    improved_count: int = 0
+    #: Findings carried to another file with their code; a worsened or improved one is in that count too.
+    moved_count: int = 0
     files_analyzed: int
     files_skipped: int
     #: Worst first, capped. ``introduced_count + worsened_count`` is the true

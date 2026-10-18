@@ -95,6 +95,9 @@ export interface ActionsResponse {
 export interface ActiveProviderSelection {
   provider?: string | null;
   model?: string | null;
+  base_url?: string | null;
+  provenance?: SelectionProvenance;
+  base_url_unconfirmed?: boolean;
   input_cost_per_1k?: number | null;
   output_cost_per_1k?: number | null;
   embedder?: string | null;
@@ -103,6 +106,7 @@ export interface ActiveProviderSelection {
 export interface AgentPromptResponse {
   flavor: "generic" | "claude-code" | "claude-code-mcp" | "cursor";
   text: string;
+  preview?: string | null;
 }
 
 /** One month of commits by attribution label. */
@@ -248,6 +252,142 @@ export interface ArchitectureViewResponse {
   external_systems: C4ExternalSystemResponse[];
   entry_points?: string[];
   entry_candidates?: string[];
+}
+
+export interface AreaBandCounts {
+  at_risk: number;
+  needs_work: number;
+  fair: number;
+  good: number;
+  excellent: number;
+}
+
+export interface AreaBandShare {
+  files: number;
+  nloc: number;
+  pct: number;
+}
+
+export interface AreaBandShares {
+  at_risk: AreaBandShare;
+  needs_work: AreaBandShare;
+  fair: AreaBandShare;
+  good: AreaBandShare;
+  excellent: AreaBandShare;
+}
+
+/** The snapshots behind ``health_delta_30d``; the baseline may be nearer than 30 days. */
+export interface AreaDeltaWindow {
+  target_days: number;
+  latest_at: string | null;
+  baseline_at: string | null;
+}
+
+export interface AreaDetailResponse {
+  area: AreaNode;
+  distribution: AreaDistribution;
+  worst_files: AreaFileRow[];
+  hotspots: AreaHotspots;
+  owners: AreaOwners;
+  trend: AreaTrendPoint[];
+  top_findings: AreaFinding[];
+  test_reach: AreaTestReach;
+  delta_window: AreaDeltaWindow;
+}
+
+export interface AreaDistribution {
+  total_files: number;
+  total_nloc: number;
+  bands: AreaBandShares;
+}
+
+export interface AreaFileRow {
+  path: string;
+  score: number;
+  band: "at_risk" | "needs_work" | "fair" | "good" | "excellent";
+  nloc: number;
+}
+
+export interface AreaFinding {
+  id: string;
+  file_path: string;
+  biomarker_type: string;
+  severity: string;
+  function_name: string | null;
+  line_start: number | null;
+  health_impact: number | null;
+  reason: string | null;
+}
+
+export interface AreaHotspots {
+  total: number;
+  files: AreaFileRow[];
+}
+
+export interface AreaNode {
+  path: string;
+  name: string;
+  depth: number;
+  parent: string | null;
+  has_children: boolean;
+  direct_file_count: number;
+  file_count: number;
+  nloc: number;
+  health: number;
+  band: "at_risk" | "needs_work" | "fair" | "good" | "excellent";
+  band_counts: AreaBandCounts;
+  worst_file: AreaWorstFile;
+  hotspot_count: number;
+  bus_factor_1_count: number;
+  primary_owner: AreaOwner | null;
+  line_coverage_pct: number | null;
+  coverage_file_count: number;
+  findings: AreaSeverityCounts;
+  health_delta_30d: number | null;
+}
+
+export interface AreaOwner {
+  key: string;
+  name: string;
+  kind: "human" | "agent" | "bot";
+  files: number;
+  share: number;
+}
+
+export interface AreaOwners {
+  total: number;
+  top: AreaOwner[];
+}
+
+export interface AreaSeverityCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+
+export interface AreaTestReach {
+  files: number;
+  with_test_file: number;
+  measured_files: number;
+  line_coverage_pct: number | null;
+}
+
+export interface AreaTreeResponse {
+  root: AreaNode;
+  depth: number;
+  nodes: AreaNode[];
+  delta_window: AreaDeltaWindow;
+}
+
+export interface AreaTrendPoint {
+  taken_at: string | null;
+  health: number;
+}
+
+export interface AreaWorstFile {
+  path: string | null;
+  score: number;
 }
 
 export interface ArtifactUpdateRequest {
@@ -424,6 +564,42 @@ export interface ChangeForgeMetadata {
   linked_issues?: string[] | null;
 }
 
+/** A finding a change's commit introduced or worsened, with that commit. */
+export interface ChangeHealthFindingResponse {
+  change_kind: string;
+  dimension: string;
+  biomarker_type: string;
+  severity: string;
+  severity_before?: string | null;
+  path: string;
+  symbol?: string | null;
+  line_start?: number | null;
+  line_end?: number | null;
+  attribution_basis: string;
+  reason: string;
+  moved_from?: MovedFromResponse | null;
+  sha: string;
+}
+
+/**
+ * A change's health rollup plus its worse findings, worst first and
+ * capped: file, lines, symbol and biomarker, enough for a fix prompt.
+ */
+export interface ChangeHealthResponse {
+  status: string;
+  kind: "improved" | "worsened" | "mixed" | "neutral";
+  scanned_commits: number;
+  unscanned_commits: number;
+  introduced: number;
+  worsened: number;
+  resolved: number;
+  improved?: number | null;
+  moved?: number | null;
+  files_improved?: number | null;
+  files_worsened: number;
+  findings?: ChangeHealthFindingResponse[];
+}
+
 /** ``pr`` | ``change_id`` | ``merge`` | ``commit``, first that applies. */
 export interface ChangeIdentity {
   kind: string;
@@ -447,6 +623,8 @@ export interface ChangeListItem {
   lines_deleted: number;
   category: string;
   provenance?: ChangeProvenance | null;
+  health?: HealthRollupResponse | null;
+  touches_hotspot?: number;
   evidence_summary?: ChangeEvidenceSummary | null;
 }
 
@@ -485,6 +663,8 @@ export interface ChangeRecord {
   lines_deleted: number;
   category: string;
   provenance?: ChangeProvenance | null;
+  health?: ChangeHealthResponse | null;
+  touches_hotspot?: number;
   commits: string[];
   files: ChangeFile[];
   metadata: ChangeForgeMetadata;
@@ -495,7 +675,17 @@ export interface ChangeRecord {
 export interface ChangelogEntryModel {
   version: string;
   label?: string | null;
+  summary?: string;
+  highlights?: ChangelogHighlightModel[];
+  stats?: ReleaseStatsModel | null;
   sections: ChangelogSectionModel[];
+}
+
+export interface ChangelogHighlightModel {
+  id: string;
+  title: string;
+  blurb: string;
+  href?: string | null;
 }
 
 export interface ChangelogResponse {
@@ -771,6 +961,8 @@ export interface CommitDetailResponse {
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
   attribution?: string | null;
+  health_delta?: HealthDeltaSummaryResponse | null;
+  touches_hotspot?: number;
   drivers?: RiskDriverResponse[];
   agent_channel?: string | null;
   files?: CommitFileResponse[];
@@ -829,6 +1021,7 @@ export interface CommitHealthFindingResponse {
   line_end?: number | null;
   attribution_basis: string;
   reason: string;
+  moved_from?: MovedFromResponse | null;
 }
 
 /**
@@ -840,9 +1033,12 @@ export interface CommitHealthFindingResponse {
  */
 export interface CommitHealthResponse {
   status: string;
+  stale?: boolean;
   introduced_count: number;
   worsened_count: number;
   resolved_count: number;
+  improved_count?: number;
+  moved_count?: number;
   files_analyzed: number;
   files_skipped: number;
   findings?: CommitHealthFindingResponse[];
@@ -882,6 +1078,8 @@ export interface CommitResponse {
   agent_autonomy_tier?: number | null;
   agent_confidence?: string | null;
   attribution?: string | null;
+  health_delta?: HealthDeltaSummaryResponse | null;
+  touches_hotspot?: number;
 }
 
 /**
@@ -969,6 +1167,13 @@ export interface CommunitySummaryItem {
   member_count: number;
   hidden_member_count?: number;
   top_file: string;
+}
+
+export interface ConcentrationOwner {
+  key: string;
+  name: string;
+  files_owned: number;
+  share: number;
 }
 
 export interface ConversationDetailResponse {
@@ -1130,6 +1335,7 @@ export interface DeadCodeFindingResponse {
   last_commit_at: string | null;
   commit_count_90d: number;
   verification?: string | null;
+  preview?: string | null;
 }
 
 export interface DeadCodeGraphNodeResponse {
@@ -1166,6 +1372,7 @@ export interface DeadCodeSummaryResponse {
   total_findings: number;
   confidence_summary: Record<string, unknown>;
   deletable_lines: number;
+  safe_to_delete_count?: number | null;
   total_lines: number;
   by_kind: Record<string, unknown>;
   analyzed_at?: string | null;
@@ -1805,6 +2012,14 @@ export interface FileHealthTrendResponse {
   snapshot_count?: number;
 }
 
+/** A file's health score before and after; ``None`` on a side it was unscored. */
+export interface FileScoreShiftResponse {
+  path: string;
+  before?: number | null;
+  after?: number | null;
+  change?: number | null;
+}
+
 export interface FileTrendPointResponse {
   taken_at?: string | null;
   score: number;
@@ -2157,6 +2372,28 @@ export interface HealthBadgeResponse {
   band: string;
 }
 
+/**
+ * What one commit did to health, as list rows carry it.
+ *
+ * ``kind`` reads the counts: ``improved`` when it only made things better,
+ * ``worsened`` when it only made them worse, ``mixed`` for both, ``neutral``
+ * for neither. ``improved`` (findings that measure better) and ``moved`` are
+ * null on a stale row, where the stored 0 means unknown; ``files`` stays empty for stored deltas (per-file scores are
+ * live-only). ``stale`` means an older analyzer wrote it: the direction holds,
+ * the counts do not compare with current rows, and no aggregate counts it.
+ */
+export interface HealthDeltaSummaryResponse {
+  status: string;
+  kind: "improved" | "worsened" | "mixed" | "neutral";
+  introduced: number;
+  worsened: number;
+  resolved: number;
+  improved?: number | null;
+  moved?: number | null;
+  stale?: boolean;
+  files?: FileScoreShiftResponse[];
+}
+
 /** One file's movement between the last two snapshots. */
 export interface HealthFileDelta {
   file_path: string;
@@ -2181,6 +2418,7 @@ export interface HealthFindingResponse {
   dimension?: string;
   verification?: string | null;
   lower_priority?: string | null;
+  preview?: string | null;
 }
 
 /**
@@ -2204,6 +2442,7 @@ export interface HealthFindingWithSymbolResponse {
   dimension?: string;
   verification?: string | null;
   lower_priority?: string | null;
+  preview?: string | null;
   symbol_id?: string | null;
 }
 
@@ -2211,6 +2450,29 @@ export interface HealthResponse {
   status: string;
   db: string;
   version: string;
+}
+
+/**
+ * What a change's commits did to health, summed.
+ *
+ * ``status`` is ``partial`` when a commit was not scanned or skipped files.
+ * Only rows from the current analyzer count; the rest are unscanned.
+ * ``files_worsened`` counts paths the stored worse findings name (a floor:
+ * findings are capped per commit). ``files_improved`` is null until stored
+ * deltas carry per-file scores.
+ */
+export interface HealthRollupResponse {
+  status: string;
+  kind: "improved" | "worsened" | "mixed" | "neutral";
+  scanned_commits: number;
+  unscanned_commits: number;
+  introduced: number;
+  worsened: number;
+  resolved: number;
+  improved?: number | null;
+  moved?: number | null;
+  files_improved?: number | null;
+  files_worsened: number;
 }
 
 export interface HealthTrendAlert {
@@ -2244,6 +2506,8 @@ export interface HealthTrendResponse {
   alerts?: HealthTrendAlert[];
   file_deltas?: HealthFileDelta[];
   file_deltas_total?: number;
+  file_deltas_worse?: number;
+  file_deltas_improved?: number;
   snapshot_count?: number;
   scope?: string;
 }
@@ -2280,6 +2544,7 @@ export interface HealthWorkItem {
   biomarkers?: string[];
   effort_bucket: string;
   impact_per_effort: number;
+  preview?: string | null;
 }
 
 export interface HealthWorkQueueResponse {
@@ -2430,6 +2695,21 @@ export interface KnowledgeMapTarget {
   doc_words: number;
 }
 
+export interface KnowledgeMatrixAuthor {
+  key: string;
+  name: string;
+  email: string | null;
+  last_commit_at: string | null;
+  active: boolean;
+}
+
+/** Every code file's top-5 human authors, positional and indexed for size. */
+export interface KnowledgeMatrixResponse {
+  authors: KnowledgeMatrixAuthor[];
+  dirs: string[];
+  files: ([number, string, number, number | null, boolean, number, number | null, [number, number][]])[];
+}
+
 /** One tool in the configurable surface, with the flags a UI needs. */
 export interface McpToolInfo {
   name: string;
@@ -2536,6 +2816,12 @@ export interface ModuleNodeResponse {
   primary_owner?: string | null;
 }
 
+/** Where a finding's code was before the commit moved it. */
+export interface MovedFromResponse {
+  path: string;
+  symbol?: string | null;
+}
+
 export interface NeighboringCommunity {
   community_id: number;
   label: string;
@@ -2583,6 +2869,12 @@ export interface OkResponse {
   ok?: boolean;
 }
 
+/** Every display name and canonical email folded into one person. */
+export interface OwnerAliases {
+  names: string[];
+  emails: string[];
+}
+
 export interface OwnerCoAuthor {
   name: string;
   email: string | null;
@@ -2605,6 +2897,7 @@ export interface OwnerListEntry {
   key: string;
   name: string;
   email: string | null;
+  kind: "human" | "bot" | "agent";
   files_owned: number;
   hotspots_owned: number;
   silo_modules: number;
@@ -2627,6 +2920,8 @@ export interface OwnerProfileResponse {
   key: string;
   name: string;
   email: string | null;
+  kind: "human" | "bot" | "agent";
+  aliases: OwnerAliases;
   files_owned: number;
   hotspots_owned: number;
   silo_modules: number;
@@ -2645,6 +2940,36 @@ export interface OwnerProfileResponse {
   co_authors: OwnerCoAuthor[];
   co_authors_total?: number;
   commit_categories: Record<string, unknown>;
+}
+
+export interface OwnerRef {
+  key: string;
+  name: string;
+}
+
+/** Repository knowledge risk, people only (automation owns nothing). */
+export interface OwnersSummaryResponse {
+  truck_factor: number | null;
+  people: number;
+  automation_identities: number;
+  owners: number;
+  tracked_files: number;
+  owned_files: number;
+  single_owner_files: number;
+  single_owner_hotspots: number;
+  concentration: OwnershipConcentration;
+  silo_modules: SiloModule[];
+  activity_window_days: number;
+  active_contributors: number;
+  activity_complete: boolean;
+  quiet_owners: QuietOwner[];
+  quiet_owners_total: number;
+}
+
+export interface OwnershipConcentration {
+  top_n: number;
+  share: number | null;
+  owners: ConcentrationOwner[];
 }
 
 export interface OwnershipEntry {
@@ -2954,6 +3279,30 @@ export interface PatchCoverageTestHint {
   total: number;
 }
 
+/**
+ * A period headline: items that made health better first, then worse.
+ *
+ * Items are changes on ``/changes/summary`` and commits on
+ * ``/commits/health-summary``. ``unscanned`` items have no delta from the
+ * current analyzer ("not yet analysed") and are in none of the four kinds;
+ * recent commits refill as updates rescan them.
+ */
+export interface PeriodHealthSummaryResponse {
+  since?: string | null;
+  until?: string | null;
+  total: number;
+  improved: number;
+  mixed: number;
+  worsened: number;
+  neutral: number;
+  unscanned: number;
+  findings_resolved: number;
+  findings_improved?: number | null;
+  findings_introduced: number;
+  findings_worsened: number;
+  net_findings: number;
+}
+
 /** A function's stored size measures; an absent one was not measured. */
 export interface PlanMeasuresResponse {
   ccn?: number | null;
@@ -3009,8 +3358,28 @@ export interface ProviderEntry {
   default_model?: string | null;
   configured?: boolean;
   requires_key?: boolean;
+  accepts_base_url?: boolean;
+  local_server?: boolean;
   env_vars?: string[];
   setup_hint?: string;
+}
+
+export interface ProviderModelEntry {
+  id: string;
+  label?: string | null;
+}
+
+/**
+ * Models a provider offers, newest-looking first after the default.
+ *
+ * ``source`` is ``live`` when the provider listed them and ``catalog`` when
+ * the built-in list stands in, with ``error`` saying why.
+ */
+export interface ProviderModelsResponse {
+  models: ProviderModelEntry[];
+  source: "live" | "catalog";
+  default_model: string;
+  error?: string | null;
 }
 
 export interface ProviderStatusResponse {
@@ -3057,6 +3426,14 @@ export interface QueueCounts {
   gated?: number;
 }
 
+export interface QuietOwner {
+  key: string;
+  name: string;
+  last_commit_at: string | null;
+  files_owned: number;
+  changing_files_owned: number;
+}
+
 /** What the ``fix_first`` scope leaves out of a page's filtered set. */
 export interface RefactoringHiddenCounts {
   total?: number;
@@ -3099,6 +3476,7 @@ export interface RefactoringOpportunityDetailResponse {
   next_actions?: Record<string, unknown>[];
   plans?: Record<string, unknown>[] | null;
   ordering_note?: string | null;
+  preview?: string | null;
 }
 
 /** What one opportunity-level triage decision wrote. */
@@ -3143,6 +3521,7 @@ export interface RefactoringPlanDetailResponse {
   file_nloc?: number;
   file_weighted_deficit?: number;
   validation?: Record<string, unknown>;
+  preview?: string | null;
   governed_by?: string[] | null;
   risks?: PlanRiskResponse[] | null;
   recipe?: Record<string, unknown> | null;
@@ -3176,6 +3555,7 @@ export interface RefactoringPlanResponse {
   file_nloc?: number;
   file_weighted_deficit?: number;
   validation?: Record<string, unknown>;
+  preview?: string | null;
 }
 
 /** What one plan-level triage decision wrote. */
@@ -3263,6 +3643,7 @@ export interface RelatedWorkItem {
 export interface RelatedWorkLens {
   items?: RelatedWorkItem[];
   total?: number;
+  preview?: string | null;
 }
 
 /** The files to look up, repo-relative. Validated by the route. */
@@ -3274,6 +3655,30 @@ export interface RelatedWorkRequest {
 export interface RelatedWorkResponse {
   files?: RelatedWorkFile[];
   per_lens_limit?: number;
+}
+
+/** A release's "By the numbers", from ``scripts/release_stats.py``. */
+export interface ReleaseStatsModel {
+  since: string;
+  days: number;
+  prs: number;
+  contributors: number;
+  first_time_contributors?: number | null;
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  types: ReleaseTypeCountsModel;
+  test_files_touched: number;
+  test_files_new: number;
+  issues_closed: number;
+}
+
+export interface ReleaseTypeCountsModel {
+  fixes?: number;
+  features?: number;
+  perf?: number;
+  refactors?: number;
+  docs?: number;
 }
 
 export interface RepoCreate {
@@ -3589,15 +3994,30 @@ export interface SecuritySummaryResponse {
   scanned_at?: string | null;
 }
 
+export interface SelectionProvenance {
+  provider?: string | null;
+  model?: string | null;
+  base_url?: string | null;
+}
+
 export interface SetActiveProviderRequest {
   provider: string;
   model?: string | null;
+  base_url?: string | null;
   repo_id?: string | null;
 }
 
 export interface SetApiKeyRequest {
   api_key: string;
   repo_id?: string | null;
+}
+
+export interface SiloModule {
+  module: string;
+  owner: OwnerRef;
+  owned_files: number;
+  file_count: number;
+  share: number;
 }
 
 /** One change in reading order; ``signals`` holds each signal that fired. */
@@ -3834,11 +4254,83 @@ export interface VersionResponse {
   store_compatible?: boolean | null;
   reindex_recommended?: boolean;
   reindex_command?: string | null;
+  highlights?: ChangelogHighlightModel[];
+  latest_highlights?: string[];
 }
 
 export interface WebhookResponse {
   event_id: string;
   status?: string;
+}
+
+export interface WinsFileGain {
+  path: string;
+  before: number;
+  after: number;
+  gain: number;
+}
+
+/**
+ * Files commits in the window touched whose score rose between the snapshot
+ * at ``baseline_at`` and the one at ``current_at``.
+ */
+export interface WinsFilesImproved {
+  count: number;
+  baseline_at?: string | null;
+  current_at?: string | null;
+  top?: WinsFileGain[];
+}
+
+/**
+ * Findings commits in the window resolved. Resolved findings are stored as
+ * per-commit counts, so the top items are the commits that resolved most.
+ */
+export interface WinsFindingsResolved {
+  count: number;
+  commits: number;
+  top_commits?: WinsResolvingCommit[];
+}
+
+/** A refactoring plan that landed: its target is gone or shrank as planned. */
+export interface WinsRefactoring {
+  file_path: string;
+  target_symbol: string;
+  refactoring_type: string;
+  resolved_at?: string | null;
+  before_ccn?: number | null;
+  after_ccn?: number | null;
+  before_nloc?: number | null;
+  after_nloc?: number | null;
+}
+
+export interface WinsRefactorings {
+  count: number;
+  top?: WinsRefactoring[];
+}
+
+export interface WinsResolvingCommit {
+  sha: string;
+  subject: string;
+  author_name: string;
+  committed_at?: string | null;
+  resolved: number;
+}
+
+/**
+ * What got better since ``since``. Positive only.
+ *
+ * With ``author`` every section narrows to that person's commits and the
+ * files they touched. ``unavailable`` names wins the index cannot answer
+ * from stored data (no history is kept for them).
+ */
+export interface WinsResponse {
+  since: string;
+  until?: string | null;
+  author?: string | null;
+  findings_resolved: WinsFindingsResolved;
+  files_improved: WinsFilesImproved;
+  refactorings_landed: WinsRefactorings;
+  unavailable?: string[];
 }
 
 export interface WorkspaceActionsResponse {

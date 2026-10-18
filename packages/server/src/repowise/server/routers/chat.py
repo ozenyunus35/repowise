@@ -21,9 +21,11 @@ from starlette.responses import StreamingResponse
 from repowise.core.persistence import crud
 from repowise.core.persistence.database import get_session
 from repowise.core.providers.llm.base import ChatProvider
+from repowise.core.providers.llm.resolve import UntrustedBaseUrlError
 from repowise.core.redaction import redact_secrets
 from repowise.server.auth import PER_CALL_TOOL_SCOPE, Principal, get_authorizer
 from repowise.server.chat_artifacts import find_artifact, set_artifact_pinned
+from repowise.server.chat_datasets import cached_rows
 from repowise.server.chat_errors import (
     INVALID_PROVIDER_MESSAGE,
     NO_PROVIDER_MESSAGE,
@@ -45,7 +47,11 @@ from repowise.server.chat_session import (
     IdempotencyConflictError,
     SessionNotFoundError,
 )
-from repowise.server.chat_suggestions import page_suggestions
+from repowise.server.chat_suggestions import (
+    collection_datasets,
+    collection_suggestions,
+    page_suggestions,
+)
 from repowise.server.deps import (
     get_db_session,
     request_principal,
@@ -53,7 +59,11 @@ from repowise.server.deps import (
     resolve_session_factory,
     verify_api_key,
 )
-from repowise.server.provider_config import get_chat_provider_instance
+from repowise.server.provider_config import (
+    NoProviderConfiguredError,
+    UnknownProviderError,
+    get_chat_provider_instance,
+)
 from repowise.server.schemas import (
     ArtifactUpdateRequest,
     ChatArtifactEnvelope,
@@ -139,16 +149,18 @@ def _chat_provider(
         )
     except ValueError as exc:
         # Every detail here is shown to the person, so none echoes the config.
-        # The two texts matched are get_chat_provider_instance's own; another
-        # ValueError (a bad base URL, say) is an invalid configuration.
+        # Another ValueError (a bad base URL, say) is an invalid configuration.
         reason = str(exc)
         logger.warning("chat_provider_unavailable: %s", redact_secrets(reason))
-        if reason.startswith("No active provider configured"):
+        if isinstance(exc, NoProviderConfiguredError):
             raise HTTPException(400, NO_PROVIDER_MESSAGE) from exc
-        if provider and reason.startswith("Unknown provider"):
+        if isinstance(exc, UnknownProviderError):
             raise HTTPException(
                 400, f"Unknown provider {provider!r}. Pick a provider in Settings."
             ) from exc
+        if isinstance(exc, UntrustedBaseUrlError):
+            # Names only the URL, already stripped of any credentials.
+            raise HTTPException(400, str(exc)) from exc
         raise HTTPException(400, INVALID_PROVIDER_MESSAGE) from exc
     except Exception as exc:
         logger.warning(
@@ -267,7 +279,8 @@ async def chat_suggestions(
     uses, so the two can never map a page kind differently, and makes no
     model call. Returns the measured tier only: an empty list leaves the
     client's static tier standing rather than restating copy the UI already
-    ships.
+    ships. A page with no target gets chart questions quoting the datasets a
+    chart has already cached, and nothing is read cold for them.
     """
     factory = resolve_request_session_factory(request)
     repo_name, repo_path = await _get_repo_info(factory, repo_id)
@@ -279,13 +292,17 @@ async def chat_suggestions(
         # banner over a composer.
         return {"suggestions": []}
 
+    alias = _workspace_alias(request, repo_path, repo_name)
+    if not context.target:
+        return {"suggestions": await _collection_suggestions(kind, alias)}
+
     principal = request_principal(request)
     scope = SessionScope(
         kind="repo",
         repo_id=repo_id,
         repo_name=repo_name,
         repo_path=repo_path,
-        repo_alias=_workspace_alias(request, repo_path, repo_name),
+        repo_alias=alias,
         storage=factory,
     )
     tools = tool_backends.get()(scope, principal)
@@ -302,6 +319,16 @@ async def chat_suggestions(
             grounding.tool_name, grounding.summary, grounding.result
         )
     }
+
+
+async def _collection_suggestions(kind: str, alias: str | None) -> list[dict[str, Any]]:
+    """Chart questions from datasets a chart already cached; a failed read is no chips."""
+    try:
+        rows = await cached_rows(collection_datasets(kind), alias)
+    except Exception:
+        logger.exception("chat_collection_suggestions_failed", extra={"kind": kind})
+        return []
+    return collection_suggestions(kind, rows)
 
 
 # ---------------------------------------------------------------------------

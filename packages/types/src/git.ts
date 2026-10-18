@@ -7,6 +7,8 @@
  * adapter before passing data to components.
  */
 
+import type { HealthDeltaSummaryResponse } from "./generated/http.js";
+
 export interface FileAuthor {
   name: string;
   email: string;
@@ -164,6 +166,10 @@ export interface Commit {
   agent_confidence?: string | null;
   /** agent / human_attested / unknown; null when attribution is off. */
   attribution?: CommitAttribution | null;
+  /** What the commit did to health, the row's lead; null when never scanned. */
+  health_delta?: HealthDeltaSummaryResponse | null;
+  /** Hotspot files (as flagged now) the commit touched. */
+  touches_hotspot?: number;
 }
 
 export type CommitAttribution = "agent" | "human_attested" | "unknown";
@@ -202,6 +208,8 @@ export interface CommitHealthFinding {
    *  `unknown`. Separates what a change wrote from what it merely touched. */
   attribution_basis: string;
   reason: string;
+  /** Set when the commit moved this finding's code here from another file. */
+  moved_from?: { path: string; symbol?: string | null } | null;
 }
 
 /** What a commit did to code health, computed at index time.
@@ -213,9 +221,16 @@ export interface CommitHealth {
   /** `available` when every changed file was compared, `partial` when some
    *  were skipped (unsupported language, binary, unreadable). */
   status: string;
+  /** An older analyzer wrote it: the direction holds, the counts do not
+   *  compare with current rows. */
+  stale?: boolean;
   introduced_count: number;
   worsened_count: number;
   resolved_count: number;
+  /** Findings whose metric dropped, at the same place or after a move. */
+  improved_count?: number;
+  /** Findings carried to another file with their code; a worsened or improved one is in that count too. */
+  moved_count?: number;
   files_analyzed: number;
   files_skipped: number;
   /** Worst first, capped. `introduced_count + worsened_count` is the true

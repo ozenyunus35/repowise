@@ -2,7 +2,7 @@
 
 import { useState, type MouseEvent } from "react";
 import type * as React from "react";
-import { CircleSlash, Eye, GitBranch, MoreHorizontal, Sparkles } from "lucide-react";
+import { CircleSlash, Eye, GitBranch, MoreHorizontal } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "../ui/button";
 import { ConfirmDialog } from "../ui/confirm-dialog";
@@ -10,6 +10,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import { formatConfidence } from "../lib/format";
 import { toFriendlyMessage } from "../lib/errors";
 import { cn } from "../lib/cn";
+import { PreviewBadge } from "../health/preview-badge";
+import { RowPromptAction } from "../health/row-prompt-action";
 import {
   deadCodeRiskFactorLabel,
   type DeadCodeFinding,
@@ -124,6 +126,11 @@ export function FindingIdentity({ finding, href, onNavigate, mark }: FindingIden
           {finding.reason}
         </span>
       )}
+      {finding.preview ? (
+        <span className="mt-0.5 block">
+          <PreviewBadge note={finding.preview} />
+        </span>
+      ) : null}
       <FindingSafety finding={finding} mark={mark ?? "review"} />
     </div>
   );
@@ -272,6 +279,12 @@ export function FindingRowActions({
   return (
     <span onClick={(e) => e.stopPropagation()}>
       <span className="flex items-center justify-end gap-1">
+        {onGeneratePrompt && (
+          <RowPromptAction
+            subject={finding.file_path}
+            onClick={() => onGeneratePrompt(finding.id)}
+          />
+        )}
         {finding.status === "open" ? (
           <Button
             size="sm"
@@ -316,10 +329,6 @@ export function FindingRowActions({
                 )}
               </>
             )}
-            {onGeneratePrompt &&
-              menuItem("Draft AI cleanup prompt", Sparkles, () =>
-                onGeneratePrompt(finding.id),
-              )}
             {graphHref && (
               <a
                 href={graphHref(finding.file_path)}

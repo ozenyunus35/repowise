@@ -779,8 +779,8 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 
 | Model | Notes |
 |-------|-------|
-| `claude-sonnet-4-6` | Best balance of quality and cost |
-| `claude-opus-4-6` | Highest quality, higher cost |
+| `claude-sonnet-5-5` | Best balance of quality and cost |
+| `claude-opus-5-5` | Highest quality, higher cost |
 | `claude-haiku-5-5` | Default, fastest, lowest cost |
 
 ```bash
@@ -858,7 +858,7 @@ Gemini is also the default embedding provider when `GEMINI_API_KEY` is set.
 
 ```bash
 export DEEPSEEK_API_KEY="..."
-repowise init --provider deepseek --model deepseek-chat
+repowise init --provider deepseek --model deepseek-flash
 ```
 
 ### Kimi
@@ -953,12 +953,24 @@ routed through Eden (e.g. `openai/gpt-5*`); other models expose only `auto`.
 
 ### Provider auto-detection
 
-If you don't pass `--provider`, repowise detects your provider by checking, in
-order:
+The CLI, `repowise serve` chat and jobs, and the MCP server resolve provider,
+model, and base URL the same way, first match wins:
 
-1. `REPOWISE_PROVIDER` environment variable
-2. `provider` in `.repowise/config.yaml`
-3. API key env vars: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OPENROUTER_API_KEY` → `OLLAMA_BASE_URL` → `GEMINI_API_KEY` → `DEEPSEEK_API_KEY` → `KIMI_API_KEY` → `EDENAI_API_KEY`
+1. `--provider` / `--model` flags, or a per-request choice in the web UI
+2. `provider`, `model`, and `<provider>: {base_url: ...}` in `.repowise/config.yaml`
+3. the global default saved from the web UI (`~/.repowise/provider_config.json`)
+4. `REPOWISE_PROVIDER` / `REPOWISE_MODEL` and the provider's `*_BASE_URL` variable
+5. API key env vars: `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` → `OPENROUTER_API_KEY` → `OLLAMA_BASE_URL` → `GEMINI_API_KEY` → `DEEPSEEK_API_KEY` → `KIMI_API_KEY` → `EDENAI_API_KEY`
+
+Picking a model in the web UI for a repo writes it to that repo's `config.yaml`,
+so the CLI uses it too. A local OpenAI-compatible server such as LM Studio works
+as `provider: openai` with `openai: {base_url: http://localhost:1234/v1}`.
+Because `config.yaml` may be committed, a non-local base URL there only receives a key
+that is not in the repo's `.repowise/.env` after you confirm it in Settings or with `repowise init`.
+You can set all of this from the repo's Settings page instead of editing the
+file: the model field lists the provider's live models and takes any id, and
+Test connection checks a base URL before you save it. A loopback base URL needs
+no API key.
 
 ---
 
@@ -1043,8 +1055,8 @@ The `.repowise/.env` file is gitignored automatically.
 
 | Variable | Description |
 |----------|-------------|
-| `REPOWISE_PROVIDER` | Override provider (skips auto-detection) |
-| `REPOWISE_MODEL` | Override model |
+| `REPOWISE_PROVIDER` | Provider when neither a flag nor `config.yaml` names one (skips auto-detection) |
+| `REPOWISE_MODEL` | Model when neither a flag nor `config.yaml` names one |
 | `REPOWISE_DOC_MODEL` | Override the model used for `get_answer` synthesis specifically |
 | `REPOWISE_REASONING` | Override `reasoning` (see valid values above) |
 | `REPOWISE_ANSWER_TIMEOUT_S` | Seconds `get_answer` waits for synthesis before giving up. Defaults to a per-provider budget: 60s for the remote API providers, 120s for `ollama` and `litellm`, 180s for `codex_cli` and `opencode`. Raise it if your model is slower than its class suggests, lower it if you would rather an agent fail fast than block. Capped at 600s. Note your MCP client enforces its own tool timeout underneath this one, so setting a value above it produces a client-side error instead of repowise's diagnosable "synthesis exceeded its budget" response |
