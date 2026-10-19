@@ -239,7 +239,7 @@ class TestProseFlag:
 
         resolver = Mock(return_value=None)
         monkeypatch.setattr(
-            "repowise.cli.commands.init_cmd.command.resolve_provider", resolver
+            "repowise.cli.commands.init_cmd._prepare.resolve_provider", resolver
         )
         result = runner.invoke(cli, ["init", str(tmp_path), *flags, "--yes"])
         assert result.exit_code == 0, result.output
@@ -253,7 +253,7 @@ class TestProseFlag:
 
         resolver = Mock(return_value=None)
         monkeypatch.setattr(
-            "repowise.cli.commands.init_cmd.command.resolve_provider", resolver
+            "repowise.cli.commands.init_cmd._prepare.resolve_provider", resolver
         )
         flags = ["--provider", "openai"] if opt_in == "provider" else []
         if opt_in == "key":
@@ -378,3 +378,66 @@ class TestNonInteractiveKeyPersistence:
 
         written = (tmp_path / ".repowise" / ".env").read_text(encoding="utf-8")
         assert "OPENAI_API_KEY=sk-newline\n" in written
+
+
+class TestAdvancedExcludeMergesWithFlag:
+    """Customize answers must add to `-x` patterns, not replace them (issue #4034)."""
+
+    @staticmethod
+    def _exclude_patterns(tmp_path, args, typed):
+        import subprocess
+        from unittest import mock
+
+        from repowise.cli.commands.init_cmd import _prepare, _questions
+
+        repo = tmp_path / "repo"
+        (repo / "vendor").mkdir(parents=True)
+        (repo / "vendor" / "lib.py").write_text("x = 1\n")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+        answers = {
+            "commit_limit": 5000,
+            "follow_renames": False,
+            "skip_tests": False,
+            "skip_infra": False,
+            "exclude": typed,
+            "run_mode": "standard",
+            "max_file_pages": None,
+            "generate_docs": False,
+        }
+        seen: list[list[str]] = []
+
+        def _stop_after_settings(run):
+            seen.append(list(run.exclude_patterns))
+            return False
+
+        with (
+            mock.patch.object(_prepare, "_interactive_gate", lambda **_: True),
+            mock.patch.object(_questions, "interactive_mode_select", lambda _c: "advanced"),
+            mock.patch.object(_questions, "interactive_generate_docs_toggle", lambda _c: False),
+            mock.patch.object(
+                _questions, "interactive_advanced_config", lambda *a, **k: dict(answers)
+            ),
+            mock.patch.object(_prepare, "_confirm_wiki_overwrite", _stop_after_settings),
+        ):
+            result = CliRunner().invoke(cli, ["init", str(repo), *args])
+
+        assert result.exit_code == 0, result.output
+        assert seen, result.output
+        return seen[0]
+
+    def test_typed_pattern_is_added_after_flag(self, tmp_path):
+        got = self._exclude_patterns(tmp_path, ["-x", "vendor/"], ("build/",))
+        assert got == ["vendor/", "build/"]
+
+    def test_enter_keeps_flag_patterns(self, tmp_path):
+        got = self._exclude_patterns(tmp_path, ["-x", "vendor/"], ())
+        assert got == ["vendor/"]
+
+    def test_repeated_pattern_is_not_duplicated(self, tmp_path):
+        got = self._exclude_patterns(tmp_path, ["-x", "vendor/"], ("vendor/",))
+        assert got == ["vendor/"]
+
+    def test_no_flag_uses_typed_patterns(self, tmp_path):
+        got = self._exclude_patterns(tmp_path, [], ("build/",))
+        assert got == ["build/"]

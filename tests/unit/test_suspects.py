@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from repowise.core.co_change import CoChangePartner
 from repowise.core.suspects import (
     Candidate,
@@ -137,6 +139,29 @@ def test_person_trailers_never_reach_the_text(tmp_path):
     assert "Ann" not in got[head][0] and "Bob" not in got[head][0]
 
 
+def test_a_change_text_is_read_from_git_once(monkeypatch, tmp_path):
+    """A commit's text never changes, so a long-lived server reads each one once."""
+    from repowise.core.suspects import git_text
+
+    sha_a, sha_b = "a" * 40, "b" * 40
+    asked: list[list[str]] = []
+
+    def fake_log(_repo, args, shas):
+        asked.append(list(shas))
+        if args[0].startswith("--format"):
+            return "".join(f"\x00{s}\nbody {s[0]}\n" for s in shas)
+        return "".join(f"\x00{s}\n@@ -1 +1 @@ def f_{s[0]}(\n" for s in shas)
+
+    monkeypatch.setattr(git_text, "_log", fake_log)
+    monkeypatch.setattr(git_text, "_TEXTS", type(git_text._TEXTS)())
+    first = git_text.read_change_texts(tmp_path, [(sha_a, 1)])
+    asked.clear()
+    both = git_text.read_change_texts(tmp_path, [(sha_a, 1), (sha_b, 1)])
+    assert both[sha_a] == first[sha_a] == ("body a", ("f_a",))
+    assert both[sha_b] == ("body b", ("f_b",))
+    assert asked == [[sha_b], [sha_b]]
+
+
 def test_git_never_inherits_stdin_and_cannot_hang(monkeypatch, tmp_path):
     # Under the stdio MCP server on Windows an inherited stdin pipe blocks git.
     import subprocess
@@ -173,3 +198,96 @@ def test_one_import_hop_reads_singular():
     out = rank_suspects(Symptom(files=(QUERY,), at=NOW), _candidates(), ctx, signals=["graph"])
     hop = next(s for s in out if s.change_id == "c").signals["graph"].evidence
     assert hop == (f"1 import hop from {QUERY} to {COMPILER}",)
+
+
+@pytest.fixture
+async def suspects_index(tmp_path, monkeypatch):
+    from repowise.core.persistence import (
+        create_engine,
+        create_session_factory,
+        get_session,
+        init_db,
+        upsert_repository,
+    )
+    from repowise.core.persistence.models import Change
+    from repowise.core.repo_config import save_repo_config
+    from repowise.core.suspects import index
+
+    save_repo_config(tmp_path, {"commit_limit": 3})
+    monkeypatch.setattr(index, "read_change_texts", lambda *args: {})
+    monkeypatch.setattr(index, "_tracked_files", lambda path: frozenset())
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        await init_db(engine)
+        async with get_session(create_session_factory(engine)) as session:
+            repo = await upsert_repository(session, name="repo", local_path=str(tmp_path))
+            session.add_all([
+                Change(
+                    repository_id=repo.id,
+                    change_id=f"change-{i}",
+                    identity_kind="commit",
+                    identity_value=f"{i:040x}",
+                    shape="commit",
+                    title=f"Change {i}",
+                    merged_at=NOW - timedelta(days=i + 1),
+                    head_sha=f"{i:040x}",
+                )
+                for i in range(3)
+            ])
+            await session.flush()
+            yield session, repo.id, tmp_path
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("commit_limit", [2, 3, "3"])
+async def test_candidates_capped_when_the_window_holds_commit_limit_changes(
+    suspects_index, commit_limit,
+):
+    from repowise.core.repo_config import save_repo_config
+    from repowise.core.suspects.index import find_suspects
+
+    session, repo_id, path = suspects_index
+    save_repo_config(path, {"commit_limit": commit_limit})
+    out = await find_suspects(session, repo_id, path, Symptom(at=NOW), limit=1)
+    assert out["candidates_capped"] is True
+    assert out["candidates"] == 3  # Count candidates before the result limit.
+    assert len(out["suspects"]) == 1
+    assert out["suspects"][0]["id"] == "change-0"
+    assert out["suspects"][0]["rank"] == 1
+
+
+async def test_candidates_not_capped_below_the_limit(suspects_index):
+    from repowise.core.suspects.index import find_suspects
+
+    session, repo_id, path = suspects_index
+    out = await find_suspects(
+        session, repo_id, path, Symptom(at=NOW), since=NOW - timedelta(days=2),
+    )
+    assert out["candidates"] == 2  # The stored third change is outside the window.
+    assert out["candidates_capped"] is False
+    assert [s["id"] for s in out["suspects"]] == ["change-0", "change-1"]
+
+
+async def test_empty_suspects_window_is_not_capped(suspects_index):
+    from repowise.core.suspects.index import find_suspects
+
+    session, repo_id, path = suspects_index
+    out = await find_suspects(
+        session, repo_id, path, Symptom(at=NOW), since=NOW - timedelta(hours=12),
+    )
+    assert out["candidates"] == 0
+    assert out["candidates_capped"] is False
+    assert out["suspects"] == []
+
+
+@pytest.mark.parametrize("config", [{}, {"commit_limit": 0}, {"commit_limit": "0"}, {"commit_limit": None}])
+async def test_candidates_use_the_default_commit_limit(suspects_index, config):
+    from repowise.core.repo_config import save_repo_config
+    from repowise.core.suspects.index import find_suspects
+
+    session, repo_id, path = suspects_index
+    save_repo_config(path, config)
+    out = await find_suspects(session, repo_id, path, Symptom(at=NOW))
+    assert out["candidates"] == 3
+    assert out["candidates_capped"] is False

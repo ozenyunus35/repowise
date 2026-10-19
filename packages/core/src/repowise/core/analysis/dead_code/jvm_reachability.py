@@ -87,6 +87,7 @@ _STEREOTYPE_ANNOTATIONS: frozenset[str] = frozenset({
     "ContributesIntoMap",
     "ContributesMultibinding",
     "BindingContainer",
+    "GlideModule",              # Glide annotation processor
     # JMH runs these by reflection; ``Benchmark`` sits on the methods.
     "State",
     "BenchmarkMode",
