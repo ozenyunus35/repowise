@@ -300,21 +300,31 @@ async def finalize_refactoring_suggestions(
     )
     public_ids = assign_public_ids(scoped)
 
-    stored_rows = list(
-        (
-            await session.execute(
-                select(RefactoringSuggestion).where(
-                    *_scope_predicates(
-                        repository_id,
-                        file_paths=file_paths,
-                        refactoring_type=refactoring_type,
+    # One batch of paths at a time, as SQLite caps the variables one statement
+    # binds; ``None`` is the whole repository, in one read.
+    paths = sorted(allowed) if allowed is not None else None
+    batches = (
+        [None]
+        if paths is None
+        else [paths[i : i + _BATCH_SIZE] for i in range(0, len(paths), _BATCH_SIZE)]
+    )
+    stored_rows: list[RefactoringSuggestion] = []
+    for batch in batches:
+        stored_rows += (
+            (
+                await session.execute(
+                    select(RefactoringSuggestion).where(
+                        *_scope_predicates(
+                            repository_id,
+                            file_paths=batch,
+                            refactoring_type=refactoring_type,
+                        )
                     )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
     reusable = await _reusable_rows(
         session, repository_id, stored_rows, public_ids, REFACTORING_MODEL_VERSION
     )

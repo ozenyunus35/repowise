@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import delete, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...batches import chunked
 from ...models import TestCoverageEntry, _new_uuid, _now_utc
 
 # Upper bound on rows persisted per repo, so a pathological O(tests x files)
@@ -207,8 +208,8 @@ async def tests_covering_files(
 ) -> dict[str, list[dict[str, Any]]]:
     """Bulk reverse index for recommendation validation.
 
-    Unlike :func:`tests_covering`, this performs one indexed query for the
-    complete target set.  Callers may then apply plan-specific line ranges in
+    Unlike :func:`tests_covering`, this performs one indexed query per batch of
+    the target set, not one per file.  Callers may then apply plan-specific line ranges in
     memory without turning recommendation hydration into one query per plan.
     Rows and buckets are ordered deterministically; ``covered_lines`` remains
     complete so a caller can distinguish a measured line hit from a file-only
@@ -216,28 +217,30 @@ async def tests_covering_files(
     """
     if not source_files:
         return {}
-    result = await session.execute(
-        select(TestCoverageEntry)
-        .where(
-            TestCoverageEntry.repository_id == repository_id,
-            TestCoverageEntry.source_file.in_(sorted(source_files)),
-        )
-        .order_by(
-            TestCoverageEntry.source_file.asc(),
-            TestCoverageEntry.test_id.asc(),
-            TestCoverageEntry.test_file.asc(),
-        )
-    )
     out: dict[str, list[dict[str, Any]]] = {}
-    for row in result.scalars().all():
-        out.setdefault(row.source_file, []).append(
-            {
-                "test_id": row.test_id,
-                "test_file": row.test_file,
-                "covered_lines": _decode_lines(row),
-                "source_format": row.source_format,
-            }
+    # Batches of the sorted set, so the rows still come in source_file order.
+    for batch in chunked(sorted(source_files)):
+        result = await session.execute(
+            select(TestCoverageEntry)
+            .where(
+                TestCoverageEntry.repository_id == repository_id,
+                TestCoverageEntry.source_file.in_(batch),
+            )
+            .order_by(
+                TestCoverageEntry.source_file.asc(),
+                TestCoverageEntry.test_id.asc(),
+                TestCoverageEntry.test_file.asc(),
+            )
         )
+        for row in result.scalars().all():
+            out.setdefault(row.source_file, []).append(
+                {
+                    "test_id": row.test_id,
+                    "test_file": row.test_file,
+                    "covered_lines": _decode_lines(row),
+                    "source_format": row.source_format,
+                }
+            )
     return out
 
 

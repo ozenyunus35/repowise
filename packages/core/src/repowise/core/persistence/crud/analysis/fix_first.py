@@ -60,6 +60,7 @@ from repowise.core.analysis.health.rows import detail_map
 from repowise.core.analysis.health.scoring import history_biomarkers
 from repowise.core.ingestion.git_indexer.function_blame import _MIN_COMMITS_FOR_BLAME
 
+from ...batches import chunked
 from ...models import (
     DeadCodeFinding,
     GitFunctionBlame,
@@ -86,9 +87,15 @@ FINDING_FILES = 100
 
 async def _metrics(session: AsyncSession, repo_id: str, paths: set[str] | None) -> list[Any]:
     """The named files' rows; ``None`` reads every file."""
-    if paths is not None and not paths:
-        return []
-    scoped = HealthFileMetric.file_path.in_(paths) if paths is not None else true()
+    if paths is None:
+        return await _metric_rows(session, repo_id, true())
+    rows: list[Any] = []
+    for batch in chunked(sorted(paths)):
+        rows += await _metric_rows(session, repo_id, HealthFileMetric.file_path.in_(batch))
+    return rows
+
+
+async def _metric_rows(session: AsyncSession, repo_id: str, scoped: Any) -> list[Any]:
     return plain_rows(
         await session.execute(
             select(
@@ -279,34 +286,42 @@ async def _findings(
         return []
     f = HealthFinding
     history = history_biomarkers()
-    return plain_rows(
-        await session.execute(
-            select(
-                f.file_path,
-                f.biomarker_type,
-                f.severity,
-                f.function_name,
-                f.line_start,
-                f.line_end,
-                f.reason,
-                f.health_impact,
-                f.public_id,
-                f.dimension,
-                f.status,
-                # History numbers become plain context sentences.
-                f.details_json,
-            ).where(
-                queue_findings(repo_id),
-                or_(
-                    f.file_path.in_(full),
-                    and_(
-                        f.file_path.in_(planned - full),
-                        or_(f.biomarker_type.in_(history), f.function_name.in_(functions)),
-                    ),
-                ),
+    rows: list[Any] = []
+    # Batched, as SQLite caps the variables one statement binds; a planned
+    # file's findings are matched to what an item quotes here rather than in
+    # SQL, since a repository's plans can name more functions than one
+    # statement may bind.
+    for files in chunked(sorted(full | planned)):
+        batch = plain_rows(
+            await session.execute(
+                select(
+                    f.file_path,
+                    f.biomarker_type,
+                    f.severity,
+                    f.function_name,
+                    f.line_start,
+                    f.line_end,
+                    f.reason,
+                    f.health_impact,
+                    f.public_id,
+                    f.dimension,
+                    f.status,
+                    # History numbers become plain context sentences.
+                    f.details_json,
+                ).where(
+                    queue_findings(repo_id),
+                    f.file_path.in_(files),
+                )
             )
         )
-    )
+        rows += [
+            row
+            for row in batch
+            if row.file_path in full
+            or row.biomarker_type in history
+            or row.function_name in functions
+        ]
+    return rows
 
 
 async def _refactoring(session: AsyncSession, repo_id: str) -> list[Any]:
@@ -432,19 +447,22 @@ async def _plans(
     whose occurrences say where verified duplicates sit (a plan is stored at
     one anchor file and names every site, so it is not filtered by file).
     ``files=None`` reads the Extract Method plans of every file."""
-    ids = {s.get("plan_id") for s in steps if s.get("plan_id")}
+    ids = sorted({s.get("plan_id") for s in steps if s.get("plan_id")})
     s = RefactoringSuggestion
-    named = s.public_id.in_(ids) if ids else None
     extract = and_(s.refactoring_type == "extract_method", s.status == "open")
-    extractions = (
-        extract if files is None else and_(extract, s.file_path.in_(files)) if files else None
-    )
     helpers = and_(s.refactoring_type == "extract_helper", s.status == "open")
-    wanted = [c for c in (named, extractions, helpers) if c is not None]
-    if not wanted:
-        return []
-    return plain_rows(
-        await session.execute(
+    # One batch of ids or files per statement, as SQLite caps the variables
+    # one statement binds; the first also reads the helpers. A plan two
+    # statements both match is kept once.
+    batches = [s.public_id.in_(batch) for batch in chunked(ids)]
+    if files is None:
+        batches.append(extract)
+    else:
+        batches += [and_(extract, s.file_path.in_(batch)) for batch in chunked(sorted(files))]
+    rows: dict[Any, None] = {}
+    for index, batch in enumerate(batches or [helpers]):
+        conditions = [batch, helpers] if index == 0 else [batch]
+        result = await session.execute(
             select(
                 s.public_id,
                 s.refactoring_type,
@@ -456,13 +474,14 @@ async def _plans(
                 s.rank_json,
             ).where(
                 s.repository_id == repo_id,
-                or_(*wanted),
+                or_(*conditions),
                 # The registry's withheld types, as on every plan list. Fix
                 # first is its own measured lens, so no language gate applies.
                 shown_plan_predicate(include_unverified=True),
             )
         )
-    )
+        rows.update(dict.fromkeys(plain_rows(result)))
+    return list(rows)
 
 
 async def _symbol_lines(session: AsyncSession, repo_id: str, performance: list[Any]) -> dict[str, int]:
@@ -484,12 +503,15 @@ async def _symbol_lines(session: AsyncSession, repo_id: str, performance: list[A
     if not wanted:
         return {}
     g = GraphNode
-    rows = await session.execute(
-        select(g.node_id, g.start_line).where(
-            g.repository_id == repo_id, g.node_id.in_(wanted), g.start_line.is_not(None)
+    lines: dict[str, int] = {}
+    for batch in chunked(sorted(wanted)):
+        rows = await session.execute(
+            select(g.node_id, g.start_line).where(
+                g.repository_id == repo_id, g.node_id.in_(batch), g.start_line.is_not(None)
+            )
         )
-    )
-    return {node_id: line for node_id, line in rows.all()}
+        lines.update(rows.all())
+    return lines
 
 
 def _span_suggestion(path: str, function: Any, start: Any, end: Any) -> PlanSuggestion:

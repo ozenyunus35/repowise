@@ -54,6 +54,7 @@ from repowise.core.analysis.test_reachability import (
 )
 from repowise.core.ingestion.package_roots import scan_package_manifests
 
+from ...batches import chunked
 from ...models import GraphMetric, GraphNode, HealthFileMetric, Repository
 from ..graph import get_graph_metrics
 from .coverage_map import tests_covering_files
@@ -285,18 +286,17 @@ async def _test_runs(checkout: str | None, test_files: set[str]) -> TestRuns:
 async def _symbol_spans(
     session: AsyncSession, repository_id: str, files: Sequence[str]
 ) -> dict[str, list[SymbolSpan]]:
-    """Each file's symbol ids with their line spans, in one statement."""
-    if not files:
-        return {}
-    rows = await session.execute(
-        select(GraphNode.file_path, GraphNode.node_id, GraphNode.start_line, GraphNode.end_line)
-        .where(GraphNode.repository_id == repository_id)
-        .where(GraphNode.node_type == "symbol")
-        .where(GraphNode.file_path.in_(list(files)))
-    )
+    """Each file's symbol ids with their line spans, one statement per batch of files."""
     spans: dict[str, list[SymbolSpan]] = {}
-    for file_path, node_id, start, end in rows:
-        spans.setdefault(file_path, []).append((node_id, int(start or 0), int(end or 0)))
+    for batch in chunked(list(files)):
+        rows = await session.execute(
+            select(GraphNode.file_path, GraphNode.node_id, GraphNode.start_line, GraphNode.end_line)
+            .where(GraphNode.repository_id == repository_id)
+            .where(GraphNode.node_type == "symbol")
+            .where(GraphNode.file_path.in_(batch))
+        )
+        for file_path, node_id, start, end in rows:
+            spans.setdefault(file_path, []).append((node_id, int(start or 0), int(end or 0)))
     return spans
 
 

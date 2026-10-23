@@ -220,21 +220,10 @@ async def upsert_health_findings(
     """
     if not file_paths:
         return
-    predicates = [
-        HealthFinding.repository_id == repository_id,
-        HealthFinding.file_path.in_(file_paths),
-    ]
-    if dimension is not None:
-        predicates.append(HealthFinding.dimension == dimension)
-    await _delete_open(session, predicates)
-
-    allowed = set(file_paths)
-    scoped = [
-        finding
-        for finding in findings
-        if (finding.file_path if hasattr(finding, "file_path") else finding.get("file_path"))
-        in allowed
-        and (
+    by_path: dict[str, list[Any]] = {path: [] for path in file_paths}
+    for finding in findings:
+        path = finding.file_path if hasattr(finding, "file_path") else finding.get("file_path")
+        if path in by_path and (
             dimension is None
             or (
                 getattr(finding, "dimension", None)
@@ -242,9 +231,22 @@ async def upsert_health_findings(
                 else finding.get("dimension")
             )
             == dimension
-        )
-    ]
-    await _insert_keeping_triage(session, repository_id, scoped, predicates)
+        ):
+            by_path[path].append(finding)
+    # One batch of paths at a time, as SQLite caps the variables one statement
+    # binds; a finding belongs to one path, so each batch replaces its own.
+    paths = sorted(by_path)
+    for start in range(0, len(paths), _BATCH_SIZE):
+        batch = paths[start : start + _BATCH_SIZE]
+        predicates = [
+            HealthFinding.repository_id == repository_id,
+            HealthFinding.file_path.in_(batch),
+        ]
+        if dimension is not None:
+            predicates.append(HealthFinding.dimension == dimension)
+        await _delete_open(session, predicates)
+        scoped = [finding for path in batch for finding in by_path[path]]
+        await _insert_keeping_triage(session, repository_id, scoped, predicates)
 
 
 async def update_health_finding_status(
