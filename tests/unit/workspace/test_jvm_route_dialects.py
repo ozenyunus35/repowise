@@ -108,6 +108,29 @@ class TestKtorServer:
         )
         assert _contracts(repo, "provider") == {}
 
+    def test_a_verb_outside_route_and_routing_is_refused(self, tmp_path: Path) -> None:
+        # In an extension function the path is served under the call site's prefix.
+        repo = _write(
+            tmp_path,
+            "Routes.kt",
+            'import io.ktor.server.routing.*\nfun Route.items() {\n    get("/x") { }\n}\n',
+        )
+        assert _contracts(repo, "provider") == {}
+
+    def test_install_routing_serves_like_routing(self, tmp_path: Path) -> None:
+        repo = _write(
+            tmp_path,
+            "Routes.kt",
+            "import io.ktor.server.routing.*\n"
+            "fun Application.module() {\n"
+            "    install(Routing) {\n"
+            '        get("/x") { }\n'
+            "        get { }\n"
+            "    }\n"
+            "}\n",
+        )
+        assert set(_contracts(repo, "provider")) == {"http::GET::/x", "http::GET::/"}
+
     def test_a_file_without_the_routing_package_is_not_read(self, tmp_path: Path) -> None:
         repo = _write(tmp_path, "Other.kt", 'fun f() { get("/x") { } }\n')
         assert _contracts(repo, "provider") == {}
