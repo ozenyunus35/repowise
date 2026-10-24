@@ -46,7 +46,7 @@ def is_call_site(content: str, offset: int) -> bool:
 
     A declaration names a type or ``fun`` before the name (``void get(``,
     ``String get(``, ``fun get(``); a call follows a statement boundary, a
-    bracket, an operator or a line break.
+    bracket, an operator, a lambda arrow or a line break.
     """
     i = offset - 1
     while i >= 0 and content[i] in " \t":
@@ -54,7 +54,10 @@ def is_call_site(content: str, offset: int) -> bool:
     if i < 0:
         return True
     prev = content[i]
-    return not (prev.isalnum() or prev in "_>]")
+    if prev == ">":
+        # `List<String> get(` declares; `() -> get(` calls, in an expression lambda.
+        return content[i - 1 : i + 1] == "->"
+    return not (prev.isalnum() or prev in "_]")
 
 
 def enclosing_prefix(scopes: list[PrefixScope], offset: int) -> str | None:

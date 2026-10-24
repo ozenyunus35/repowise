@@ -3,11 +3,11 @@
 A Ktor route is a bare call with a trailing handler block: ``get("/x") { }``,
 or ``get { }`` with no path, which serves the enclosing route. ``route("/p")``
 blocks nest prefixes, and the prefix a verb serves under is every ``route``
-block around it, by lambda scope. A verb outside every ``route`` serves its own
-path, or ``/`` with none, when it sits directly in ``routing { }`` or
-``install(Routing) { }``. Outside both, in an extension function such as
-``fun Route.users()``, its prefix is wherever that function is called, which
-this file cannot see, so it is refused.
+block around it, by lambda scope. Only a verb inside ``routing { }`` or
+``install(Routing) { }`` has a known root; a verb with no path straight under
+it serves ``/``. In an extension function such as ``fun Route.users()``, even
+inside a ``route`` block, the prefix is wherever that function is called,
+which this file cannot see, so it is refused.
 
 The receiver is what keeps the Ktor client out: a request is a dotted call on
 a client value (``client.get("/x")``), a route is a bare call on the implicit
@@ -97,8 +97,8 @@ def _served_path(call: _Call, routes: list[PrefixScope], routing: list[PrefixSco
     """The path *call* serves, or ``None`` when it is not a route this file can place."""
     if call.path is None or call.n_args > 1 or call.name.upper() not in HTTP_METHODS:
         return None
-    if not _within(routes, call.offset) and not _within(routing, call.offset):
-        return None  # an extension function's verb: its prefix is its call site
+    if not _within(routing, call.offset):
+        return None  # not under routing { } or install(Routing) { }: the prefix is the call site's
     prefix = enclosing_prefix(routes, call.offset)
     if prefix is None:
         return None

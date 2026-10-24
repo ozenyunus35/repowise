@@ -42,7 +42,6 @@ class TestKtorServer:
         ids = _contracts(_FIXTURES / "ktor", "provider")
         assert "http::GET::/api/users/{param}" in ids
         assert "http::GET::/api/status" in ids
-        assert "http::DELETE::/customers/{param}" in ids
 
     def test_a_verb_with_no_path_serves_the_enclosing_route(self) -> None:
         ids = _contracts(_FIXTURES / "ktor", "provider")
@@ -53,15 +52,14 @@ class TestKtorServer:
 
     def test_exactly_the_declared_routes(self) -> None:
         ids = _contracts(_FIXTURES / "ktor", "provider")
-        # The typed `get<Articles>` and the path-less `get` in an extension
-        # function, whose prefix is its call site, are not among them.
+        # The typed `get<Articles>` and every route in the extension function,
+        # whose prefix is its call site, are not among them.
         assert set(ids) == {
             "http::GET::/",
             "http::GET::/api/users",
             "http::GET::/api/users/{param}",
             "http::POST::/api/users",
             "http::GET::/api/status",
-            "http::DELETE::/customers/{param}",
             "http::GET::/test-only",
         }
 
@@ -108,12 +106,17 @@ class TestKtorServer:
         )
         assert _contracts(repo, "provider") == {}
 
-    def test_a_verb_outside_route_and_routing_is_refused(self, tmp_path: Path) -> None:
-        # In an extension function the path is served under the call site's prefix.
+    def test_a_verb_outside_routing_is_refused(self, tmp_path: Path) -> None:
+        # In an extension function, inside a `route` block or not, the path is
+        # served under the call site's prefix.
         repo = _write(
             tmp_path,
             "Routes.kt",
-            'import io.ktor.server.routing.*\nfun Route.items() {\n    get("/x") { }\n}\n',
+            "import io.ktor.server.routing.*\n"
+            "fun Route.items() {\n"
+            '    get("/x") { }\n'
+            '    route("/p") { get("/y") { } }\n'
+            "}\n",
         )
         assert _contracts(repo, "provider") == {}
 
@@ -169,6 +172,19 @@ class TestJavalin:
         contract = _contracts(_FIXTURES / "javalin", "provider")["http::POST::/orders"]
         assert contract.origin == ContractOrigin.ROUTE_REGISTRATION
         assert contract.meta["framework"] == "javalin"
+
+    def test_an_expression_lambda_verb_is_read(self, tmp_path: Path) -> None:
+        # `() -> get(...)`: the arrow before the verb is a call, not a return type.
+        repo = _write(
+            tmp_path,
+            "Routes.java",
+            "import static io.javalin.apibuilder.ApiBuilder.*;\n"
+            "class Routes {\n"
+            '    void routes() { path("/api", () -> get("/x", ctx -> ctx.result("x"))); }\n'
+            "    List<String> get(String key) { return null; }\n"
+            "}\n",
+        )
+        assert set(_contracts(repo, "provider")) == {"http::GET::/api/x"}
 
     def test_a_verb_on_an_unknown_receiver_is_not_a_route(self, tmp_path: Path) -> None:
         repo = _write(
