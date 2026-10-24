@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from repowise.core.analysis.decisions.extractor import (
     _BATCH_MAX_TOKENS,
@@ -149,6 +150,31 @@ async def test_a_cut_off_batch_fails_the_source_instead_of_returning_zero(tmp_pa
     ex = _extractor(tmp_path, _CUT_OFF, stop_reason="max_tokens")
     with pytest.raises(DecisionSourceError, match="max_tokens"):
         await getattr(ex, miner)()
+
+
+async def test_a_cut_off_marker_reply_falls_back_to_the_raw_markers(tmp_path):
+    (tmp_path / "app.py").write_text(
+        "def fn():\n    # DECISION: use lazy imports because startup is slow\n    return 1\n",
+        encoding="utf-8",
+    )
+    ex = _extractor(tmp_path, _CUT_OFF, stop_reason="max_tokens")
+
+    decisions = await ex.scan_inline_markers()
+
+    assert [d.evidence_line for d in decisions] == [2]
+    assert decisions[0].confidence == 0.7  # the raw-marker fallback, not []
+
+
+async def test_a_cut_off_adr_reply_is_logged_as_a_failure(tmp_path):
+    ex = _extractor(tmp_path, _CUT_OFF, stop_reason="max_tokens")
+
+    with capture_logs() as logs:
+        decisions = await ex._mine_unstructured_adr(
+            ex.test_provider, "docs/adr/0001-notes.md", "We chose lazy imports."
+        )
+
+    assert decisions == []
+    assert any(e["event"] == "decision_extractor.adr_llm_failed" for e in logs)
 
 
 async def test_the_failure_reaches_the_report_as_a_failure(tmp_path):

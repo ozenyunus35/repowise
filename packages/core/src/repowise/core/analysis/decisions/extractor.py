@@ -406,7 +406,7 @@ class DecisionExtractor:
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
             )
-            decisions.extend(parse_decisions_json(response.content))
+            decisions.extend(parse_decisions_reply(response))
         return decisions
 
     # ------------------------------------------------------------------
@@ -512,7 +512,7 @@ class DecisionExtractor:
             response = await provider.generate(
                 _SYSTEM_PROMPT, prompt, max_tokens=2000, temperature=0.2
             )
-            for d in parse_decisions_json(response.content):
+            for d in parse_decisions_reply(response):
                 d.source = "adr"
                 d.status = "proposed"
                 d.confidence = 0.80
